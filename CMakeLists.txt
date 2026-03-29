@@ -124,5 +124,7 @@ target_compile_options(node PRIVATE
     -Wpedantic
     -g
 )
-target_compile_definitions(node PRIVATE)
+target_compile_definitions(node PRIVATE
+    CHAIN_DATA_DIR="${CMAKE_BINARY_DIR}/chain_data"
+)
 set_target_properties(node PROPERTIES OUTPUT_NAME "minicoin_node")

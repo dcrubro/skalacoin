@@ -140,16 +140,17 @@ bool Block_AllTransactionsValid(const block_t* block) {
 
     for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
         signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
-        if (!Transaction_Verify(tx)) {
-            return false;
-        }
-
-        if (Address_IsCoinbase(tx->transaction.senderAddress)) {
+        if (tx && Address_IsCoinbase(tx->transaction.senderAddress)) {
             if (hasCoinbase) {
                 return false; // More than one coinbase transaction
             }
 
             hasCoinbase = true;
+            continue; // Coinbase transactions are valid since the miner has the right to create coins. Only rule is one per block.
+        }
+        
+        if (!Transaction_Verify(tx)) {
+            return false;
         }
     }
 

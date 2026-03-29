@@ -8,7 +8,7 @@ static randomx_cache* rxCache = NULL;
 static randomx_dataset* rxDataset = NULL;
 static randomx_vm* rxVm = NULL;
 
-bool RandomX_Init(const char* key) {
+bool RandomX_Init(const char* key, bool preferFullMemory) {
     if (!key || rxCache || rxVm) {
         return false;
     }
@@ -24,18 +24,20 @@ bool RandomX_Init(const char* key) {
     randomx_init_cache(rxCache, key, strlen(key));
 
     // Prefer full-memory mode. If dataset allocation fails, fall back to light mode.
-    rxDataset = randomx_alloc_dataset(vmFlags);
-    if (rxDataset) {
-        const unsigned long datasetItems = randomx_dataset_item_count();
-        randomx_init_dataset(rxDataset, rxCache, 0, datasetItems);
-        rxVm = randomx_create_vm(vmFlags, NULL, rxDataset);
-        if (rxVm) {
-            printf("RandomX initialized in full-memory mode\n");
-            return true;
-        }
+    if (preferFullMemory) {
+        rxDataset = randomx_alloc_dataset(vmFlags);
+        if (rxDataset) {
+            const unsigned long datasetItems = randomx_dataset_item_count();
+            randomx_init_dataset(rxDataset, rxCache, 0, datasetItems);
+            rxVm = randomx_create_vm(vmFlags, NULL, rxDataset);
+            if (rxVm) {
+                printf("RandomX initialized in full-memory mode\n");
+                return true;
+            }
 
-        randomx_release_dataset(rxDataset);
-        rxDataset = NULL;
+            randomx_release_dataset(rxDataset);
+            rxDataset = NULL;
+        }
     }
 
     vmFlags = baseFlags;

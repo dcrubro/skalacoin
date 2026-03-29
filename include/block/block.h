@@ -10,13 +10,14 @@
 #include <randomx/librx_wrapper.h>
 
 typedef struct {
-    uint8_t version;
-    uint32_t blockNumber;
+    uint64_t blockNumber;
+    uint64_t timestamp;
+    uint64_t nonce;
     uint8_t prevHash[32];
     uint8_t merkleRoot[32];
-    uint64_t timestamp;
     uint32_t difficultyTarget; // Encoding: [1 byte exponent][3 byte coefficient]; Target = coefficient * 256^(exponent-3)
-    uint64_t nonce; // Higher nonce for RandomX
+    uint8_t version;
+    uint8_t reserved[3];       // 3 bytes (Explicit padding for 8-byte alignment)
 } block_header_t;
 
 typedef struct {

@@ -11,6 +11,10 @@
 #include <randomx/librx_wrapper.h>
 #include <signal.h>
 
+#ifndef CHAIN_DATA_DIR
+#define CHAIN_DATA_DIR "chain_data"
+#endif
+
 void handle_sigint(int sig) {
     printf("Caught signal %d, exiting...\n", sig);
     RandomX_Destroy();
@@ -121,8 +125,10 @@ static bool MineBlock(block_t* block) {
 int main(void) {
     signal(SIGINT, handle_sigint);
 
+    const char* chainDataDir = CHAIN_DATA_DIR;
+
     // Init RandomX
-    if (!RandomX_Init("minicoin")) { // TODO: Use a key that is not hardcoded; E.g. hash of the last block, every thousand blocks, etc.
+    if (!RandomX_Init("minicoin", false)) { // TODO: Use a key that is not hardcoded; E.g. hash of the last block, every thousand blocks, difficulty recalibration, etc.
         fprintf(stderr, "failed to initialize RandomX\n");
         return 1;
     }
@@ -131,6 +137,33 @@ int main(void) {
     if (!chain) {
         fprintf(stderr, "failed to create chain\n");
         return 1;
+    }
+
+    // Attempt read
+    if (!Chain_LoadFromFile(chain, chainDataDir)) {
+        printf("No existing chain loaded from %s\n", chainDataDir);
+    }
+
+    if (Chain_Size(chain) > 0) {
+        if (Chain_IsValid(chain)) {
+            printf("Loaded chain with %zu blocks from disk\n", Chain_Size(chain));
+        } else {
+            fprintf(stderr, "loaded chain is invalid, scrapping, resyncing.\n"); // TODO: Actually implement resyncing from peers instead of just scrapping the chain
+            const size_t badSize = Chain_Size(chain);
+
+            // Delete files (wipe dir)
+            for (size_t i = 0; i < badSize; i++) {
+                char filePath[256];
+                snprintf(filePath, sizeof(filePath), "%s/block_%zu.dat", chainDataDir, i);
+                remove(filePath);
+            }
+
+            char metaPath[256];
+            snprintf(metaPath, sizeof(metaPath), "%s/chain.meta", chainDataDir);
+            remove(metaPath);
+
+            Chain_Wipe(chain);
+        }
     }
 
     secp256k1_context* secpCtx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -153,6 +186,17 @@ int main(void) {
         return 1;
     }
 
+    // Coinbase TX - no signature needed, one per block
+    signed_transaction_t coinbaseTx;
+    memset(&coinbaseTx, 0, sizeof(coinbaseTx));
+    coinbaseTx.transaction.version = 1;
+    coinbaseTx.transaction.amount = 50; // Block reward
+    coinbaseTx.transaction.fee = 0;
+    SHA256(receiverCompressedPublicKey, 33, coinbaseTx.transaction.recipientAddress);
+    memset(coinbaseTx.transaction.compressedPublicKey, 0x00, 33); // No public key for coinbase
+    memset(coinbaseTx.transaction.senderAddress, 0xFF, 32); // Coinbase marker
+
+    // Test TX
     signed_transaction_t tx;
     memset(&tx, 0, sizeof(tx));
     tx.transaction.version = 1;
@@ -182,22 +226,36 @@ int main(void) {
     }
 
     block->header.version = 1;
-    block->header.blockNumber = (uint32_t)Chain_Size(chain);
-    memset(block->header.prevHash, 0, sizeof(block->header.prevHash));
+    block->header.blockNumber = (uint64_t)Chain_Size(chain);
+    // Get prevHash from last block if exists
+    if (Chain_Size(chain) > 0) {
+        block_t* lastBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
+        if (lastBlock) {
+            Block_CalculateHash(lastBlock, block->header.prevHash);
+        } else {
+            memset(block->header.prevHash, 0, sizeof(block->header.prevHash));
+        }
+    } else {
+        memset(block->header.prevHash, 0, sizeof(block->header.prevHash));
+    }
     memset(block->header.merkleRoot, 0, sizeof(block->header.merkleRoot));
     block->header.timestamp = (uint64_t)time(NULL);
 
-        const double hps = MeasureRandomXHashrate();
-        const double targetSeconds = 60.0;
-        const double expectedHashes = (hps > 0.0) ? (hps * targetSeconds) : 65536.0;
-        block->header.difficultyTarget = CompactTargetForExpectedHashes(expectedHashes);
+    const double hps = MeasureRandomXHashrate();
+    const double targetSeconds = 10.0;
+    const double expectedHashes = (hps > 0.0) ? (hps * targetSeconds) : 65536.0;
+    block->header.difficultyTarget = CompactTargetForExpectedHashes(expectedHashes);
     block->header.nonce = 0;
 
-        printf("RandomX benchmark: %.2f H/s, target %.0fs, nBits=0x%08x\n",
-            hps,
-            targetSeconds,
-            block->header.difficultyTarget);
+    printf("RandomX benchmark: %.2f H/s, target %.0fs, nBits=0x%08x\n",
+        hps,
+        targetSeconds,
+        block->header.difficultyTarget);
 
+    Block_AddTransaction(block, &coinbaseTx);
+    printf("Added coinbase transaction to block: recipient %02x... -> amount %lu\n",
+           coinbaseTx.transaction.recipientAddress[0], coinbaseTx.transaction.recipientAddress[31],
+           coinbaseTx.transaction.amount);
     Block_AddTransaction(block, &tx);
     printf("Added transaction to block: sender %02x... -> recipient %02x..., amount %lu, fee %lu\n",
            tx.transaction.senderAddress[0], tx.transaction.senderAddress[31],
@@ -222,10 +280,10 @@ int main(void) {
         return 1;
     }
 
-        printf("Mined block %u with nonce %llu and chain size %zu\n",
-           block->header.blockNumber,
-            (unsigned long long)block->header.nonce,
-           Chain_Size(chain));
+    printf("Mined block %llu with nonce %llu and chain size %zu\n",
+        (unsigned long long)block->header.blockNumber,
+        (unsigned long long)block->header.nonce,
+        Chain_Size(chain));
 
     printf("Block hash (SHA256): ");
     uint8_t blockHash[32];
@@ -240,6 +298,12 @@ int main(void) {
         printf("%02x", randomXHash[i]);
     }
     printf("\n");
+
+    if (!Chain_SaveToFile(chain, chainDataDir)) {
+        fprintf(stderr, "failed to save chain to %s\n", chainDataDir);
+    } else {
+        printf("Saved chain with %zu blocks to %s\n", Chain_Size(chain), chainDataDir);
+    }
 
     // Chain currently stores a copy of block_t that references the same tx array pointer,
     // so we do not destroy `block` here to avoid invalidating chain data.

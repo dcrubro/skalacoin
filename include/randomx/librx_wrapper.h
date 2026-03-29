@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-bool RandomX_Init(const char* key);
+bool RandomX_Init(const char* key, bool preferFullMemory);
 void RandomX_Destroy();
 void RandomX_CalculateHash(const uint8_t* input, size_t inputLen, uint8_t* output);
 
