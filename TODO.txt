@@ -1,0 +1,1 @@
+Eventually move the Proof of Work to RandomX. Keep the SHA-256 for Block IDs, TX IDs, etc. But nonce and mining should be RandomX. This will make it more resistant to ASICs and more accessible for CPU mining.

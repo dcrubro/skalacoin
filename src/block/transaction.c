@@ -1,0 +1,76 @@
+#include <block/transaction.h>
+#include <string.h>
+
+void Transaction_CalculateHash(const signed_transaction_t* tx, uint8_t* outHash) {
+    if (!tx || !outHash) {
+        return;
+    }
+
+    uint8_t buffer[sizeof(transaction_t)];
+    memcpy(buffer, &tx->transaction, sizeof(transaction_t));
+
+    SHA256(buffer, sizeof(buffer), outHash);
+    SHA256(outHash, 32, outHash); // Double-Hash
+}
+
+void Transaction_Sign(signed_transaction_t* tx, const uint8_t* privateKey) {
+    if (!tx || !privateKey) {
+        return;
+    }
+
+    Transaction_CalculateHash(tx, tx->signature.txHash);
+    Crypto_SignData(
+        (const uint8_t*)&tx->transaction,
+        sizeof(transaction_t),
+        privateKey,
+        tx->signature.signature
+    );
+}
+
+bool Transaction_Verify(const signed_transaction_t* tx) {
+    if (!tx) {
+        return false;
+    }
+
+    if (Address_IsCoinbase(tx->transaction.senderAddress)) {
+        // Coinbase transactions are valid if the signature is correct for the block (handled in Block_Verify)
+        return true;
+    }
+
+    uint8_t computeAddress[32];
+    SHA256(tx->transaction.compressedPublicKey, 33, computeAddress); // Address is hash of public key
+    if (memcmp(computeAddress, tx->transaction.senderAddress, 32) != 0) {
+        return false; // Sender address does not match public key
+    }
+
+    if (tx->transaction.amount == 0) {
+        return false; // Zero-amount transactions are not valid
+    }
+
+    if (tx->transaction.fee > tx->transaction.amount) {
+        return false; // Fee cannot exceed amount
+    }
+
+    if (tx->transaction.version != 1) {
+        return false; // Unsupported version
+    }
+
+    if (Address_IsCoinbase(tx->transaction.recipientAddress)) {
+        return false; // Cannot send to coinbase address
+    }
+
+    uint8_t txHash[32];
+    Transaction_CalculateHash(tx, txHash);
+
+    if (memcmp(txHash, tx->signature.txHash, 32) != 0) {
+        return false; // Hash does not match signature hash
+    }
+
+    // If all checks pass, verify the signature
+    return Crypto_VerifySignature(
+        (const uint8_t*)&tx->transaction,
+        sizeof(transaction_t),
+        tx->signature.signature,
+        tx->transaction.compressedPublicKey
+    );
+}

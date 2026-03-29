@@ -1,0 +1,9 @@
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+svrtest
+main
+CMakeFiles/
+.vscode/
+build/
+.DS_Store
