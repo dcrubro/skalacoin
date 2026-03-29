@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <constants.h>
+#include <uint256.h>
 
 typedef struct {
     DynArr* blocks;
@@ -22,7 +24,7 @@ bool Chain_IsValid(blockchain_t* chain);
 void Chain_Wipe(blockchain_t* chain);
 
 // I/O
-bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath);
-bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath);
+bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply);
+bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply);
 
 #endif

@@ -119,7 +119,7 @@ void Chain_Wipe(blockchain_t* chain) {
     }
 }
 
-bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath) {
+bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply) {
     // To avoid stalling the chain from peers, write after every block addition (THAT IS VERIFIED)
 
     if (!chain || !chain->blocks || !EnsureDirectoryExists(dirpath)) {
@@ -145,6 +145,8 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath) {
         // Write last block hash (32 bytes of zeros for now)
         uint8_t zeroHash[32] = {0};
         fwrite(zeroHash, sizeof(uint8_t), 32, metaFile);
+        uint256_t zeroSupply = {0};
+        fwrite(&zeroSupply, sizeof(uint256_t), 1, metaFile);
 
         // TODO: Potentially some other things here, we'll see
     }
@@ -210,13 +212,14 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath) {
         Block_CalculateHash(lastBlock, lastHash);
         fwrite(lastHash, sizeof(uint8_t), 32, metaFile);
     }
+    fwrite(&currentSupply, sizeof(uint256_t), 1, metaFile);
     fclose(metaFile);
 
     return true;
 }
 
-bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath) {
-    if (!chain || !chain->blocks || !dirpath) {
+bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply) {
+    if (!chain || !chain->blocks || !dirpath || !outCurrentSupply) {
         return false;
     }
 
@@ -240,6 +243,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath) {
     fread(&savedSize, sizeof(size_t), 1, metaFile);
     uint8_t lastSavedHash[32];
     fread(lastSavedHash, sizeof(uint8_t), 32, metaFile);
+    fread(outCurrentSupply, sizeof(uint256_t), 1, metaFile);
     fclose(metaFile);
 
     // TODO: Might add a flag to allow reading from a point onward, but just rewrite for now
