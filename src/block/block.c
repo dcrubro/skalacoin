@@ -1,5 +1,22 @@
 #include <block/block.h>
+#include <autolykos2/autolykos2.h>
 #include <stdlib.h>
+
+static Autolykos2Context* g_autolykos2Ctx = NULL;
+
+static Autolykos2Context* GetAutolykos2Ctx(void) {
+    if (!g_autolykos2Ctx) {
+        g_autolykos2Ctx = Autolykos2_Create();
+    }
+    return g_autolykos2Ctx;
+}
+
+void Block_ShutdownPowContext(void) {
+    if (g_autolykos2Ctx) {
+        Autolykos2_Destroy(g_autolykos2Ctx);
+        g_autolykos2Ctx = NULL;
+    }
+}
 
 block_t* Block_Create() {
     block_t* block = (block_t*)malloc(sizeof(block_t));
@@ -116,13 +133,28 @@ void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash) {
     DynArr_destroy(hashes2);
 }
 
-void Block_CalculateRandomXHash(const block_t* block, uint8_t* outHash) {
+void Block_CalculateAutolykos2Hash(const block_t* block, uint8_t* outHash) {
     if (!block || !outHash) {
         return;
     }
 
-    // PoW hash is also computed from the header only.
-    RandomX_CalculateHash((const uint8_t*)&block->header, sizeof(block_header_t), outHash);
+    // PoW hash is computed from the block header, while canonical block hash remains SHA256.
+    Autolykos2Context* ctx = GetAutolykos2Ctx();
+    if (!ctx) {
+        memset(outHash, 0, 32);
+        return;
+    }
+
+    if (!Autolykos2_Hash(
+        ctx,
+        (const uint8_t*)&block->header,
+        sizeof(block_header_t),
+        block->header.nonce,
+        (uint32_t)block->header.blockNumber,
+        outHash
+    )) {
+        memset(outHash, 0, 32);
+    }
 }
 
 void Block_AddTransaction(block_t* block, signed_transaction_t* tx) {
@@ -199,7 +231,7 @@ bool Block_HasValidProofOfWork(const block_t* block) {
     }
 
     uint8_t hash[32];
-    Block_CalculateRandomXHash(block, hash);
+    Block_CalculateAutolykos2Hash(block, hash);
 
     return Uint256_CompareBE(hash, target) <= 0;
 }

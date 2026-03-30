@@ -162,6 +162,8 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         fwrite(zeroHash, sizeof(uint8_t), 32, metaFile);
         uint256_t zeroSupply = {0};
         fwrite(&zeroSupply, sizeof(uint256_t), 1, metaFile);
+        uint32_t initialTarget = INITIAL_DIFFICULTY;
+        fwrite(&initialTarget, sizeof(uint32_t), 1, metaFile);
 
         // TODO: Potentially some other things here, we'll see
     }
@@ -215,6 +217,9 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         }
 
         fclose(blockFile);
+
+        DynArr_destroy(blk->transactions);
+        blk->transactions = NULL; // Clear transactions to save memory since they're now saved on disk
     }
 
     // Update metadata with new size and last block hash
@@ -228,12 +233,14 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         fwrite(lastHash, sizeof(uint8_t), 32, metaFile);
     }
     fwrite(&currentSupply, sizeof(uint256_t), 1, metaFile);
+    uint32_t difficultyTarget = ((block_t*)DynArr_at(chain->blocks, newSize - 1))->header.difficultyTarget;
+    fwrite(&difficultyTarget, sizeof(uint32_t), 1, metaFile);
     fclose(metaFile);
 
     return true;
 }
 
-bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply) {
+bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget) {
     if (!chain || !chain->blocks || !dirpath || !outCurrentSupply) {
         return false;
     }
@@ -259,6 +266,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
     uint8_t lastSavedHash[32];
     fread(lastSavedHash, sizeof(uint8_t), 32, metaFile);
     fread(outCurrentSupply, sizeof(uint256_t), 1, metaFile);
+    fread(outDifficultyTarget, sizeof(uint32_t), 1, metaFile);
     fclose(metaFile);
 
     // TODO: Might add a flag to allow reading from a point onward, but just rewrite for now
@@ -308,15 +316,88 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
         fclose(blockFile);
         Chain_AddBlock(chain, blk);
 
-        if (blk->transactions) {
-            DynArr_destroy(blk->transactions);
-            blk->transactions = NULL;
-        }
-        free(blk); // chain stores block headers/fields by value
+        // Chain_AddBlock stores blocks by value, so the copied block now owns
+        // blk->transactions. Only free the temporary wrapper struct here.
+        free(blk);
     }
 
     chain->size = savedSize;
 
     // After read, you SHOULD verify chain validity. We're not doing it here since returning false is a bit unclear if the read failed or if the chain is invalid.
     return true;
+}
+
+uint32_t Chain_ComputeNextTarget(blockchain_t* chain, uint32_t currentTarget) {
+    if (!chain || !chain->blocks) {
+        return 0x00; // Impossible difficulty, only valid hash is all zeros (practically impossible)
+    }
+
+    size_t chainSize = DynArr_size(chain->blocks);
+    if (chainSize < DIFFICULTY_ADJUSTMENT_INTERVAL) {
+        // Baby-chain, return initial difficulty
+        return INITIAL_DIFFICULTY;
+    }
+
+    // Assuming block validation validates timestamps, we can assume they're valid and can just read them
+    block_t* lastBlock = (block_t*)DynArr_at(chain->blocks, chainSize - 1);
+    block_t* adjustmentBlock = (block_t*)DynArr_at(chain->blocks, chainSize - DIFFICULTY_ADJUSTMENT_INTERVAL);
+    if (!lastBlock || !adjustmentBlock) {
+        return 0x00; // Impossible difficulty, only valid hash is all zeros (practically impossible)
+    }
+
+    // Retarget uses whole-window span. Per-block average is implicit:
+    // (actualTime / interval) / targetBlockTime == actualTime / targetTime.
+    uint64_t actualTime = 0;
+    if (lastBlock->header.timestamp > adjustmentBlock->header.timestamp) {
+        actualTime = lastBlock->header.timestamp - adjustmentBlock->header.timestamp;
+    }
+    if (actualTime == 0) {
+        return currentTarget; // Invalid/non-increasing time window; keep current target
+    }
+
+    const uint64_t targetTime = (uint64_t)TARGET_BLOCK_TIME * (uint64_t)DIFFICULTY_ADJUSTMENT_INTERVAL;
+    double timeRatio = (double)actualTime / (double)targetTime;
+
+    // Clamp per-epoch target movement: at most x2 easier or x2 harder. TODO: Check if the clamp should be more aggressive or looser
+    if (timeRatio > 2.0) {
+        timeRatio = 2.0;
+    } else if (timeRatio < 0.5) {
+        timeRatio = 0.5;
+    }
+
+    uint32_t exponent = currentTarget >> 24;
+    uint32_t mantissa = currentTarget & 0x007fffff;
+    if (mantissa == 0 || exponent == 0) {
+        return INITIAL_DIFFICULTY;
+    }
+
+    double newMantissa = (double)mantissa * timeRatio;
+
+    // Normalize to compact format range.
+    while (newMantissa > 8388607.0) { // 0x007fffff
+        newMantissa /= 256.0;
+        exponent++;
+    }
+    while (newMantissa > 0.0 && newMantissa < 32768.0 && exponent > 3) { // Keep coefficient in normal range
+        newMantissa *= 256.0;
+        exponent--;
+    }
+
+    if (exponent > 32) {
+        // Easiest representable target in our decoder range.
+        return (32u << 24) | 0x007fffff;
+    }
+    if (exponent < 1) {
+        exponent = 1;
+    }
+
+    uint32_t newCoeff = (uint32_t)newMantissa;
+    if (newCoeff == 0) {
+        newCoeff = 1;
+    }
+    if (newCoeff > 0x007fffff) {
+        newCoeff = 0x007fffff;
+    }
+
+    return (exponent << 24) | (newCoeff & 0x007fffff);
 }

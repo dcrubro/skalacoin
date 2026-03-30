@@ -25,6 +25,9 @@ void Chain_Wipe(blockchain_t* chain);
 
 // I/O
 bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply);
-bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply);
+bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget);
+
+// Difficulty
+uint32_t Chain_ComputeNextTarget(blockchain_t* chain, uint32_t currentTarget);
 
 #endif

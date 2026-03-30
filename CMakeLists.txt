@@ -10,6 +10,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
+include(FetchContent)
 
 # OpenSSL
 find_package(OpenSSL QUIET)
@@ -42,37 +43,39 @@ if(NOT SECP256K1_FOUND)
     endif()
 endif()
 
-# RandomX
-set(RANDOMX_ROOT "" CACHE PATH "Root directory of a RandomX installation")
-set(RANDOMX_USING_FETCHCONTENT OFF)
-if(PkgConfig_FOUND)
-    pkg_check_modules(RANDOMX QUIET IMPORTED_TARGET randomx)
-endif()
+# Autolykos2 CPU reference backend (optional)
+option(MINICOIN_ENABLE_AUTOLYKOS2_REF "Enable Autolykos2 CPU reference backend" ON)
+set(MINICOIN_AUTOLYKOS2_REF_AVAILABLE OFF)
 
-if(NOT RANDOMX_FOUND)
-    find_path(RANDOMX_INCLUDE_DIR
-        NAMES randomx.h
-        HINTS ${RANDOMX_ROOT}
-        PATH_SUFFIXES include
+if(MINICOIN_ENABLE_AUTOLYKOS2_REF)
+    FetchContent_Declare(
+        autolykos2_ref_src
+        GIT_REPOSITORY https://github.com/mhssamadani/Autolykos2_NV_Miner.git
+        GIT_TAG main
+        GIT_SHALLOW TRUE
     )
-    find_library(RANDOMX_LIBRARY
-        NAMES randomx
-        HINTS ${RANDOMX_ROOT}
-        PATH_SUFFIXES lib
+    FetchContent_MakeAvailable(autolykos2_ref_src)
+
+    set(AUTOLYKOS2_REF_BASE ${autolykos2_ref_src_SOURCE_DIR}/secp256k1)
+    set(AUTOLYKOS2_REF_SOURCES
+        ${AUTOLYKOS2_REF_BASE}/src/cpuAutolykos.cc
+        ${AUTOLYKOS2_REF_BASE}/src/conversion.cc
+        ${AUTOLYKOS2_REF_BASE}/src/cryptography.cc
+        ${AUTOLYKOS2_REF_BASE}/src/definitions.cc
+        ${AUTOLYKOS2_REF_BASE}/src/easylogging++.cc
+        ${AUTOLYKOS2_REF_BASE}/src/jsmn.c
+        ${PROJECT_SOURCE_DIR}/src/autolykos2/easylogging_init.cpp
+        ${PROJECT_SOURCE_DIR}/src/autolykos2/autolykos2_ref_wrapper.cpp
     )
 
-    if(NOT RANDOMX_INCLUDE_DIR OR NOT RANDOMX_LIBRARY)
-        include(FetchContent)
-        FetchContent_Declare(
-            randomx_src
-            GIT_REPOSITORY https://github.com/tevador/RandomX.git
-            GIT_TAG master
-            GIT_SHALLOW TRUE
-        )
-        FetchContent_MakeAvailable(randomx_src)
-        set(RANDOMX_USING_FETCHCONTENT ON)
-        set(RANDOMX_INCLUDE_DIR ${randomx_src_SOURCE_DIR}/src)
-    endif()
+    add_library(autolykos2_ref STATIC ${AUTOLYKOS2_REF_SOURCES})
+    target_include_directories(autolykos2_ref PRIVATE ${AUTOLYKOS2_REF_BASE}/include)
+    target_link_libraries(autolykos2_ref PRIVATE
+        ${CMAKE_THREAD_LIBS_INIT}
+        OpenSSL::SSL
+        OpenSSL::Crypto
+    )
+    set(MINICOIN_AUTOLYKOS2_REF_AVAILABLE ON)
 endif()
 
 # ---------------------------------------------------------
@@ -105,14 +108,8 @@ else()
     target_link_libraries(node PRIVATE ${SECP256K1_LIBRARY})
 endif()
 
-if(RANDOMX_FOUND)
-    target_link_libraries(node PRIVATE PkgConfig::RANDOMX)
-elseif(RANDOMX_USING_FETCHCONTENT)
-    target_link_libraries(node PRIVATE randomx)
-    target_include_directories(node PRIVATE ${RANDOMX_INCLUDE_DIR})
-else()
-    target_include_directories(node PRIVATE ${RANDOMX_INCLUDE_DIR})
-    target_link_libraries(node PRIVATE ${RANDOMX_LIBRARY})
+if(MINICOIN_AUTOLYKOS2_REF_AVAILABLE)
+    target_link_libraries(node PRIVATE autolykos2_ref)
 endif()
 
 target_include_directories(node PRIVATE 
@@ -126,5 +123,6 @@ target_compile_options(node PRIVATE
 )
 target_compile_definitions(node PRIVATE
     CHAIN_DATA_DIR="${CMAKE_BINARY_DIR}/chain_data"
+    $<$<BOOL:${MINICOIN_AUTOLYKOS2_REF_AVAILABLE}>:MINICOIN_AUTOLYKOS2_REF_AVAILABLE>
 )
 set_target_properties(node PROPERTIES OUTPUT_NAME "minicoin_node")
