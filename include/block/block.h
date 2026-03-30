@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <randomx/librx_wrapper.h>
+#include <stdlib.h>
 
 typedef struct {
     uint64_t blockNumber;
@@ -27,11 +28,13 @@ typedef struct {
 
 block_t* Block_Create();
 void Block_CalculateHash(const block_t* block, uint8_t* outHash);
+void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash);
 void Block_CalculateRandomXHash(const block_t* block, uint8_t* outHash);
 void Block_AddTransaction(block_t* block, signed_transaction_t* tx);
 void Block_RemoveTransaction(block_t* block, uint8_t* txHash);
 bool Block_HasValidProofOfWork(const block_t* block);
 bool Block_AllTransactionsValid(const block_t* block);
 void Block_Destroy(block_t* block);
+void Block_Print(const block_t* block);
 
 #endif

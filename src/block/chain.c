@@ -32,6 +32,23 @@ static bool BuildPath(char* out, size_t outSize, const char* dirpath, const char
     return written > 0 && (size_t)written < outSize;
 }
 
+static void Chain_ClearBlocks(blockchain_t* chain) {
+    if (!chain || !chain->blocks) {
+        return;
+    }
+
+    for (size_t i = 0; i < DynArr_size(chain->blocks); i++) {
+        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
+        if (blk && blk->transactions) {
+            DynArr_destroy(blk->transactions);
+            blk->transactions = NULL;
+        }
+    }
+
+    DynArr_erase(chain->blocks);
+    chain->size = 0;
+}
+
 blockchain_t* Chain_Create() {
     blockchain_t* ptr = (blockchain_t*)malloc(sizeof(blockchain_t));
     if (!ptr) {
@@ -47,6 +64,7 @@ blockchain_t* Chain_Create() {
 void Chain_Destroy(blockchain_t* chain) {
     if (chain) {
         if (chain->blocks) {
+            Chain_ClearBlocks(chain);
             DynArr_destroy(chain->blocks);
         }
         free(chain);
@@ -113,10 +131,7 @@ bool Chain_IsValid(blockchain_t* chain) {
 }
 
 void Chain_Wipe(blockchain_t* chain) {
-    if (chain && chain->blocks) {
-        DynArr_erase(chain->blocks);
-        chain->size = 0;
-    }
+    Chain_ClearBlocks(chain);
 }
 
 bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply) {
@@ -247,7 +262,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
     fclose(metaFile);
 
     // TODO: Might add a flag to allow reading from a point onward, but just rewrite for now
-    DynArr_erase(chain->blocks); // Clear current chain blocks, but keep allocated memory for efficiency, since we will likely be loading a similar number of blocks as currently in memory.
+    Chain_ClearBlocks(chain); // Clear current chain blocks and free owned transaction buffers before reload.
 
     // Load blocks
     for (size_t i = 0; i < savedSize; i++) {
@@ -280,7 +295,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
             return false;
         }
 
-        for (size_t j = 0; j < txSize; j++) {
+        /*for (size_t j = 0; j < txSize; j++) {
             signed_transaction_t tx;
             if (fread(&tx, sizeof(signed_transaction_t), 1, blockFile) != 1) {
                 fclose(blockFile);
@@ -288,10 +303,16 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
                 return false;
             }
             Block_AddTransaction(blk, &tx);
-        }
-        fclose(blockFile);
+        }*/ // Transactions are not read, we use the merkle root for validity
 
+        fclose(blockFile);
         Chain_AddBlock(chain, blk);
+
+        if (blk->transactions) {
+            DynArr_destroy(blk->transactions);
+            blk->transactions = NULL;
+        }
+        free(blk); // chain stores block headers/fields by value
     }
 
     chain->size = savedSize;

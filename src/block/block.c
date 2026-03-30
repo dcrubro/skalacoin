@@ -16,40 +16,113 @@ block_t* Block_Create() {
 }
 
 void Block_CalculateHash(const block_t* block, uint8_t* outHash) {
-    if (!block || !outHash || !block->transactions || DynArr_size(block->transactions) <= 0) {
+    if (!block || !outHash) {
         return;
     }
 
-    // Merkle root TODO
-    
-    // Flatten the block header and transactions into a single buffer for hashing (assume that txs are verified - usually on receive)
-    uint8_t buffer[sizeof(block_header_t) + (DynArr_size(block->transactions) * DynArr_elemSize(block->transactions))];
-    memcpy(buffer, &block->header, sizeof(block_header_t));
-    for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
-        void* txPtr = (char*)DynArr_at(block->transactions, i);
-        memcpy(buffer + sizeof(block_header_t) + (i * DynArr_elemSize(block->transactions)), txPtr, DynArr_elemSize(block->transactions));
-    }
-
-    SHA256((const unsigned char*)buffer, sizeof(buffer), outHash);
+    // Canonical block hash commits to header fields, including merkleRoot.
+    SHA256((const unsigned char*)&block->header, sizeof(block_header_t), outHash);
     SHA256(outHash, 32, outHash); // Double-Hash
 }
 
-void Block_CalculateRandomXHash(const block_t* block, uint8_t* outHash) {
-    if (!block || !outHash || !block->transactions || DynArr_size(block->transactions) <= 0) {
+void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash) {
+    if (!block || !block->transactions || !outHash) {
         return;
     }
 
-    // Merkle root TODO
-    
-    // Flatten the block header and transactions into a single buffer for hashing (assume that txs are verified - usually on receive)
-    uint8_t buffer[sizeof(block_header_t) + (DynArr_size(block->transactions) * DynArr_elemSize(block->transactions))];
-    memcpy(buffer, &block->header, sizeof(block_header_t));
-    for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
-        void* txPtr = (char*)DynArr_at(block->transactions, i);
-        memcpy(buffer + sizeof(block_header_t) + (i * DynArr_elemSize(block->transactions)), txPtr, DynArr_elemSize(block->transactions));
+    const size_t txCount = DynArr_size(block->transactions);
+    if (txCount == 0) {
+        memset(outHash, 0, 32);
+        return;
+    }
+    if (txCount == 1) {
+        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, 0);
+        Transaction_CalculateHash(tx, outHash);
+        return;
     }
 
-    RandomX_CalculateHash(buffer, sizeof(buffer), outHash);
+    // TODO: Make this not shit
+    DynArr* hashes1 = DynArr_create(sizeof(uint8_t) * 32, 1);
+    DynArr* hashes2 = DynArr_create(sizeof(uint8_t) * 32, 1);
+    if (!hashes1 || !hashes2) {
+        if (hashes1) DynArr_destroy(hashes1);
+        if (hashes2) DynArr_destroy(hashes2);
+        return;
+    }
+
+    // Handle the transactions
+    for (size_t i = 0; i < txCount - 1; i++) {
+        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+        signed_transaction_t* txNext = (signed_transaction_t*)DynArr_at(block->transactions, i + 1);
+        uint8_t buf1[32] = {0}; uint8_t buf2[32] = {0}; // Zeroed out
+
+        // Unless if by some miracle the hash just so happens to be all zeros,
+        // I think we can safely assume that a 1 : 2^256 chance will NEVER be hit
+        Transaction_CalculateHash(tx, buf1);
+        Transaction_CalculateHash(txNext, buf2);
+
+        // Concat the two hashes
+        uint8_t dataInBuffer[64] = {0};
+        uint8_t* nextStart = dataInBuffer;
+        nextStart += 32;
+        memcpy(dataInBuffer, buf1, 32);
+        if (txNext) { memcpy(nextStart, buf2, 32); }
+
+        // Double hash that tx set
+        uint8_t outHash[32];
+        SHA256((const unsigned char*)dataInBuffer, 64, outHash);
+        SHA256(outHash, 32, outHash);
+
+        // Copy to the hashes dynarr
+        DynArr_push_back(hashes1, outHash);
+    }
+
+    // Move to hashing the existing ones until only one remains
+    do {
+        for (size_t i = 0; i < DynArr_size(hashes1) - 1; i++) {
+            uint8_t* hash1 = (uint8_t*)DynArr_at(hashes1, i); uint8_t* hash2 = (uint8_t*)DynArr_at(hashes1, i + 1);
+
+            // Concat the two hashes
+            uint8_t dataInBuffer[64] = {0};
+            uint8_t* nextStart = dataInBuffer;
+            nextStart += 32;
+            memcpy(dataInBuffer, hash1, 32);
+            memcpy(nextStart, hash2, 32);
+
+            // Double hash that tx set
+            uint8_t outHash[32];
+            SHA256((const unsigned char*)dataInBuffer, 64, outHash);
+            SHA256(outHash, 32, outHash);
+
+            DynArr_push_back(hashes2, outHash);
+        }
+
+        DynArr_erase(hashes1);
+        for (size_t i = 0; i < DynArr_size(hashes2); i++) {
+            DynArr_push_back(hashes1, (uint8_t*)DynArr_at(hashes2, i));
+        }
+        DynArr_erase(hashes2);
+    } while (DynArr_size(hashes1) > 1);
+
+    // Final Merkle
+    uint8_t* merkle = (uint8_t*)DynArr_at(hashes1, 0);
+    if (merkle) {
+        memcpy(outHash, merkle, 32);
+    } else {
+        memset(outHash, 0, 32);
+    }
+
+    DynArr_destroy(hashes1);
+    DynArr_destroy(hashes2);
+}
+
+void Block_CalculateRandomXHash(const block_t* block, uint8_t* outHash) {
+    if (!block || !outHash) {
+        return;
+    }
+
+    // PoW hash is also computed from the header only.
+    RandomX_CalculateHash((const uint8_t*)&block->header, sizeof(block_header_t), outHash);
 }
 
 void Block_AddTransaction(block_t* block, signed_transaction_t* tx) {
@@ -161,4 +234,35 @@ void Block_Destroy(block_t* block) {
     if (!block) return;
     DynArr_destroy(block->transactions);
     free(block);
+}
+
+void Block_Print(const block_t* block) {
+    if (!block) return;
+
+    printf("Block #%llu\n", block->header.blockNumber);
+    printf("Timestamp: %llu\n", block->header.timestamp);
+    printf("Nonce: %llu\n", block->header.nonce);
+    printf("Difficulty Target: 0x%08x\n", block->header.difficultyTarget);
+    printf("Version: %u\n", block->header.version);
+    printf("Previous Hash: ");
+    for (size_t i = 0; i < 32; i++) {
+        printf("%02x", block->header.prevHash[i]);
+    }
+    printf("\n");
+    printf("Merkle Root: ");
+    for (size_t i = 0; i < 32; i++) {
+        printf("%02x", block->header.merkleRoot[i]);
+    }
+    printf("\n");
+    if (block->transactions) {
+        printf("Transactions (%zu):\n", DynArr_size(block->transactions));
+        for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
+            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+            if (tx) {
+                printf("  Tx #%zu: %llu -> %llu, fee %llu\n", i, tx->transaction.amount, tx->transaction.fee, tx->transaction.amount + tx->transaction.fee);
+            }
+        }
+    } else {
+        printf("No transactions (or none loaded)\n");
+    }
 }

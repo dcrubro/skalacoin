@@ -87,12 +87,12 @@ static bool MineBlock(block_t* block) {
     }
 }
 
-int main(void) {
+int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint);
 
     const char* chainDataDir = CHAIN_DATA_DIR;
     const uint64_t blocksToMine = 10;
-    const double targetSeconds = 90.0;
+    const double targetSeconds = TARGET_BLOCK_TIME;
 
     uint256_t currentSupply = uint256_from_u64(0);
 
@@ -134,91 +134,117 @@ int main(void) {
         }
     }
 
-    const double hps = MeasureRandomXHashrate();
-    const double expectedHashes = (hps > 0.0) ? (hps * targetSeconds) : 65536.0;
-    const uint32_t calibratedBits = CompactTargetForExpectedHashes(expectedHashes);
+    // Get flag from argv "-mine" to mine blocks
+    if (argc > 1 && strcmp(argv[1], "-mine") == 0) {
+        printf("Mining %llu blocks with target time %.0fs...\n", (unsigned long long)blocksToMine, targetSeconds);
 
-    printf("RandomX benchmark: %.2f H/s, target %.0fs, nBits=0x%08x\n",
-        hps,
-        targetSeconds,
-        calibratedBits);
+        const double hps = MeasureRandomXHashrate();
+        const double expectedHashes = (hps > 0.0) ? (hps * targetSeconds) : 65536.0;
+        const uint32_t calibratedBits = CompactTargetForExpectedHashes(expectedHashes);
+        //const uint32_t calibratedBits = 0xffffffff; // Absurdly low diff for testing
 
-    uint8_t minerAddress[32];
-    SHA256((const unsigned char*)"minicoin-miner-1", strlen("minicoin-miner-1"), minerAddress);
+        printf("RandomX benchmark: %.2f H/s, target %.0fs, nBits=0x%08x, diff=%.2f\n",
+            hps,
+            targetSeconds,
+            calibratedBits,
+            (double)(1.f / calibratedBits) * 4294967296.0); // Basic representation as a big number for now
 
-    for (uint64_t mined = 0; mined < blocksToMine; ++mined) {
-        block_t* block = Block_Create();
-        if (!block) {
-            fprintf(stderr, "failed to create block\n");
-            Chain_Destroy(chain);
-            RandomX_Destroy();
-            return 1;
-        }
+        uint8_t minerAddress[32];
+        SHA256((const unsigned char*)"minicoin-miner-1", strlen("minicoin-miner-1"), minerAddress);
 
-        block->header.version = 1;
-        block->header.blockNumber = (uint64_t)Chain_Size(chain);
-        if (Chain_Size(chain) > 0) {
-            block_t* lastBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
-            if (lastBlock) {
-                Block_CalculateHash(lastBlock, block->header.prevHash);
+        for (uint64_t mined = 0; mined < blocksToMine; ++mined) {
+            block_t* block = Block_Create();
+            if (!block) {
+                fprintf(stderr, "failed to create block\n");
+                Chain_Destroy(chain);
+                RandomX_Destroy();
+                return 1;
+            }
+
+            block->header.version = 1;
+            block->header.blockNumber = (uint64_t)Chain_Size(chain);
+            if (Chain_Size(chain) > 0) {
+                block_t* lastBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
+                if (lastBlock) {
+                    Block_CalculateHash(lastBlock, block->header.prevHash);
+                } else {
+                    memset(block->header.prevHash, 0, sizeof(block->header.prevHash));
+                }
             } else {
                 memset(block->header.prevHash, 0, sizeof(block->header.prevHash));
             }
+            block->header.timestamp = (uint64_t)time(NULL);
+            block->header.difficultyTarget = calibratedBits;
+            block->header.nonce = 0;
+
+            signed_transaction_t coinbaseTx;
+            memset(&coinbaseTx, 0, sizeof(coinbaseTx));
+            coinbaseTx.transaction.version = 1;
+            coinbaseTx.transaction.amount = CalculateBlockReward(currentSupply, block->header.blockNumber);
+            coinbaseTx.transaction.fee = 0;
+            memcpy(coinbaseTx.transaction.recipientAddress, minerAddress, sizeof(minerAddress));
+            memset(coinbaseTx.transaction.compressedPublicKey, 0, sizeof(coinbaseTx.transaction.compressedPublicKey));
+            memset(coinbaseTx.transaction.senderAddress, 0xFF, sizeof(coinbaseTx.transaction.senderAddress));
+            Block_AddTransaction(block, &coinbaseTx);
+
+            uint8_t merkleRoot[32];
+            Block_CalculateMerkleRoot(block, merkleRoot);
+            memcpy(block->header.merkleRoot, merkleRoot, sizeof(block->header.merkleRoot));
+
+            if (!MineBlock(block)) {
+                fprintf(stderr, "failed to mine block within nonce range\n");
+                Block_Destroy(block);
+                Chain_Destroy(chain);
+                RandomX_Destroy();
+                return 1;
+            }
+
+            if (!Chain_AddBlock(chain, block)) {
+                fprintf(stderr, "failed to append block to chain\n");
+                Block_Destroy(block);
+                Chain_Destroy(chain);
+                RandomX_Destroy();
+                return 1;
+            }
+
+            (void)uint256_add_u64(&currentSupply, coinbaseTx.transaction.amount);
+
+            uint8_t blockHash[32];
+            Block_CalculateHash(block, blockHash);
+            printf("Mined block %llu/%llu (height=%llu) nonce=%llu reward=%llu supply=%llu merkle=%02x%02x%02x%02x... hash=%02x%02x%02x%02x...\n",
+                (unsigned long long)(mined + 1),
+                (unsigned long long)blocksToMine,
+                (unsigned long long)block->header.blockNumber,
+                (unsigned long long)block->header.nonce,
+                (unsigned long long)coinbaseTx.transaction.amount,
+                (unsigned long long)currentSupply.limbs[0],
+                block->header.merkleRoot[0], block->header.merkleRoot[1], block->header.merkleRoot[2], block->header.merkleRoot[3],
+                blockHash[0], blockHash[1], blockHash[2], blockHash[3]);
+
+            free(block); // chain stores blocks by value; transactions are owned by chain copy
+
+            // Save chain after each mined block
+            Chain_SaveToFile(chain, chainDataDir, currentSupply);
+        }
+
+        if (!Chain_SaveToFile(chain, chainDataDir, currentSupply)) {
+            fprintf(stderr, "failed to save chain to %s\n", chainDataDir);
         } else {
-            memset(block->header.prevHash, 0, sizeof(block->header.prevHash));
+            printf("Saved chain with %zu blocks to %s (supply=%llu)\n",
+                Chain_Size(chain),
+                chainDataDir,
+                (unsigned long long)currentSupply.limbs[0]);
         }
-        memset(block->header.merkleRoot, 0, sizeof(block->header.merkleRoot));
-        block->header.timestamp = (uint64_t)time(NULL);
-        block->header.difficultyTarget = calibratedBits;
-        block->header.nonce = 0;
-
-        signed_transaction_t coinbaseTx;
-        memset(&coinbaseTx, 0, sizeof(coinbaseTx));
-        coinbaseTx.transaction.version = 1;
-        coinbaseTx.transaction.amount = CalculateBlockReward(currentSupply, block->header.blockNumber);
-        coinbaseTx.transaction.fee = 0;
-        memcpy(coinbaseTx.transaction.recipientAddress, minerAddress, sizeof(minerAddress));
-        memset(coinbaseTx.transaction.compressedPublicKey, 0, sizeof(coinbaseTx.transaction.compressedPublicKey));
-        memset(coinbaseTx.transaction.senderAddress, 0xFF, sizeof(coinbaseTx.transaction.senderAddress));
-        Block_AddTransaction(block, &coinbaseTx);
-
-        if (!MineBlock(block)) {
-            fprintf(stderr, "failed to mine block within nonce range\n");
-            Block_Destroy(block);
-            Chain_Destroy(chain);
-            RandomX_Destroy();
-            return 1;
-        }
-
-        if (!Chain_AddBlock(chain, block)) {
-            fprintf(stderr, "failed to append block to chain\n");
-            Block_Destroy(block);
-            Chain_Destroy(chain);
-            RandomX_Destroy();
-            return 1;
-        }
-
-        (void)uint256_add_u64(&currentSupply, coinbaseTx.transaction.amount);
-
-        uint8_t blockHash[32];
-        Block_CalculateHash(block, blockHash);
-        printf("Mined block %llu/%llu (height=%llu) nonce=%llu reward=%llu supply=%llu hash=%02x%02x%02x%02x...\n",
-            (unsigned long long)(mined + 1),
-            (unsigned long long)blocksToMine,
-            (unsigned long long)block->header.blockNumber,
-            (unsigned long long)block->header.nonce,
-            (unsigned long long)coinbaseTx.transaction.amount,
-            (unsigned long long)currentSupply.limbs[0],
-            blockHash[0], blockHash[1], blockHash[2], blockHash[3]);
+    } else {
+        printf("Current chain has %zu blocks, total supply %llu\n", Chain_Size(chain), (unsigned long long)currentSupply.limbs[0]);
     }
 
-    if (!Chain_SaveToFile(chain, chainDataDir, currentSupply)) {
-        fprintf(stderr, "failed to save chain to %s\n", chainDataDir);
-    } else {
-        printf("Saved chain with %zu blocks to %s (supply=%llu)\n",
-            Chain_Size(chain),
-            chainDataDir,
-            (unsigned long long)currentSupply.limbs[0]);
+    // Print chain
+    for (size_t i = 0; i < Chain_Size(chain); i++) {
+        block_t* blk = Chain_GetBlock(chain, i);
+        if (blk) {
+            Block_Print(blk);
+        }
     }
 
     Chain_Destroy(chain);
