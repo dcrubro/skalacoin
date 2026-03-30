@@ -24,6 +24,9 @@ void handle_sigint(int sig) {
 
 uint32_t difficultyTarget = INITIAL_DIFFICULTY;
 
+// extern the currentReward from constants.h so we can update it as we mine blocks and save it to disk
+extern uint64_t currentReward;
+
 static bool MineBlock(block_t* block) {
     if (!block) {
         return false;
@@ -45,7 +48,7 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint);
 
     const char* chainDataDir = CHAIN_DATA_DIR;
-    const uint64_t blocksToMine = 1000;
+    const uint64_t blocksToMine = 4000000;
     const double targetSeconds = TARGET_BLOCK_TIME;
 
     uint256_t currentSupply = uint256_from_u64(0);
@@ -56,8 +59,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!Chain_LoadFromFile(chain, chainDataDir, &currentSupply, &difficultyTarget)) {
+    if (!Chain_LoadFromFile(chain, chainDataDir, &currentSupply, &difficultyTarget, &currentReward)) {
         printf("No existing chain loaded from %s\n", chainDataDir);
+    }
+
+    if (currentReward == 0) {
+        currentReward = CalculateBlockReward(currentSupply, chain);
     }
 
     if (Chain_Size(chain) > 0) {
@@ -117,9 +124,11 @@ int main(int argc, char* argv[]) {
             signed_transaction_t coinbaseTx;
             memset(&coinbaseTx, 0, sizeof(coinbaseTx));
             coinbaseTx.transaction.version = 1;
-            coinbaseTx.transaction.amount = CalculateBlockReward(currentSupply, block->header.blockNumber);
+            coinbaseTx.transaction.amount1 = currentReward;
             coinbaseTx.transaction.fee = 0;
-            memcpy(coinbaseTx.transaction.recipientAddress, minerAddress, sizeof(minerAddress));
+            memcpy(coinbaseTx.transaction.recipientAddress1, minerAddress, sizeof(minerAddress));
+            coinbaseTx.transaction.recipientAddress2[0] = 0; // Mark recipient 2 as unused
+            coinbaseTx.transaction.amount2 = 0;
             memset(coinbaseTx.transaction.compressedPublicKey, 0, sizeof(coinbaseTx.transaction.compressedPublicKey));
             memset(coinbaseTx.transaction.senderAddress, 0xFF, sizeof(coinbaseTx.transaction.senderAddress));
             Block_AddTransaction(block, &coinbaseTx);
@@ -144,7 +153,7 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            (void)uint256_add_u64(&currentSupply, coinbaseTx.transaction.amount);
+            (void)uint256_add_u64(&currentSupply, coinbaseTx.transaction.amount1);
 
             uint8_t canonicalHash[32];
             uint8_t powHash[32];
@@ -155,7 +164,7 @@ int main(int argc, char* argv[]) {
                 (unsigned long long)blocksToMine,
                 (unsigned long long)block->header.blockNumber,
                 (unsigned long long)block->header.nonce,
-                (unsigned long long)coinbaseTx.transaction.amount,
+                (unsigned long long)coinbaseTx.transaction.amount1,
                 (unsigned long long)currentSupply.limbs[0],
                 (unsigned int)block->header.difficultyTarget,
                 block->header.merkleRoot[0], block->header.merkleRoot[1], block->header.merkleRoot[2], block->header.merkleRoot[3],
@@ -164,15 +173,18 @@ int main(int argc, char* argv[]) {
 
             free(block); // chain stores blocks by value; transactions are owned by chain copy
 
-            // Save chain after each mined block
-            Chain_SaveToFile(chain, chainDataDir, currentSupply);
+            // Save chain after each mined block; NOTE: In reality, blocks will appear every ~90s, so this won't be a realistic bottleneck on the mainnet
+            Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward);
 
-            if (Chain_Size(chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0) {
-                difficultyTarget = Chain_ComputeNextTarget(chain, difficultyTarget);
-            }
+            currentReward = CalculateBlockReward(currentSupply, chain); // Update the global currentReward for the next block
+            
+            // TEST, disabled diff
+            //if (Chain_Size(chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0) {
+            //    difficultyTarget = Chain_ComputeNextTarget(chain, difficultyTarget);
+            //}
         }
 
-        if (!Chain_SaveToFile(chain, chainDataDir, currentSupply)) {
+        if (!Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward)) {
             fprintf(stderr, "failed to save chain to %s\n", chainDataDir);
         } else {
             printf("Saved chain with %zu blocks to %s (supply=%llu)\n",
@@ -185,12 +197,12 @@ int main(int argc, char* argv[]) {
     }
 
     // Print chain
-    for (size_t i = 0; i < Chain_Size(chain); i++) {
+    /*for (size_t i = 0; i < Chain_Size(chain); i++) {
         block_t* blk = Chain_GetBlock(chain, i);
         if (blk) {
             Block_Print(blk);
         }
-    }
+    }*/
 
     Chain_Destroy(chain);
     Block_ShutdownPowContext();

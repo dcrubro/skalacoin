@@ -1,4 +1,5 @@
 #include <block/chain.h>
+#include <constants.h>
 #include <errno.h>
 #include <sys/stat.h>
 
@@ -134,8 +135,9 @@ void Chain_Wipe(blockchain_t* chain) {
     Chain_ClearBlocks(chain);
 }
 
-bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply) {
+bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply, uint64_t currentReward) {
     // To avoid stalling the chain from peers, write after every block addition (THAT IS VERIFIED)
+    // TODO: Write to one "db" file instead of one file per block - filesystems (and rm *) don't like millions of files :(
 
     if (!chain || !chain->blocks || !EnsureDirectoryExists(dirpath)) {
         return false;
@@ -164,6 +166,8 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         fwrite(&zeroSupply, sizeof(uint256_t), 1, metaFile);
         uint32_t initialTarget = INITIAL_DIFFICULTY;
         fwrite(&initialTarget, sizeof(uint32_t), 1, metaFile);
+        uint64_t initialReward = 0;
+        fwrite(&initialReward, sizeof(uint64_t), 1, metaFile);
 
         // TODO: Potentially some other things here, we'll see
     }
@@ -235,12 +239,13 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     fwrite(&currentSupply, sizeof(uint256_t), 1, metaFile);
     uint32_t difficultyTarget = ((block_t*)DynArr_at(chain->blocks, newSize - 1))->header.difficultyTarget;
     fwrite(&difficultyTarget, sizeof(uint32_t), 1, metaFile);
+    fwrite(&currentReward, sizeof(uint64_t), 1, metaFile);
     fclose(metaFile);
 
     return true;
 }
 
-bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget) {
+bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget, uint64_t* outCurrentReward) {
     if (!chain || !chain->blocks || !dirpath || !outCurrentSupply) {
         return false;
     }
@@ -267,6 +272,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
     fread(lastSavedHash, sizeof(uint8_t), 32, metaFile);
     fread(outCurrentSupply, sizeof(uint256_t), 1, metaFile);
     fread(outDifficultyTarget, sizeof(uint32_t), 1, metaFile);
+    fread(outCurrentReward, sizeof(uint64_t), 1, metaFile);
     fclose(metaFile);
 
     // TODO: Might add a flag to allow reading from a point onward, but just rewrite for now

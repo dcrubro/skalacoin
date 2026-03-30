@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
-#include <constants.h>
 #include <uint256.h>
 
 typedef struct {
@@ -24,8 +23,8 @@ bool Chain_IsValid(blockchain_t* chain);
 void Chain_Wipe(blockchain_t* chain);
 
 // I/O
-bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply);
-bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget);
+bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply, uint64_t currentReward);
+bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget, uint64_t* outCurrentReward);
 
 // Difficulty
 uint32_t Chain_ComputeNextTarget(blockchain_t* chain, uint32_t currentTarget);

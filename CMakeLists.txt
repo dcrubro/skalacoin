@@ -70,6 +70,19 @@ if(MINICOIN_ENABLE_AUTOLYKOS2_REF)
 
     add_library(autolykos2_ref STATIC ${AUTOLYKOS2_REF_SOURCES})
     target_include_directories(autolykos2_ref PRIVATE ${AUTOLYKOS2_REF_BASE}/include)
+    # Upstream source uses `malloc/free/exit/EXIT_FAILURE` without including
+    # stdlib headers in some C++ translation units. AppleClang can compile this,
+    # while Linux Clang fails. Force-include stdlib.h for C++ in this vendored lib.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(autolykos2_ref PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-include>
+            $<$<COMPILE_LANGUAGE:CXX>:stdlib.h>
+        )
+    elseif(MSVC)
+        target_compile_options(autolykos2_ref PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/FIstdlib.h>
+        )
+    endif()
     target_link_libraries(autolykos2_ref PRIVATE
         ${CMAKE_THREAD_LIBS_INIT}
         OpenSSL::SSL
