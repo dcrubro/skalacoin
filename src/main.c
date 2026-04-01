@@ -223,18 +223,14 @@ int main(int argc, char* argv[]) {
             free(block); // chain stores blocks by value; transactions are owned by chain copy
 
             // Save chain after each mined block; NOTE: In reality, blocks will appear every ~90s, so this won't be a realistic bottleneck on the mainnet
-            // TEMP
-            if (Chain_Size(chain) % 100 == 0) {
-                printf("Saving chain at height %zu...\n", Chain_Size(chain));
-                Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward);
-            }
+            printf("Saving chain at height %zu...\n", Chain_Size(chain));
+            Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward);
 
             currentReward = CalculateBlockReward(currentSupply, chain); // Update the global currentReward for the next block
             
-            // TEST, disabled diff
-            //if (Chain_Size(chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0) {
-            //    difficultyTarget = Chain_ComputeNextTarget(chain, difficultyTarget);
-            //}
+            if (Chain_Size(chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0) {
+                difficultyTarget = Chain_ComputeNextTarget(chain, difficultyTarget);
+            }
         }
 
         if (!Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward)) {
