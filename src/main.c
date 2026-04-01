@@ -27,6 +27,53 @@ uint32_t difficultyTarget = INITIAL_DIFFICULTY;
 // extern the currentReward from constants.h so we can update it as we mine blocks and save it to disk
 extern uint64_t currentReward;
 
+static void Uint256ToDecimal(const uint256_t* value, char* out, size_t outSize) {
+    if (!value || !out || outSize == 0) {
+        return;
+    }
+
+    uint64_t tmp[4] = {
+        value->limbs[0],
+        value->limbs[1],
+        value->limbs[2],
+        value->limbs[3]
+    };
+
+    if (tmp[0] == 0 && tmp[1] == 0 && tmp[2] == 0 && tmp[3] == 0) {
+        if (outSize >= 2) {
+            out[0] = '0';
+            out[1] = '\0';
+        } else {
+            out[0] = '\0';
+        }
+        return;
+    }
+
+    char digits[80];
+    size_t digitCount = 0;
+
+    while (tmp[0] != 0 || tmp[1] != 0 || tmp[2] != 0 || tmp[3] != 0) {
+        uint64_t remainder = 0;
+        for (int i = 3; i >= 0; --i) {
+            __uint128_t cur = ((__uint128_t)remainder << 64) | tmp[i];
+            tmp[i] = (uint64_t)(cur / 10u);
+            remainder = (uint64_t)(cur % 10u);
+        }
+
+        if (digitCount < sizeof(digits) - 1) {
+            digits[digitCount++] = (char)('0' + remainder);
+        } else {
+            break;
+        }
+    }
+
+    size_t writeLen = (digitCount < (outSize - 1)) ? digitCount : (outSize - 1);
+    for (size_t i = 0; i < writeLen; ++i) {
+        out[i] = digits[digitCount - 1 - i];
+    }
+    out[writeLen] = '\0';
+}
+
 static bool MineBlock(block_t* block) {
     if (!block) {
         return false;
@@ -154,18 +201,20 @@ int main(int argc, char* argv[]) {
             }
 
             (void)uint256_add_u64(&currentSupply, coinbaseTx.transaction.amount1);
+            char supplyStr[80];
+            Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
 
             uint8_t canonicalHash[32];
             uint8_t powHash[32];
             Block_CalculateHash(block, canonicalHash);
             Block_CalculateAutolykos2Hash(block,     powHash);
-            printf("Mined block %llu/%llu (height=%llu) nonce=%llu reward=%llu supply=%llu diff=%#x merkle=%02x%02x%02x%02x... pow=%02x%02x%02x%02x... canonical=%02x%02x%02x%02x...\n",
+            printf("Mined block %llu/%llu (height=%llu) nonce=%llu reward=%llu supply=%s diff=%#x merkle=%02x%02x%02x%02x... pow=%02x%02x%02x%02x... canonical=%02x%02x%02x%02x...\n",
                 (unsigned long long)(mined + 1),
                 (unsigned long long)blocksToMine,
                 (unsigned long long)block->header.blockNumber,
                 (unsigned long long)block->header.nonce,
                 (unsigned long long)coinbaseTx.transaction.amount1,
-                (unsigned long long)currentSupply.limbs[0],
+                supplyStr,
                 (unsigned int)block->header.difficultyTarget,
                 block->header.merkleRoot[0], block->header.merkleRoot[1], block->header.merkleRoot[2], block->header.merkleRoot[3],
                 powHash[0], powHash[1], powHash[2], powHash[3],
@@ -174,7 +223,11 @@ int main(int argc, char* argv[]) {
             free(block); // chain stores blocks by value; transactions are owned by chain copy
 
             // Save chain after each mined block; NOTE: In reality, blocks will appear every ~90s, so this won't be a realistic bottleneck on the mainnet
-            Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward);
+            // TEMP
+            if (Chain_Size(chain) % 100 == 0) {
+                printf("Saving chain at height %zu...\n", Chain_Size(chain));
+                Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward);
+            }
 
             currentReward = CalculateBlockReward(currentSupply, chain); // Update the global currentReward for the next block
             
@@ -187,13 +240,17 @@ int main(int argc, char* argv[]) {
         if (!Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward)) {
             fprintf(stderr, "failed to save chain to %s\n", chainDataDir);
         } else {
-            printf("Saved chain with %zu blocks to %s (supply=%llu)\n",
+            char supplyStr[80];
+            Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
+            printf("Saved chain with %zu blocks to %s (supply=%s)\n",
                 Chain_Size(chain),
                 chainDataDir,
-                (unsigned long long)currentSupply.limbs[0]);
+                supplyStr);
         }
     } else {
-        printf("Current chain has %zu blocks, total supply %llu\n", Chain_Size(chain), (unsigned long long)currentSupply.limbs[0]);
+        char supplyStr[80];
+        Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
+        printf("Current chain has %zu blocks, total supply %s\n", Chain_Size(chain), supplyStr);
     }
 
     // Print chain

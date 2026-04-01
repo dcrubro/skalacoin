@@ -14,7 +14,18 @@
 #define INITIAL_DIFFICULTY 0x1f0c1422 // Default compact target used by Autolykos2 PoW (This is ridiculously low)
 //#define INITIAL_DIFFICULTY 0x1d1b7c51 // This takes 90s on my machine with a single thread, good for testing
 
-#define INFLATION_PERCENTAGE_PER_EPOCH 15 // 1.5%
+// Reward schedule acceleration: 1 means normal-speed progression.
+#define EMISSION_ACCELERATION_FACTOR 1ULL
+
+// Phase-one target horizon: emit ~2^64-1 atomic units by this many blocks at x1.
+#define PHASE1_TARGET_BLOCKS 3000000ULL
+
+// Inflation is expressed in tenths of a percent to preserve integer math.
+#define INFLATION_PERCENTAGE_PER_EPOCH_TENTHS 15ULL // 1.5%
+
+// Monero-style main emission: reward = (MONEY_SUPPLY - generated) >> speed factor.
+// Keep this at 20 to match the canonical curve shape against a 2^64 atomic supply cap.
+#define MONERO_EMISSION_SPEED_FACTOR 20U
 
 // Future Autolykos2 constants:
 #define EPOCH_LENGTH 350000 // ~1 year at 90s
@@ -35,32 +46,36 @@
  * - Phase 2: Stable DAG growth (target is the max cap) to provide a stable environment for GPU miners, 320k blocks (roughly 11 months)
 **/
 
-static uint64_t currentReward = 0; // Global variable to track current block reward; updated with each block mined
 static const uint64_t M_CAP = 18446744073709551615ULL; // Max uint64
-static const uint64_t TAIL_EMISSION = DECIMALS; // Emission floor is 1.0 coins per block
+static const uint64_t TAIL_EMISSION = 750000000000ULL; // 0.75 coins per block floor
+static uint64_t currentReward = 750000000000ULL; // Epoch reward cache for phase 3
 // No max supply. Instead of halving, it'll follow a more gradual, Monero-like emission curve.
 
 static uint256_t currentSupply = {{0, 0, 0, 0}}; // Global variable to track total supply; updated with each block mined
 
-// Call every epoch
+// Phase 3: update once per effective epoch and keep a fixed per-block reward for that epoch.
 static inline uint64_t GetInflationRateReward(uint256_t currentSupply, blockchain_t* chain) {
     if (!chain || !chain->blocks) { return 0x00; } // Invalid
     size_t height = Chain_Size(chain);
-    
-    block_t* blk = (block_t*)Chain_GetBlock(chain, height - 1); // Last block
-    if (!blk) { return 0x00; } // Invalid
-    
-    if (height % EPOCH_LENGTH == 0) {
-        // Calculate the new block reward (using all integer math to avoid floating point issues)
+    const uint64_t effectiveEpochLength =
+        (EPOCH_LENGTH / EMISSION_ACCELERATION_FACTOR) > 0
+            ? (EPOCH_LENGTH / EMISSION_ACCELERATION_FACTOR)
+            : 1;
 
-        // 1. Multiply supply by 3
-        uint256_t multiplied = currentSupply;
-        uint256_t temp = currentSupply;
-        uint256_add(&multiplied, &temp); // currentSupply * 2
-        uint256_add(&multiplied, &temp); // currentSupply * 3
+    if (height == 0) {
+        currentReward = TAIL_EMISSION;
+        return currentReward;
+    }
+    
+    if (height % effectiveEpochLength == 0) {
+        // inflationPerBlock = currentSupply * 1.5% / effectiveEpochLength
+        // = currentSupply * 15 / (1000 * effectiveEpochLength)
+        uint256_t multiplied = uint256_from_u64(0);
+        for (uint64_t i = 0; i < INFLATION_PERCENTAGE_PER_EPOCH_TENTHS; ++i) {
+            uint256_add(&multiplied, &currentSupply);
+        }
 
-        // 2. Divide by 70,000,000 using scalar short division
-        uint64_t divisor = 70000000ULL;
+        uint64_t divisor = 1000ULL * effectiveEpochLength;
         uint256_t quotient = {{0, 0, 0, 0}};
         unsigned __int128 remainder = 0;
 
@@ -71,43 +86,67 @@ static inline uint64_t GetInflationRateReward(uint256_t currentSupply, blockchai
             remainder = current % divisor;
         }
 
-        currentReward = quotient.limbs[0]; // Update the global reward variable with the new calculated reward for this epoch
-        return quotient.limbs[0]; // Return the least significant limb as the reward (the rest should be 0 for reasonable supply levels)
+        uint64_t inflationPerBlock = quotient.limbs[0];
+        currentReward = (inflationPerBlock > TAIL_EMISSION) ? inflationPerBlock : TAIL_EMISSION;
+        return currentReward;
     }
 
-    return currentReward;
+    return (currentReward > TAIL_EMISSION) ? currentReward : TAIL_EMISSION;
 }
 
 static inline uint64_t CalculateBlockReward(uint256_t currentSupply, blockchain_t* chain) {
     if (!chain || !chain->blocks) { return 0x00; } // Invalid
 
-    uint64_t height = Chain_Size(chain);
+    const uint64_t effectivePhase1Blocks =
+        (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR) > 0
+            ? (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR)
+            : 1;
+    const uint64_t height = (uint64_t)Chain_Size(chain);
+
+    // After the phase-one target horizon, only floor/inflation schedule applies.
+    if (height >= effectivePhase1Blocks) {
+        return GetInflationRateReward(currentSupply, chain);
+    }
 
     if (currentSupply.limbs[1] > 0 || 
         currentSupply.limbs[2] > 0 || 
         currentSupply.limbs[3] > 0 || 
-        currentSupply.limbs[0] >= M_CAP) {
-        return TAIL_EMISSION;
+        currentSupply.limbs[0] >= M_CAP)
+    {
+        // Post-Monero phase with unlimited supply: floor/inflation schedule only.
+        return GetInflationRateReward(currentSupply, chain);
     }
 
-    uint64_t supply_64 = currentSupply.limbs[0];
-    
-    // Formula: ((M - Supply) >> 20) * 181 / 256
-    // Use 128-bit intermediate to avoid overflow while preserving integer math.
-    __uint128_t rewardWide = (((__uint128_t)(M_CAP - supply_64) >> 20) * 181u) >> 8;
-    uint64_t reward = (rewardWide > UINT64_MAX) ? UINT64_MAX : (uint64_t)rewardWide;
-    // At a block time of ~90s and a floor of 1.0 coins, this will make a curve of ~8.5 years
+    const uint64_t generated = currentSupply.limbs[0];
+    const uint64_t remaining = M_CAP - generated;
 
-    // Check if the calculated reward has fallen below the floor
-    if (reward < TAIL_EMISSION) {
-        if (height < EPOCH_LENGTH * 10) { // Transitionary period to inflation of 1.5% per epoch
-            return TAIL_EMISSION;
-        } else {
-            return GetInflationRateReward(currentSupply, chain); // After the transitionary period, switch to the inflation-based reward
-        }
+    // Monero-style base curve against ~2^64 atomic-unit terminal supply.
+    uint64_t reward = remaining >> MONERO_EMISSION_SPEED_FACTOR;
+
+    // Acceleration preserves curve shape while reaching the floor sooner in block-height terms.
+    if (EMISSION_ACCELERATION_FACTOR > 1ULL && reward > 0ULL) {
+        __uint128_t accelerated = (__uint128_t)reward * (__uint128_t)EMISSION_ACCELERATION_FACTOR;
+        reward = (accelerated > (__uint128_t)remaining) ? remaining : (uint64_t)accelerated;
     }
 
-    return reward;
+    // Retarget phase one to finish by PHASE1_TARGET_BLOCKS (x1), while keeping
+    // Monero-style behavior as the preferred curve when it is already sufficient.
+    const uint64_t blocksLeft = effectivePhase1Blocks - height;
+    const uint64_t minRewardToFinish = (remaining + blocksLeft - 1ULL) / blocksLeft; // ceil(remaining / blocksLeft)
+    if (reward < minRewardToFinish) {
+        reward = minRewardToFinish;
+    }
+    if (reward > remaining) {
+        reward = remaining;
+    }
+
+    // Phase 1 until Monero reward goes below the floor.
+    if (reward > TAIL_EMISSION) {
+        return reward;
+    }
+
+    // Phase 2 + 3: floor and epoch inflation updates.
+    return GetInflationRateReward(currentSupply, chain);
 }
 
 #endif

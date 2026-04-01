@@ -291,7 +291,8 @@ void Block_Print(const block_t* block) {
         for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
             signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
             if (tx) {
-                printf("  Tx #%zu: %llu -> %llu, fee %llu\n", i, tx->transaction.amount, tx->transaction.fee, tx->transaction.amount + tx->transaction.fee);
+                printf("  Tx #%zu: 1: %llu -> %02x%02x...%02x%02x, fee %llu\n           2: %llu -> %02x%02x...%02x%02x, fee %llu\n", 
+                    i, tx->transaction.amount1, tx->transaction.recipientAddress1[0], tx->transaction.recipientAddress1[1], tx->transaction.recipientAddress1[30], tx->transaction.recipientAddress1[31], tx->transaction.fee, tx->transaction.amount2, tx->transaction.recipientAddress2[0], tx->transaction.recipientAddress2[1], tx->transaction.recipientAddress2[30], tx->transaction.recipientAddress2[31], tx->transaction.fee);
             }
         }
     } else {

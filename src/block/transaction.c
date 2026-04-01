@@ -43,11 +43,11 @@ bool Transaction_Verify(const signed_transaction_t* tx) {
         return false; // Sender address does not match public key
     }
 
-    if (tx->transaction.amount == 0) {
+    if (tx->transaction.amount1 == 0) {
         return false; // Zero-amount transactions are not valid
     }
 
-    if (tx->transaction.fee > tx->transaction.amount) {
+    if (tx->transaction.fee > tx->transaction.amount1) {
         return false; // Fee cannot exceed amount
     }
 
@@ -55,8 +55,16 @@ bool Transaction_Verify(const signed_transaction_t* tx) {
         return false; // Unsupported version
     }
 
-    if (Address_IsCoinbase(tx->transaction.recipientAddress)) {
+    if (Address_IsCoinbase(tx->transaction.recipientAddress1) || Address_IsCoinbase(tx->transaction.recipientAddress2)) {
         return false; // Cannot send to coinbase address
+    }
+
+    if (tx->transaction.amount2 == 0) {
+        // If amount2 is zero, address2 must be all zeros
+        uint8_t zeroAddress[32] = {0};
+        if (memcmp(tx->transaction.recipientAddress2, zeroAddress, 32) != 0) {
+            return false; // amount2 is zero but address2 is not zeroed
+        }
     }
 
     uint8_t txHash[32];

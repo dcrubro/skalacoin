@@ -55,4 +55,16 @@ static inline bool uint256_add(uint256_t* a, const uint256_t* b) {
     return carry > 0;
 }
 
+/**
+ * Compares two uint256_t values in a greater-than manner.
+ * Returns [-1, 0, 1] if a > b, a < b, or a == b respectively.
+**/
+static inline int uint256_cmp(const uint256_t* a, const uint256_t* b) {
+    for (int i = 3; i >= 0; i--) {
+        if (a->limbs[i] > b->limbs[i]) return 1;
+        if (a->limbs[i] < b->limbs[i]) return -1;
+    }
+    return 0;
+}
+
 #endif
