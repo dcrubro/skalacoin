@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <uint256.h>
+#include <storage/block_table.h>
 
 typedef struct {
     DynArr* blocks;

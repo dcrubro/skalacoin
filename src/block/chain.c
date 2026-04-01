@@ -137,7 +137,7 @@ void Chain_Wipe(blockchain_t* chain) {
 
 bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply, uint64_t currentReward) {
     // To avoid stalling the chain from peers, write after every block addition (THAT IS VERIFIED)
-    // TODO: Write to one "db" file instead of one file per block - filesystems (and rm *) don't like millions of files :(
+    // TODO: Check fwrite() and fread() calls if they actually didn't error
 
     if (!chain || !chain->blocks || !EnsureDirectoryExists(dirpath)) {
         return false;
@@ -148,13 +148,24 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         return false;
     }
 
+    char chainPath[512];
+    if (!BuildPath(chainPath, sizeof(chainPath), dirpath, "chain.data")) {
+        return false;
+    }
+    
+    char tablePath[512];
+    if (!BuildPath(tablePath, sizeof(tablePath), dirpath, "chain.table")) {
+        return false;
+    }
+    
     // Find metadata file (create if not exists) to get the saved chain size (+ other things)
     FILE* metaFile = fopen(metaPath, "rb+");
-    if (!metaFile) {
+    FILE* chainFile = fopen(chainPath, "rb+");
+    FILE* tableFile = fopen(tablePath, "rb+");
+    if (!metaFile || !chainFile || !tableFile) {
+        // Just overwrite everything
         metaFile = fopen(metaPath, "wb+");
-        if (!metaFile) {
-            return false;
-        }
+        if (!metaFile) { return false; }
 
         // Initialize metadata with size 0
         size_t initialSize = 0;
@@ -169,6 +180,12 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         uint64_t initialReward = 0;
         fwrite(&initialReward, sizeof(uint64_t), 1, metaFile);
 
+        chainFile = fopen(chainPath, "wb+");
+        if (!chainFile) { return false; }
+
+        tableFile = fopen(tablePath, "wb+");
+        if (!tableFile) { return false; }
+
         // TODO: Potentially some other things here, we'll see
     }
 
@@ -182,45 +199,63 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     if (savedSize > DynArr_size(chain->blocks)) {
         // Saved chain is longer than current chain, this should not happen if we are always saving the current chain, but just in case, fail to save to avoid overwriting a potentially valid longer chain with a shorter one.
         fclose(metaFile);
+        fclose(chainFile);
+        fclose(tableFile);
         return false;
     }
 
-    // Filename formart: dirpath/block_{index}.dat
-    // File format: [block_header][num_transactions][transactions...] - since block_header is fixed size, LoadFromFile will only read those by default
+    // Filename format: dirpath/chain.data
+    // File format: ([block_header][num_transactions][transactions...])[*length] - since block_header is fixed size, LoadFromFile will only read those by default
+
+    fseek(chainFile, 0, SEEK_END); // Seek to the end of those files
+    fseek(tableFile, 0, SEEK_END);
+    long pos = ftell(chainFile);
+    if (pos < 0) {
+        fclose(metaFile);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    uint64_t byteCount = (uint64_t)pos; // Get the size
 
     // Save blocks that are not yet saved
     for (size_t i = savedSize; i < DynArr_size(chain->blocks); i++) {
         block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
         if (!blk) {
             fclose(metaFile);
+            fclose(chainFile);
+            fclose(tableFile);
             return false;
         }
+
+        uint64_t preIncrementByteSize = byteCount;
 
         // Construct file path
-        char filePath[256];
-        snprintf(filePath, sizeof(filePath), "%s/block_%zu.dat", dirpath, i);
-
-        FILE* blockFile = fopen(filePath, "wb");
-        if (!blockFile) {
-            fclose(metaFile);
-            return false;
-        }
-
         // Write block header
-        fwrite(&blk->header, sizeof(block_header_t), 1, blockFile);
+        fwrite(&blk->header, sizeof(block_header_t), 1, chainFile);
         size_t txSize = DynArr_size(blk->transactions);
-        fwrite(&txSize, sizeof(size_t), 1, blockFile); // Write number of transactions
+        fwrite(&txSize, sizeof(size_t), 1, chainFile); // Write number of transactions
+        byteCount += sizeof(block_header_t) + sizeof(size_t);
         // Write transactions
         for (size_t j = 0; j < txSize; j++) {
             signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, j);
-            if (fwrite(tx, sizeof(signed_transaction_t), 1, blockFile) != 1) {
-                fclose(blockFile);
+            if (fwrite(tx, sizeof(signed_transaction_t), 1, chainFile) != 1) {
+                fclose(chainFile);
                 fclose(metaFile);
+                fclose(tableFile);
                 return false;
             }
+
+            byteCount += sizeof(signed_transaction_t);
         }
 
-        fclose(blockFile);
+        // Create an entry in the block table
+        block_table_entry_t entry;
+        entry.blockNumber = i;
+        entry.byteNumber = preIncrementByteSize;
+        entry.blockSize = byteCount - preIncrementByteSize;
+        fwrite(&entry, sizeof(block_table_entry_t), 1, tableFile);
 
         DynArr_destroy(blk->transactions);
         blk->transactions = NULL; // Clear transactions to save memory since they're now saved on disk
@@ -240,7 +275,16 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     uint32_t difficultyTarget = ((block_t*)DynArr_at(chain->blocks, newSize - 1))->header.difficultyTarget;
     fwrite(&difficultyTarget, sizeof(uint32_t), 1, metaFile);
     fwrite(&currentReward, sizeof(uint64_t), 1, metaFile);
+
+    // Safety
+    fflush(metaFile);
+    fflush(chainFile);
+    fflush(tableFile);
+
+    // Close all pointers
     fclose(metaFile);
+    fclose(chainFile);
+    fclose(tableFile);
 
     return true;
 }
@@ -260,19 +304,31 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
         return false;
     }
 
+    char chainPath[512];
+    if (!BuildPath(chainPath, sizeof(chainPath), dirpath, "chain.data")) {
+        return false;
+    }
+    
+    char tablePath[512];
+    if (!BuildPath(tablePath, sizeof(tablePath), dirpath, "chain.table")) {
+        return false;
+    }
+
     // Read metadata file to get saved chain size (+ other things)
-    FILE* metaFile = fopen(metaPath, "rb");
-    if (!metaFile) {
+    FILE* metaFile = fopen(metaPath, "rb+");
+    FILE* chainFile = fopen(chainPath, "rb+");
+    FILE* tableFile = fopen(tablePath, "rb+");
+    if (!metaFile || !chainFile || !tableFile) {
         return false;
     }
 
     size_t savedSize = 0;
-    fread(&savedSize, sizeof(size_t), 1, metaFile);
+    if (fread(&savedSize, sizeof(size_t), 1, metaFile) != 1) return false;
     uint8_t lastSavedHash[32];
-    fread(lastSavedHash, sizeof(uint8_t), 32, metaFile);
-    fread(outCurrentSupply, sizeof(uint256_t), 1, metaFile);
-    fread(outDifficultyTarget, sizeof(uint32_t), 1, metaFile);
-    fread(outCurrentReward, sizeof(uint64_t), 1, metaFile);
+    if (fread(lastSavedHash, sizeof(uint8_t), 32, metaFile) != 32) return false;
+    if (fread(outCurrentSupply, sizeof(uint256_t), 1, metaFile) != 1) return false;
+    if (fread(outDifficultyTarget, sizeof(uint32_t), 1, metaFile) != 1) return false;
+    if (fread(outCurrentReward, sizeof(uint64_t), 1, metaFile) != 1) return false;
     fclose(metaFile);
 
     // TODO: Might add a flag to allow reading from a point onward, but just rewrite for now
@@ -280,31 +336,41 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
 
     // Load blocks
     for (size_t i = 0; i < savedSize; i++) {
-        // Construct file path
-        char filePath[256];
-        snprintf(filePath, sizeof(filePath), "%s/block_%zu.dat", dirpath, i);
+        // Get the table entry
+        //fseek(tableFile, sizeof(block_table_entry_t) * i, SEEK_SET); // I think that fread() should take care of this for us
+        block_table_entry_t loc;
+        if (fread(&loc, sizeof(block_table_entry_t), 1, tableFile) != 1) {
+            fclose(chainFile);
+            fclose(tableFile);
+            return false;
+        }
+
+        if (loc.blockNumber != i) {
+            return false; // Mismatch
+        }
+
+        // Seek to that position
+        if (fseek(chainFile, loc.byteNumber, SEEK_SET) != 0) {
+            fclose(chainFile);
+            fclose(tableFile);
+            return false;
+        }
 
         block_t* blk = Block_Create();
         if (!blk) {
             return false;
         }
 
-        FILE* blockFile = fopen(filePath, "rb");
-        if (!blockFile) {
-            Block_Destroy(blk);
-            return false;
-        }
-
         // Read block header and transactions
-        if (fread(&blk->header, sizeof(block_header_t), 1, blockFile) != 1) {
-            fclose(blockFile);
+        if (fread(&blk->header, sizeof(block_header_t), 1, chainFile) != 1) {
+            fclose(chainFile);
             Block_Destroy(blk);
             return false;
         }
 
         size_t txSize = 0;
-        if (fread(&txSize, sizeof(size_t), 1, blockFile) != 1) {
-            fclose(blockFile);
+        if (fread(&txSize, sizeof(size_t), 1, chainFile) != 1) {
+            fclose(chainFile);
             Block_Destroy(blk);
             return false;
         }
@@ -318,8 +384,8 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
             }
             Block_AddTransaction(blk, &tx);
         }*/ // Transactions are not read, we use the merkle root for validity
+        blk->transactions = NULL;
 
-        fclose(blockFile);
         Chain_AddBlock(chain, blk);
 
         // Chain_AddBlock stores blocks by value, so the copied block now owns
