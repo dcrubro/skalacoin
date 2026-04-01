@@ -7,6 +7,11 @@ static Autolykos2Context* g_autolykos2Ctx = NULL;
 static Autolykos2Context* GetAutolykos2Ctx(void) {
     if (!g_autolykos2Ctx) {
         g_autolykos2Ctx = Autolykos2_Create();
+        if (!g_autolykos2Ctx) {
+            fprintf(stderr, "Failed to create Autolykos2 context\n");
+            exit(1);
+        }
+        Autolykos2_DagAllocate(g_autolykos2Ctx, DAG_BASE_SIZE);
     }
     return g_autolykos2Ctx;
 }
@@ -16,6 +21,24 @@ void Block_ShutdownPowContext(void) {
         Autolykos2_Destroy(g_autolykos2Ctx);
         g_autolykos2Ctx = NULL;
     }
+}
+
+bool Block_RebuildAutolykos2Dag(size_t dagBytes, const uint8_t seed32[32]) {
+    if (!seed32 || dagBytes == 0) {
+        return false;
+    }
+
+    Autolykos2Context* ctx = GetAutolykos2Ctx();
+    if (!ctx) {
+        return false;
+    }
+
+    Autolykos2_DagClear(ctx);
+    if (!Autolykos2_DagAllocate(ctx, dagBytes)) {
+        return false;
+    }
+
+    return Autolykos2_DagGenerate(ctx, seed32);
 }
 
 block_t* Block_Create() {
@@ -271,9 +294,9 @@ void Block_Destroy(block_t* block) {
 void Block_Print(const block_t* block) {
     if (!block) return;
 
-    printf("Block #%llu\n", block->header.blockNumber);
-    printf("Timestamp: %llu\n", block->header.timestamp);
-    printf("Nonce: %llu\n", block->header.nonce);
+    printf("Block #%llu\n", (unsigned long long)block->header.blockNumber);
+    printf("Timestamp: %llu\n", (unsigned long long)block->header.timestamp);
+    printf("Nonce: %llu\n", (unsigned long long)block->header.nonce);
     printf("Difficulty Target: 0x%08x\n", block->header.difficultyTarget);
     printf("Version: %u\n", block->header.version);
     printf("Previous Hash: ");
@@ -292,7 +315,13 @@ void Block_Print(const block_t* block) {
             signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
             if (tx) {
                 printf("  Tx #%zu: 1: %llu -> %02x%02x...%02x%02x, fee %llu\n           2: %llu -> %02x%02x...%02x%02x, fee %llu\n", 
-                    i, tx->transaction.amount1, tx->transaction.recipientAddress1[0], tx->transaction.recipientAddress1[1], tx->transaction.recipientAddress1[30], tx->transaction.recipientAddress1[31], tx->transaction.fee, tx->transaction.amount2, tx->transaction.recipientAddress2[0], tx->transaction.recipientAddress2[1], tx->transaction.recipientAddress2[30], tx->transaction.recipientAddress2[31], tx->transaction.fee);
+                    i,
+                    (unsigned long long)tx->transaction.amount1,
+                    tx->transaction.recipientAddress1[0], tx->transaction.recipientAddress1[1], tx->transaction.recipientAddress1[30], tx->transaction.recipientAddress1[31],
+                    (unsigned long long)tx->transaction.fee,
+                    (unsigned long long)tx->transaction.amount2,
+                    tx->transaction.recipientAddress2[0], tx->transaction.recipientAddress2[1], tx->transaction.recipientAddress2[30], tx->transaction.recipientAddress2[31],
+                    (unsigned long long)tx->transaction.fee);
             }
         }
     } else {

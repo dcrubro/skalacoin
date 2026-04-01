@@ -12,7 +12,7 @@
                                            // Max adjustment per is x2. So if blocks are coming in too fast, the difficulty will at most double every 24 hours, and vice versa if they're coming in too slow.
 #define TARGET_BLOCK_TIME 90 // Target block time in seconds
 //#define INITIAL_DIFFICULTY 0x1f0c1422 // Default compact target used by Autolykos2 PoW (This is ridiculously low)
-#define INITIAL_DIFFICULTY 0x1d1b7c51 // This takes 90s on my machine with a single thread, good for testing
+#define INITIAL_DIFFICULTY 0x1f1b7c51 // This takes 90s on my machine with a single thread, good for testing
 
 // Reward schedule acceleration: 1 means normal-speed progression.
 #define EMISSION_ACCELERATION_FACTOR 1ULL
@@ -29,16 +29,14 @@
 
 // Future Autolykos2 constants:
 #define EPOCH_LENGTH 350000 // ~1 year at 90s
-#define BASE_DAG_SIZE (2ULL << 30) // 2 GB
-#define DAG_BASE_GROWTH (1ULL << 30) // 1 GB, calculated fully later
-#define DAG_BASE_CAP (8ULL << 30) // 8 GB, adjusted per cycle based off DAG_BASE_GROWTH
+#define DAG_BASE_GROWTH (1ULL << 30) // 1 GB per epoch, adjusted by acceleration
+#define DAG_BASE_SIZE (6ULL << 30) // 6 GB, adjusted per cycle based off DAG_BASE_GROWTH
 // Swings - calculated as MIN(percentage, absolute GB) to prevent absurd swings from low hashrate or very large DAG growth
-#define DAG_MAX_UP_SWING_PERCENTAGE 1.3 // 30%
-#define DAG_MAX_DOWN_SWING_PERCENTAGE 0.85 // 15%
-#define DAG_MAX_UP_SWING_GB (4ULL << 30) // 4 GB
+#define DAG_MAX_UP_SWING_PERCENTAGE 1.15 // 15%
+#define DAG_MAX_DOWN_SWING_PERCENTAGE 0.90 // 10%
+#define DAG_MAX_UP_SWING_GB (2ULL << 30) // 2 GB
 #define DAG_MAX_DOWN_SWING_GB (1ULL << 30) // 1 GB
-#define KICKOUT_TARGET_PERCENTAGE 75
-#define KICKOUT_TARGET_BLOCK 30000 // 1 month at 90s block time
+#define DAG_GENESIS_SEED 0x00 // Genesis seed is zeroes, every epoch's seed is the hash of the previous block, therefore unpredictable until the block is mined
 
 /**
  * Each epoch has 2 phases, connected logarithmically:
@@ -147,6 +145,66 @@ static inline uint64_t CalculateBlockReward(uint256_t currentSupply, blockchain_
 
     // Phase 2 + 3: floor and epoch inflation updates.
     return GetInflationRateReward(currentSupply, chain);
+}
+
+// Hashing DAG
+#include <math.h>
+static inline size_t CalculateTargetDAGSize(blockchain_t* chain) {
+    // Base size plus (base growth * difficulty factor), adjusted by acceleration
+    if (!chain || !chain->blocks) { return 0; } // Invalid
+    uint64_t height = (uint64_t)Chain_Size(chain);
+    
+    if (height < EPOCH_LENGTH) {
+        return DAG_BASE_SIZE;
+    }
+
+    // Get the height - EPOCH_LENGTH block and the last block;
+    block_t* lastBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
+    block_t* epochStartBlock = Chain_GetBlock(chain, (size_t)(Chain_Size(chain) - 1 - EPOCH_LENGTH));
+    if (!lastBlock || !epochStartBlock) {
+        return 0; // Invalid
+    }
+
+    int64_t difficultyDelta = (int64_t)epochStartBlock->header.difficultyTarget - (int64_t)lastBlock->header.difficultyTarget;
+    int64_t growth = (DAG_BASE_GROWTH * difficultyDelta); // Can be negative if difficulty has decreased, which is why we use int64_t
+
+    // Clamp
+    if (growth > 0) {
+        // Difficulty increased -> Clamp the UPWARD swing
+        int64_t maxUp = (int64_t)((DAG_BASE_SIZE * 15) / 100); // 15%
+        if (growth > maxUp) growth = maxUp;
+        if (growth > (int64_t)DAG_MAX_UP_SWING_GB) growth = DAG_MAX_UP_SWING_GB;
+    } else {
+        // Difficulty decreased -> Clamp the DOWNWARD swing
+        int64_t maxDown = (int64_t)((DAG_BASE_SIZE * 10) / 100); // 10%
+        if (-growth > maxDown) growth = -maxDown;
+        if (-growth > (int64_t)DAG_MAX_DOWN_SWING_GB) growth = -(int64_t)DAG_MAX_DOWN_SWING_GB;
+    }
+    
+    int64_t targetSize = (int64_t)DAG_BASE_SIZE + growth;
+    if (targetSize <= 0) {
+        return 0;
+    }
+
+    return (size_t)targetSize;
+}
+
+static inline void GetNextDAGSeed(blockchain_t* chain, uint8_t outSeed[32]) {
+    if (!chain || !chain->blocks || !outSeed) { return; } // Invalid
+    uint64_t height = (uint64_t)Chain_Size(chain);
+
+    if (height < EPOCH_LENGTH) {
+        memset(outSeed, DAG_GENESIS_SEED, 32);
+        return;
+    }
+
+    block_t* prevBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
+    if (!prevBlock) {
+        memset(outSeed, 0x00, 32); // Fallback to zeroes if we can't get the previous block for some reason; The caller should treat this as an error if height >= EPOCH_LENGTH
+        return;
+    }
+
+    Block_CalculateHash(prevBlock, outSeed);
 }
 
 #endif

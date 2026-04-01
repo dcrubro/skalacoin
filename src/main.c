@@ -11,6 +11,7 @@
 #include <signal.h>
 
 #include <constants.h>
+#include <autolykos2/autolykos2.h>
 
 #ifndef CHAIN_DATA_DIR
 #define CHAIN_DATA_DIR "chain_data"
@@ -110,8 +111,21 @@ int main(int argc, char* argv[]) {
         printf("No existing chain loaded from %s\n", chainDataDir);
     }
 
-    if (currentReward == 0) {
+    const uint64_t effectivePhase1Blocks =
+        (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR) > 0
+            ? (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR)
+            : 1;
+
+    // During phase 1, reward is deterministic from (supply,height), so always recompute.
+    // This avoids using stale on-disk cached rewards (e.g. floor reward after genesis).
+    if ((uint64_t)Chain_Size(chain) < effectivePhase1Blocks || currentReward == 0) {
         currentReward = CalculateBlockReward(currentSupply, chain);
+    }
+
+    {
+        uint8_t dagSeed[32];
+        GetNextDAGSeed(chain, dagSeed);
+        (void)Block_RebuildAutolykos2Dag(CalculateTargetDAGSize(chain), dagSeed);
     }
 
     if (Chain_Size(chain) > 0) {
@@ -222,14 +236,21 @@ int main(int argc, char* argv[]) {
 
             free(block); // chain stores blocks by value; transactions are owned by chain copy
 
+            currentReward = CalculateBlockReward(currentSupply, chain); // Update the global currentReward for the next block
+
             // Save chain after each mined block; NOTE: In reality, blocks will appear every ~90s, so this won't be a realistic bottleneck on the mainnet
+            // Persist the reward for the *next* block so restart behavior is correct.
             printf("Saving chain at height %zu...\n", Chain_Size(chain));
             Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward);
-
-            currentReward = CalculateBlockReward(currentSupply, chain); // Update the global currentReward for the next block
             
             if (Chain_Size(chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0) {
                 difficultyTarget = Chain_ComputeNextTarget(chain, difficultyTarget);
+            }
+
+            if (Chain_Size(chain) % EPOCH_LENGTH == 0 && Chain_Size(chain) > 0) {
+                uint8_t dagSeed[32];
+                GetNextDAGSeed(chain, dagSeed);
+                (void)Block_RebuildAutolykos2Dag(CalculateTargetDAGSize(chain), dagSeed);
             }
         }
 

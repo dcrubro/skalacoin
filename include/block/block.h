@@ -29,6 +29,7 @@ block_t* Block_Create();
 void Block_CalculateHash(const block_t* block, uint8_t* outHash);
 void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash);
 void Block_CalculateAutolykos2Hash(const block_t* block, uint8_t* outHash);
+bool Block_RebuildAutolykos2Dag(size_t dagBytes, const uint8_t seed32[32]);
 void Block_AddTransaction(block_t* block, signed_transaction_t* tx);
 void Block_RemoveTransaction(block_t* block, uint8_t* txHash);
 bool Block_HasValidProofOfWork(const block_t* block);
