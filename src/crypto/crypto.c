@@ -75,3 +75,13 @@ void Crypto_SignData(const uint8_t* data, size_t len, const uint8_t* privateKey,
     secp256k1_ecdsa_signature_serialize_compact(ctx, outSignature, &sig);
     secp256k1_context_destroy(ctx);
 }
+
+void to_hex(const uint8_t *in, char *out) {
+    static const char hex[] = "0123456789abcdef";
+
+    for (int i = 0; i < 32; i++) {
+        out[i * 2]     = hex[in[i] >> 4];
+        out[i * 2 + 1] = hex[in[i] & 0x0F];
+    }
+    out[64] = '\0';
+}

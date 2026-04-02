@@ -8,7 +8,7 @@
 #include <block/block.h>
 
 #define DECIMALS 1000000000000ULL
-#define DIFFICULTY_ADJUSTMENT_INTERVAL 960 // Every 960 blocks (roughly every 24 hours with a 90 second block time)
+#define DIFFICULTY_ADJUSTMENT_INTERVAL 3840 // Every 3840 blocks (roughly every 4 days with a 90 second block time)
                                            // Max adjustment per is x2. So if blocks are coming in too fast, the difficulty will at most double every 24 hours, and vice versa if they're coming in too slow.
 #define TARGET_BLOCK_TIME 90 // Target block time in seconds
 //#define INITIAL_DIFFICULTY 0x1f0c1422 // Default compact target used by Autolykos2 PoW (This is ridiculously low)

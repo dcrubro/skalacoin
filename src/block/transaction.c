@@ -59,6 +59,8 @@ bool Transaction_Verify(const signed_transaction_t* tx) {
         return false; // Cannot send to coinbase address
     }
 
+    // TODO: Check that the sender has sufficient funds - if not coinbase
+
     if (tx->transaction.amount2 == 0) {
         // If amount2 is zero, address2 must be all zeros
         uint8_t zeroAddress[32] = {0};

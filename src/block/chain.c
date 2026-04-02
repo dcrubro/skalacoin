@@ -73,9 +73,47 @@ void Chain_Destroy(blockchain_t* chain) {
 }
 
 bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
+    // Assume the block is pre-verified
+
     if (chain && block && chain->blocks) {
-        DynArr_push_back(chain->blocks, block);
+        block_t* blk = (block_t*)DynArr_push_back(chain->blocks, block);
         chain->size++;
+
+        if (blk && blk->transactions) {
+            size_t txCount = DynArr_size(blk->transactions);
+            for (size_t i = 0; i < txCount; i++) {
+                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, i);
+                if (!tx) { continue; }
+
+                // Destination 1
+                balance_sheet_entry_t entry1;
+                uint8_t addr1[32];
+                memcpy(addr1, tx->transaction.recipientAddress1, 32);
+                // Assume addr1 is never NULL, since we enforce that
+                if (BalanceSheet_Lookup(addr1, &entry1)) {
+                    entry1.balance += tx->transaction.amount1;
+                } else {
+                    memcpy(entry1.address, addr1, 32);
+                    entry1.balance = tx->transaction.amount1;
+                }
+                BalanceSheet_Insert(entry1); // Insert/Overwrite
+
+                // Destination 2
+                balance_sheet_entry_t entry2;
+                char ZERO[32] = {0};
+                uint8_t addr2[32];
+                memcpy(addr2, tx->transaction.recipientAddress2, 32);
+                if (memcmp(addr2, ZERO, 32) == 0) { continue; } // Destination 2 not specified, continue
+                if (BalanceSheet_Lookup(addr2, &entry2)) {
+                    entry2.balance += tx->transaction.amount2;
+                } else {
+                    memcpy(entry2.address, addr2, 32);
+                    entry2.balance = tx->transaction.amount2;
+                }
+                BalanceSheet_Insert(entry2);
+            }
+        }
+
         return true;
     }
 
@@ -121,7 +159,8 @@ bool Chain_IsValid(blockchain_t* chain) {
 
         // A potential issue is verifying PoW, since the chain read might only have header data without transactions.
         // A potnetial fix is verifying PoW as we go, when getting new blocks from peers, and only accepting blocks
-        //with valid PoW, so that we can assume all blocks in the chain are valid in that regard.
+        // with valid PoW, so that we can assume all blocks in the chain are valid in that regard.
+        // During the initial sync, we can verify the PoW, the validity of each transaction + coinbase, etc.
     }
     
     // Genesis needs special handling because the prevHash is always invalid (no previous block)
@@ -289,8 +328,8 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     return true;
 }
 
-bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget, uint64_t* outCurrentReward) {
-    if (!chain || !chain->blocks || !dirpath || !outCurrentSupply) {
+bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget, uint64_t* outCurrentReward, uint8_t* outLastSavedHash) {
+    if (!chain || !chain->blocks || !dirpath || !outCurrentSupply || !outLastSavedHash) {
         return false;
     }
 
@@ -324,8 +363,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
 
     size_t savedSize = 0;
     if (fread(&savedSize, sizeof(size_t), 1, metaFile) != 1) return false;
-    uint8_t lastSavedHash[32];
-    if (fread(lastSavedHash, sizeof(uint8_t), 32, metaFile) != 32) return false;
+    if (fread(outLastSavedHash, sizeof(uint8_t), 32, metaFile) != 32) return false;
     if (fread(outCurrentSupply, sizeof(uint256_t), 1, metaFile) != 1) return false;
     if (fread(outDifficultyTarget, sizeof(uint32_t), 1, metaFile) != 1) return false;
     if (fread(outCurrentReward, sizeof(uint64_t), 1, metaFile) != 1) return false;

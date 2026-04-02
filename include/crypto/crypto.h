@@ -9,5 +9,6 @@
 
 bool Crypto_VerifySignature(const uint8_t* data, size_t len, const uint8_t* signature, const uint8_t* publicKey);
 void Crypto_SignData(const uint8_t* data, size_t len, const uint8_t* privateKey, uint8_t* outSignature);
+void to_hex(const uint8_t *in, char *out);
 
 #endif
