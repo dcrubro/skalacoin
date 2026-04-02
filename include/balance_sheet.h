@@ -9,6 +9,7 @@
 #include <khash/khash.h>
 #include <crypto/crypto.h>
 #include <string.h>
+#include <uint256.h>
 
 typedef struct {
     uint8_t bytes[32];
@@ -16,7 +17,7 @@ typedef struct {
 
 typedef struct {
     uint8_t address[32]; // For now just the SHA-256 of the public key; allows representation in different encodings (base58, bech32, etc) without changing the underlying data structure
-    uint64_t balance;
+    uint256_t balance;
     // TODO: Additional things
 } balance_sheet_entry_t;
 

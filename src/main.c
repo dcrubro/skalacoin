@@ -30,6 +30,65 @@ uint32_t difficultyTarget = INITIAL_DIFFICULTY;
 // extern the currentReward from constants.h so we can update it as we mine blocks and save it to disk
 extern uint64_t currentReward;
 
+static void AddressFromCompressedPubkey(const uint8_t compressedPubkey[33], uint8_t outAddress[32]) {
+    if (!compressedPubkey || !outAddress) {
+        return;
+    }
+
+    SHA256(compressedPubkey, 33, outAddress);
+}
+
+static bool GenerateTestMinerIdentity(uint8_t privateKey[32], uint8_t compressedPubkey[33], uint8_t address[32]) {
+    if (!privateKey || !compressedPubkey || !address) {
+        return false;
+    }
+
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    if (!ctx) {
+        return false;
+    }
+
+    uint8_t seed[64];
+    secp256k1_pubkey pubkey;
+
+    for (uint64_t counter = 0; counter < 1024; ++counter) {
+        const char* base = "minicoin-test-miner-key";
+        size_t baseLen = strlen(base);
+        memcpy(seed, base, baseLen);
+        memcpy(seed + baseLen, &counter, sizeof(counter));
+        SHA256(seed, baseLen + sizeof(counter), privateKey);
+
+        if (!secp256k1_ec_seckey_verify(ctx, privateKey)) {
+            continue;
+        }
+
+        if (!secp256k1_ec_pubkey_create(ctx, &pubkey, privateKey)) {
+            continue;
+        }
+
+        size_t pubLen = 33;
+        if (!secp256k1_ec_pubkey_serialize(ctx, compressedPubkey, &pubLen, &pubkey, SECP256K1_EC_COMPRESSED) || pubLen != 33) {
+            continue;
+        }
+
+        AddressFromCompressedPubkey(compressedPubkey, address);
+        secp256k1_context_destroy(ctx);
+        return true;
+    }
+
+    secp256k1_context_destroy(ctx);
+    return false;
+}
+
+static void MakeTestRecipientAddress(uint8_t outAddress[32]) {
+    if (!outAddress) {
+        return;
+    }
+
+    const char* label = "minicoin-test-recipient-address";
+    SHA256((const unsigned char*)label, strlen(label), outAddress);
+}
+
 static void Uint256ToDecimal(const uint256_t* value, char* out, size_t outSize) {
     if (!value || !out || outSize == 0) {
         return;
@@ -161,7 +220,15 @@ int main(int argc, char* argv[]) {
         printf("Mining %llu blocks with target time %.0fs...\n", (unsigned long long)blocksToMine, targetSeconds);
 
         uint8_t minerAddress[32];
-        SHA256((const unsigned char*)"minicoin-miner-1", strlen("minicoin-miner-1"), minerAddress);
+        uint8_t minerPrivateKey[32];
+        uint8_t minerCompressedPubkey[33];
+        if (!GenerateTestMinerIdentity(minerPrivateKey, minerCompressedPubkey, minerAddress)) {
+            fprintf(stderr, "failed to generate test miner keypair\n");
+            Chain_Destroy(chain);
+            Block_ShutdownPowContext();
+            BalanceSheet_Destroy();
+            return 1;
+        }
 
         for (uint64_t mined = 0; mined < blocksToMine; ++mined) {
             block_t* block = Block_Create();
@@ -265,6 +332,96 @@ int main(int argc, char* argv[]) {
 
             isFirstBlockOfLoadedChain = false;
         }
+
+        // Post-loop test: spend 10 coins from the miner address to a different address.
+        // This validates sender balance checks, transaction signing, merkle root generation,
+        // and PoW mining for a non-coinbase transaction.
+        const uint64_t spendAmount = 10ULL * DECIMALS;
+        uint8_t recipientAddress[32];
+        MakeTestRecipientAddress(recipientAddress);
+
+        signed_transaction_t spendTx;
+        memset(&spendTx, 0, sizeof(spendTx));
+        spendTx.transaction.version = 1;
+        spendTx.transaction.fee = 0;
+        spendTx.transaction.amount1 = spendAmount;
+        spendTx.transaction.amount2 = 0;
+        memcpy(spendTx.transaction.senderAddress, minerAddress, sizeof(minerAddress));
+        memcpy(spendTx.transaction.recipientAddress1, recipientAddress, sizeof(recipientAddress));
+        memset(spendTx.transaction.recipientAddress2, 0, sizeof(spendTx.transaction.recipientAddress2));
+        memcpy(spendTx.transaction.compressedPublicKey, minerCompressedPubkey, sizeof(minerCompressedPubkey));
+
+        Transaction_Sign(&spendTx, minerPrivateKey);
+
+        block_t* spendBlock = Block_Create();
+        if (!spendBlock) {
+            fprintf(stderr, "failed to create test spend block\n");
+            Chain_Destroy(chain);
+            Block_ShutdownPowContext();
+            BalanceSheet_Destroy();
+            return 1;
+        }
+
+        spendBlock->header.version = 1;
+        spendBlock->header.blockNumber = (uint64_t)Chain_Size(chain);
+        if (Chain_Size(chain) > 0) {
+            block_t* lastBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
+            if (lastBlock) {
+                Block_CalculateHash(lastBlock, spendBlock->header.prevHash);
+            } else {
+                memset(spendBlock->header.prevHash, 0, sizeof(spendBlock->header.prevHash));
+            }
+        } else {
+            memset(spendBlock->header.prevHash, 0, sizeof(spendBlock->header.prevHash));
+        }
+        spendBlock->header.timestamp = (uint64_t)time(NULL);
+        spendBlock->header.difficultyTarget = difficultyTarget;
+        spendBlock->header.nonce = 0;
+
+        signed_transaction_t testCoinbaseTx;
+        memset(&testCoinbaseTx, 0, sizeof(testCoinbaseTx));
+        testCoinbaseTx.transaction.version = 1;
+        testCoinbaseTx.transaction.amount1 = currentReward;
+        testCoinbaseTx.transaction.fee = 0;
+        memcpy(testCoinbaseTx.transaction.recipientAddress1, minerAddress, sizeof(minerAddress));
+        testCoinbaseTx.transaction.recipientAddress2[0] = 0;
+        testCoinbaseTx.transaction.amount2 = 0;
+        memset(testCoinbaseTx.transaction.compressedPublicKey, 0, sizeof(testCoinbaseTx.transaction.compressedPublicKey));
+        memset(testCoinbaseTx.transaction.senderAddress, 0xFF, sizeof(testCoinbaseTx.transaction.senderAddress));
+
+        Block_AddTransaction(spendBlock, &testCoinbaseTx);
+        Block_AddTransaction(spendBlock, &spendTx);
+
+        uint8_t merkleRoot[32];
+        Block_CalculateMerkleRoot(spendBlock, merkleRoot);
+        memcpy(spendBlock->header.merkleRoot, merkleRoot, sizeof(spendBlock->header.merkleRoot));
+
+        if (!MineBlock(spendBlock)) {
+            fprintf(stderr, "failed to mine test spend block\n");
+            Block_Destroy(spendBlock);
+            Chain_Destroy(chain);
+            Block_ShutdownPowContext();
+            BalanceSheet_Destroy();
+            return 1;
+        }
+
+        if (!Chain_AddBlock(chain, spendBlock)) {
+            fprintf(stderr, "failed to append test spend block to chain\n");
+            Block_Destroy(spendBlock);
+            Chain_Destroy(chain);
+            Block_ShutdownPowContext();
+            BalanceSheet_Destroy();
+            return 1;
+        }
+
+        (void)uint256_add_u64(&currentSupply, testCoinbaseTx.transaction.amount1);
+        currentReward = CalculateBlockReward(currentSupply, chain);
+
+        printf("Mined test spend block (height=%llu) sending %llu base units to a new address\n",
+            (unsigned long long)spendBlock->header.blockNumber,
+            (unsigned long long)spendAmount);
+
+        free(spendBlock);
 
         if (!Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward)) {
             fprintf(stderr, "failed to save chain to %s\n", chainDataDir);

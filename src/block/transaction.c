@@ -59,7 +59,8 @@ bool Transaction_Verify(const signed_transaction_t* tx) {
         return false; // Cannot send to coinbase address
     }
 
-    // TODO: Check that the sender has sufficient funds - if not coinbase
+    // Balance checks are stateful and are handled when a block is added to the chain.
+    // Transaction_Verify only checks transaction structure, addresses, and signature material.
 
     if (tx->transaction.amount2 == 0) {
         // If amount2 is zero, address2 must be all zeros
