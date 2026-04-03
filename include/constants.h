@@ -30,7 +30,8 @@
 // Future Autolykos2 constants:
 #define EPOCH_LENGTH 350000 // ~1 year at 90s
 #define DAG_BASE_GROWTH (1ULL << 30) // 1 GB per epoch, adjusted by acceleration
-#define DAG_BASE_SIZE (6ULL << 30) // 6 GB, adjusted per cycle based off DAG_BASE_GROWTH
+//#define DAG_BASE_SIZE (6ULL << 30) // 6 GB, adjusted per cycle based off DAG_BASE_GROWTH
+#define DAG_BASE_SIZE (1ULL << 30) // TEMPORARY FOR TESTING
 // Swings - calculated as MIN(percentage, absolute GB) to prevent absurd swings from low hashrate or very large DAG growth
 #define DAG_MAX_UP_SWING_PERCENTAGE 1.15 // 15%
 #define DAG_MAX_DOWN_SWING_PERCENTAGE 0.90 // 10%

@@ -158,7 +158,7 @@ int main(int argc, char* argv[]) {
 
     BalanceSheet_Init();
     const char* chainDataDir = CHAIN_DATA_DIR;
-    const uint64_t blocksToMine = 100;
+    const uint64_t blocksToMine = 1000;
     const double targetSeconds = TARGET_BLOCK_TIME;
 
     uint256_t currentSupply = uint256_from_u64(0);
@@ -264,7 +264,7 @@ int main(int argc, char* argv[]) {
             block->header.nonce = 0;
 
             signed_transaction_t coinbaseTx;
-            memset(&coinbaseTx, 0, sizeof(coinbaseTx));
+            Transaction_Init(&coinbaseTx);
             coinbaseTx.transaction.version = 1;
             coinbaseTx.transaction.amount1 = currentReward;
             coinbaseTx.transaction.fee = 0;
@@ -345,7 +345,7 @@ int main(int argc, char* argv[]) {
         MakeTestRecipientAddress(recipientAddress);
 
         signed_transaction_t spendTx;
-        memset(&spendTx, 0, sizeof(spendTx));
+        Transaction_Init(&spendTx);
         spendTx.transaction.version = 1;
         spendTx.transaction.fee = 0;
         spendTx.transaction.amount1 = spendAmount;
@@ -383,6 +383,7 @@ int main(int argc, char* argv[]) {
         spendBlock->header.nonce = 0;
 
         signed_transaction_t testCoinbaseTx;
+        Transaction_Init(&testCoinbaseTx);
         memset(&testCoinbaseTx, 0, sizeof(testCoinbaseTx));
         testCoinbaseTx.transaction.version = 1;
         testCoinbaseTx.transaction.amount1 = currentReward;

@@ -52,6 +52,10 @@ block_t* Block_Create() {
         free(block);
         return NULL;
     }
+    
+    // Zero out padding
+    memset(block->header.reserved, 0, sizeof(block->header.reserved));
+
     return block;
 }
 

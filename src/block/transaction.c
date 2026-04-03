@@ -1,6 +1,14 @@
 #include <block/transaction.h>
 #include <string.h>
 
+void Transaction_Init(signed_transaction_t* tx) {
+    if (!tx) { return; }
+    // Zero out everything
+    memset(tx, 0, sizeof(signed_transaction_t));
+
+    // NOTE: Other things might be added here
+}
+
 void Transaction_CalculateHash(const signed_transaction_t* tx, uint8_t* outHash) {
     if (!tx || !outHash) {
         return;

@@ -51,6 +51,7 @@ typedef struct {
     transaction_sig_t signature;
 } signed_transaction_t;
 
+void Transaction_Init(signed_transaction_t* tx);
 void Transaction_CalculateHash(const signed_transaction_t* tx, uint8_t* outHash);
 void Transaction_Sign(signed_transaction_t* tx, const uint8_t* privateKey);
 bool Transaction_Verify(const signed_transaction_t* tx);

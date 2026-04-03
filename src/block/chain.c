@@ -521,10 +521,18 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
         }*/ // Transactions are not read, we use the merkle root for validity
         blk->transactions = NULL;
 
-        Chain_AddBlock(chain, blk);
+        // Loading from disk currently restores headers only. Do not run Chain_AddBlock,
+        // because it enforces transaction presence and mutates balances.
+        if (!DynArr_push_back(chain->blocks, blk)) {
+            fclose(chainFile);
+            fclose(tableFile);
+            Block_Destroy(blk);
+            return false;
+        }
+        chain->size++;
 
-        // Chain_AddBlock stores blocks by value, so the copied block now owns
-        // blk->transactions. Only free the temporary wrapper struct here.
+        // DynArr_push_back stores blocks by value, so the copied block now owns
+        // blk->transactions (NULL in header-only load mode). Free wrapper only.
         free(blk);
     }
 
