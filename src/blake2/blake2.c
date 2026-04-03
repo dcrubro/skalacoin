@@ -42,9 +42,9 @@ static bool Blake2_HashInternal(
 }
 
 bool Blake2b_Hash(const uint8_t* input, size_t inputLen, uint8_t* out, size_t outLen) {
-    return Blake2_HashInternal(EVP_blake2b512(), MINICOIN_BLAKE2B_OUTBYTES, input, inputLen, out, outLen);
+    return Blake2_HashInternal(EVP_blake2b512(), SKALACOIN_BLAKE2B_OUTBYTES, input, inputLen, out, outLen);
 }
 
 bool Blake2s_Hash(const uint8_t* input, size_t inputLen, uint8_t* out, size_t outLen) {
-    return Blake2_HashInternal(EVP_blake2s256(), MINICOIN_BLAKE2S_OUTBYTES, input, inputLen, out, outLen);
+    return Blake2_HashInternal(EVP_blake2s256(), SKALACOIN_BLAKE2S_OUTBYTES, input, inputLen, out, outLen);
 }

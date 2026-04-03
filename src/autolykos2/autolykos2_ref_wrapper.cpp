@@ -28,27 +28,27 @@ uint32_t calcN(uint32_t Hblock) {
     return newN;
 }
 
-struct minicoin_autolykos2_ref_handle {
+struct skalacoin_autolykos2_ref_handle {
     AutolykosAlg* alg;
 };
 
-extern "C" void* minicoin_autolykos2_ref_create(void) {
-    minicoin_autolykos2_ref_handle* h = new minicoin_autolykos2_ref_handle();
+extern "C" void* skalacoin_autolykos2_ref_create(void) {
+    skalacoin_autolykos2_ref_handle* h = new skalacoin_autolykos2_ref_handle();
     h->alg = new AutolykosAlg();
     return h;
 }
 
-extern "C" void minicoin_autolykos2_ref_destroy(void* handle) {
+extern "C" void skalacoin_autolykos2_ref_destroy(void* handle) {
     if (!handle) {
         return;
     }
 
-    auto* h = static_cast<minicoin_autolykos2_ref_handle*>(handle);
+    auto* h = static_cast<skalacoin_autolykos2_ref_handle*>(handle);
     delete h->alg;
     delete h;
 }
 
-extern "C" bool minicoin_autolykos2_ref_check_target(
+extern "C" bool skalacoin_autolykos2_ref_check_target(
     void* handle,
     const uint8_t message32[32],
     uint64_t nonce,
@@ -59,7 +59,7 @@ extern "C" bool minicoin_autolykos2_ref_check_target(
         return false;
     }
 
-    auto* h = static_cast<minicoin_autolykos2_ref_handle*>(handle);
+    auto* h = static_cast<skalacoin_autolykos2_ref_handle*>(handle);
     if (!h->alg) {
         return false;
     }

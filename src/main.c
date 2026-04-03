@@ -52,7 +52,7 @@ static bool GenerateTestMinerIdentity(uint8_t privateKey[32], uint8_t compressed
     secp256k1_pubkey pubkey;
 
     for (uint64_t counter = 0; counter < 1024; ++counter) {
-        const char* base = "minicoin-test-miner-key";
+        const char* base = "skalacoin-test-miner-key";
         size_t baseLen = strlen(base);
         memcpy(seed, base, baseLen);
         memcpy(seed + baseLen, &counter, sizeof(counter));
@@ -85,7 +85,7 @@ static void MakeTestRecipientAddress(uint8_t outAddress[32]) {
         return;
     }
 
-    const char* label = "minicoin-test-recipient-address";
+    const char* label = "skalacoin-test-recipient-address";
     SHA256((const unsigned char*)label, strlen(label), outAddress);
 }
 

@@ -16,10 +16,10 @@ struct Autolykos2Context {
     void* backend;
 };
 
-#ifdef MINICOIN_AUTOLYKOS2_REF_AVAILABLE
-extern void* minicoin_autolykos2_ref_create(void);
-extern void minicoin_autolykos2_ref_destroy(void* handle);
-extern bool minicoin_autolykos2_ref_check_target(
+#ifdef SKALACOIN_AUTOLYKOS2_REF_AVAILABLE
+extern void* skalacoin_autolykos2_ref_create(void);
+extern void skalacoin_autolykos2_ref_destroy(void* handle);
+extern bool skalacoin_autolykos2_ref_check_target(
     void* handle,
     const uint8_t message32[32],
     uint64_t nonce,
@@ -247,8 +247,8 @@ Autolykos2Context* Autolykos2_Create(void) {
         return NULL;
     }
 
-#ifdef MINICOIN_AUTOLYKOS2_REF_AVAILABLE
-    ctx->backend = minicoin_autolykos2_ref_create();
+#ifdef SKALACOIN_AUTOLYKOS2_REF_AVAILABLE
+    ctx->backend = skalacoin_autolykos2_ref_create();
 #endif
 
     return ctx;
@@ -259,9 +259,9 @@ void Autolykos2_Destroy(Autolykos2Context* ctx) {
         return;
     }
 
-#ifdef MINICOIN_AUTOLYKOS2_REF_AVAILABLE
+#ifdef SKALACOIN_AUTOLYKOS2_REF_AVAILABLE
     if (ctx->backend) {
-        minicoin_autolykos2_ref_destroy(ctx->backend);
+        skalacoin_autolykos2_ref_destroy(ctx->backend);
         ctx->backend = NULL;
     }
 #endif
@@ -430,9 +430,9 @@ bool Autolykos2_CheckTarget(
         return false;
     }
 
-#ifdef MINICOIN_AUTOLYKOS2_REF_AVAILABLE
+#ifdef SKALACOIN_AUTOLYKOS2_REF_AVAILABLE
     if (ctx->backend) {
-        const bool ok = minicoin_autolykos2_ref_check_target(ctx->backend, message32, nonce, height, target32);
+        const bool ok = skalacoin_autolykos2_ref_check_target(ctx->backend, message32, nonce, height, target32);
         if (Autolykos2_Hash(ctx, message32, 32, nonce, height, outHash)) {
             return ok;
         }

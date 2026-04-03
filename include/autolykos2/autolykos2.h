@@ -1,5 +1,5 @@
-#ifndef MINICOIN_AUTOLYKOS2_H
-#define MINICOIN_AUTOLYKOS2_H
+#ifndef SKALACOIN_AUTOLYKOS2_H
+#define SKALACOIN_AUTOLYKOS2_H
 
 #include <stdbool.h>
 #include <stddef.h>

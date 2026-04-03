@@ -1,4 +1,4 @@
-# MiniCoin
+# Skalacoin
 
 Privacy coin made in C. One day hopefully with a purpose beyond "educational" :)
 
@@ -13,7 +13,7 @@ Build with clang/clang++ (I don't want to deal with the gcc/MSVC shenangans righ
 
 Use:
 ```bash
-./bin/minicoin_node <-mine>
+./bin/skalacoin_node <-mine>
 ```
 
 Main Hashing Algorithm: SHA256d (double SHA256) for now.

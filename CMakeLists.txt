@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(miniboinc
+project(skalacoin
     VERSION 0.1.0
     LANGUAGES C CXX
 )
@@ -44,10 +44,10 @@ if(NOT SECP256K1_FOUND)
 endif()
 
 # Autolykos2 CPU reference backend (optional)
-option(MINICOIN_ENABLE_AUTOLYKOS2_REF "Enable Autolykos2 CPU reference backend" ON)
-set(MINICOIN_AUTOLYKOS2_REF_AVAILABLE OFF)
+option(SKALACOIN_ENABLE_AUTOLYKOS2_REF "Enable Autolykos2 CPU reference backend" ON)
+set(SKALACOIN_AUTOLYKOS2_REF_AVAILABLE OFF)
 
-if(MINICOIN_ENABLE_AUTOLYKOS2_REF)
+if(SKALACOIN_ENABLE_AUTOLYKOS2_REF)
     FetchContent_Declare(
         autolykos2_ref_src
         GIT_REPOSITORY https://github.com/mhssamadani/Autolykos2_NV_Miner.git
@@ -88,7 +88,7 @@ if(MINICOIN_ENABLE_AUTOLYKOS2_REF)
         OpenSSL::SSL
         OpenSSL::Crypto
     )
-    set(MINICOIN_AUTOLYKOS2_REF_AVAILABLE ON)
+    set(SKALACOIN_AUTOLYKOS2_REF_AVAILABLE ON)
 endif()
 
 # ---------------------------------------------------------
@@ -121,7 +121,7 @@ else()
     target_link_libraries(node PRIVATE ${SECP256K1_LIBRARY})
 endif()
 
-if(MINICOIN_AUTOLYKOS2_REF_AVAILABLE)
+if(SKALACOIN_AUTOLYKOS2_REF_AVAILABLE)
     target_link_libraries(node PRIVATE autolykos2_ref)
 endif()
 
@@ -136,6 +136,6 @@ target_compile_options(node PRIVATE
 )
 target_compile_definitions(node PRIVATE
     CHAIN_DATA_DIR="${CMAKE_BINARY_DIR}/chain_data"
-    $<$<BOOL:${MINICOIN_AUTOLYKOS2_REF_AVAILABLE}>:MINICOIN_AUTOLYKOS2_REF_AVAILABLE>
+    $<$<BOOL:${SKALACOIN_AUTOLYKOS2_REF_AVAILABLE}>:SKALACOIN_AUTOLYKOS2_REF_AVAILABLE>
 )
-set_target_properties(node PROPERTIES OUTPUT_NAME "minicoin_node")
+set_target_properties(node PROPERTIES OUTPUT_NAME "skalacoin_node")
