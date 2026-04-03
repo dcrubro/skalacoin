@@ -22,7 +22,7 @@ typedef struct {
 
 typedef struct {
     block_header_t header;
-    DynArr* transactions; // Array of signed_transaction_t
+    DynArr* transactions; // Array of signed_transaction_t, NOTE: Potentially move to a hashmap at some point for quick lookups.
 } block_t;
 
 block_t* Block_Create();
