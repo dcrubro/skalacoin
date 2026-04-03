@@ -176,6 +176,10 @@ int main(int argc, char* argv[]) {
         printf("No existing chain loaded from %s\n", chainDataDir);
     }
 
+    if (!BalanceSheet_LoadFromFile(chainDataDir)) {
+        printf("Failed to load the balance sheet or none existing\n");
+    }
+
     const uint64_t effectivePhase1Blocks =
         (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR) > 0
             ? (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR)
@@ -448,6 +452,7 @@ int main(int argc, char* argv[]) {
     }*/
 
     BalanceSheet_Print();
+    BalanceSheet_SaveToFile(chainDataDir);
 
     Chain_Destroy(chain);
     Block_ShutdownPowContext();

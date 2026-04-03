@@ -40,15 +40,48 @@ bool BalanceSheet_Lookup(uint8_t* address, balance_sheet_entry_t* out) {
     return false;
 }
 
-/* TODO */
 bool BalanceSheet_SaveToFile(const char* outPath) {
     if (!sheetMap) { return false; }
+
+    char outFile[512];
+    strcpy(outFile, outPath);
+    strcat(outFile, "/balance_sheet.data");
+    FILE* file = fopen(outFile, "wb");
+    if (!file) { return false; }
+
+    khiter_t k;
+    for (k = kh_begin(sheetMap); k != kh_end(sheetMap); ++k) {
+        if (kh_exist(sheetMap, k)) {
+            balance_sheet_entry_t entry = kh_val(sheetMap, k);
+            if (fwrite(&entry, sizeof(balance_sheet_entry_t), 1, file) != 1) {
+                fclose(file);
+                return false;
+            }
+        }
+    }
+
+    fclose(file);
     return true;
 }
 
-/* TODO */
 bool BalanceSheet_LoadFromFile(const char* inPath) {
     if (!sheetMap) { return false; }
+
+    char inFile[512];
+    strcpy(inFile, inPath);
+    strcat(inFile, "/balance_sheet.data");
+    FILE* file = fopen(inFile, "rb");
+    if (!file) { return false; }
+
+    balance_sheet_entry_t entry;
+    while (fread(&entry, sizeof(balance_sheet_entry_t), 1, file) == 1) {
+        if (BalanceSheet_Insert(entry) < 0) {
+            fclose(file);
+            return false;
+        }
+    }
+
+    fclose(file);
     return true;
 }
 
