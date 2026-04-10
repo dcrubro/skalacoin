@@ -34,7 +34,7 @@ static inline int eq_key32(key32_t a, key32_t b) {
     return memcmp(a.bytes, b.bytes, 32) == 0;
 }
 
-KHASH_INIT(balance_sheet_map_m, key32_t, balance_sheet_entry_t, 1, hash_key32, eq_key32);
+KHASH_INIT(balance_sheet_map_m, key32_t, balance_sheet_entry_t, 1, hash_key32, eq_key32)
 extern khash_t(balance_sheet_map_m)* sheetMap;
 
 void BalanceSheet_Init();
