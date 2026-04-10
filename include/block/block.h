@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 
+#pragma pack(push, 1) // Ensure no padding for consistent file storage
 typedef struct {
     uint64_t blockNumber;
     uint64_t timestamp;
@@ -19,6 +20,7 @@ typedef struct {
     uint8_t version;
     uint8_t reserved[3];       // 3 bytes (Explicit padding for 8-byte alignment)
 } block_header_t;
+#pragma pack(pop)
 
 typedef struct {
     block_header_t header;

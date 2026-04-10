@@ -21,6 +21,7 @@ static inline bool Address_IsCoinbase(const uint8_t address[32]) {
 }
 
 // 160 bytes total for v1
+#pragma pack(push, 1) // Ensure no padding for consistent file storage
 typedef struct {
     uint64_t fee; // Rewarded to the miner; can be zero, but the miner may choose to ignore transactions with very low fees
     uint64_t amount1;
@@ -40,6 +41,7 @@ typedef struct {
     uint8_t version;
     uint8_t reserved[6]; // 6 bytes (Explicit padding for 8-byte alignment)
 } transaction_t;
+#pragma pack(pop)
 
 typedef struct {
     uint8_t txHash[32];
