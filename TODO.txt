@@ -1,11 +1,15 @@
-Move to a GPU algo. RandomX is a good candidate, but CPU mining is not that attractive to anyone but people who actually want to support the project.
-It won't incentivize people who want to profit, which let's be fair, is the majority of miners.
-
+TODO:
 Implement Horizen's "Reorg Penalty" system to make it harder for the young chain to be attacked by a powerful miner.
 
 Make transactions private. A bit more work, but it's a challenge worth taking on.
 I want to make an "optional privacy" system, where the TX can be public or private. Of course private TXs need more bytes, so the fees (although low) will be higher for them.
 I need to figure out a way to make the privacy work without a UTXO system, and instead, with a "Balance Sheet" approach.
 
+Move the Networking Code to support win32 as well, as I'm just doing POSIX right now
+
+DONE:
 I want to move away from the Monero emission. I want to do something a bit radical for cryptocurrency, but I feel like it's necessary to make it more like money:
 a constant inflation rate of 1.5% per year. It's lower than fiat (USD is ~2.8% per year), and it additionally doesn't fluctuate during crisis. It's constant.
+
+Move to a GPU algo. RandomX is a good candidate, but CPU mining is not that attractive to anyone but people who actually want to support the project.
+Sadly, CPUs won't incentivize people who want to profit, which let's be fair, is the majority of miners.

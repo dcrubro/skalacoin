@@ -10,7 +10,7 @@
 #include <pthread.h>
 #include <stdint.h>
 
-#include <tcpd/tcpclient.h>
+#include <tcpd/tcpconnection.h>
 #include <numgen.h>
 #include <dynarr.h>
 
@@ -20,37 +20,37 @@ typedef struct {
     int opt;
 
     // Called before the client thread runs
-    void (*on_connect)(TcpClient* client);
+    void (*on_connect)(tcp_connection_t* client);
     // Called when data is received
-    void (*on_data)(TcpClient* client);
+    void (*on_data)(tcp_connection_t* client);
     // Called before the socket and client thread are killed; Do NOT free client manually
-    void (*on_disconnect)(TcpClient* client);
+    void (*on_disconnect)(tcp_connection_t* client);
 
     // max clients
     size_t clients;
-    TcpClient** clientsArrPtr;
+    tcp_connection_t** clientsArrPtr;
 
     pthread_t svrThread;
-} TcpServer;
+} tcp_server_t;
 
 struct tcpclient_thread_args {
-    TcpClient* clientPtr;
-    TcpServer* serverPtr;
+    tcp_connection_t* clientPtr;
+    tcp_server_t* serverPtr;
 };
 
 typedef struct tcpclient_thread_args tcpclient_thread_args;
 
-TcpServer* TcpServer_Create();
-void TcpServer_Destroy(TcpServer* ptr);
+tcp_server_t* TcpServer_Create();
+void TcpServer_Destroy(tcp_server_t* ptr);
 
-void TcpServer_Init(TcpServer* ptr, unsigned short port, const char* addr);
-void TcpServer_Start(TcpServer* ptr, int maxcons);
-void TcpServer_Stop(TcpServer* ptr);
-void TcpServer_Send(TcpServer* ptr, TcpClient* cli, void* data, size_t len);
+void TcpServer_Init(tcp_server_t* ptr, unsigned short port, const char* addr);
+void TcpServer_Start(tcp_server_t* ptr, int maxcons);
+void TcpServer_Stop(tcp_server_t* ptr);
+void TcpServer_Send(tcp_server_t* ptr, tcp_connection_t* cli, void* data, size_t len);
 void Generic_SendSocket(int sock, void* data, size_t len);
-void TcpServer_Disconnect(TcpServer* ptr, TcpClient* cli);
-void TcpServer_KillClient(TcpServer* ptr, TcpClient* cli);
+void TcpServer_Disconnect(tcp_server_t* ptr, tcp_connection_t* cli);
+void TcpServer_KillClient(tcp_server_t* ptr, tcp_connection_t* cli);
 
-size_t Generic_FindClientInArrayByPtr(TcpClient** arr, TcpClient* ptr, size_t len);
+size_t Generic_FindClientInArrayByPtr(tcp_connection_t** arr, tcp_connection_t* ptr, size_t len);
 
 #endif

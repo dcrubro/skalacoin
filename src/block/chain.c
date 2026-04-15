@@ -455,15 +455,43 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
     FILE* chainFile = fopen(chainPath, "rb+");
     FILE* tableFile = fopen(tablePath, "rb+");
     if (!metaFile || !chainFile || !tableFile) {
+        if (metaFile) fclose(metaFile);
+        if (chainFile) fclose(chainFile);
+        if (tableFile) fclose(tableFile);
         return false;
     }
 
     size_t savedSize = 0;
-    if (fread(&savedSize, sizeof(size_t), 1, metaFile) != 1) return false;
-    if (fread(outLastSavedHash, sizeof(uint8_t), 32, metaFile) != 32) return false;
-    if (fread(outCurrentSupply, sizeof(uint256_t), 1, metaFile) != 1) return false;
-    if (fread(outDifficultyTarget, sizeof(uint32_t), 1, metaFile) != 1) return false;
-    if (fread(outCurrentReward, sizeof(uint64_t), 1, metaFile) != 1) return false;
+    if (fread(&savedSize, sizeof(size_t), 1, metaFile) != 1) {
+        fclose(metaFile);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+    if (fread(outLastSavedHash, sizeof(uint8_t), 32, metaFile) != 32) {
+        fclose(metaFile);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+    if (fread(outCurrentSupply, sizeof(uint256_t), 1, metaFile) != 1) {
+        fclose(metaFile);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+    if (fread(outDifficultyTarget, sizeof(uint32_t), 1, metaFile) != 1) {
+        fclose(metaFile);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+    if (fread(outCurrentReward, sizeof(uint64_t), 1, metaFile) != 1) {
+        fclose(metaFile);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
     fclose(metaFile);
 
     // TODO: Might add a flag to allow reading from a point onward, but just rewrite for now
@@ -481,6 +509,8 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
         }
 
         if (loc.blockNumber != i) {
+            fclose(chainFile);
+            fclose(tableFile);
             return false; // Mismatch
         }
 
@@ -491,24 +521,30 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
             return false;
         }
 
-        block_t* blk = Block_Create();
+        // Header-only load path: do not allocate per-block transaction arrays.
+        block_t* blk = (block_t*)calloc(1, sizeof(block_t));
         if (!blk) {
+            fclose(chainFile);
+            fclose(tableFile);
             return false;
         }
 
         // Read block header and transactions
         if (fread(&blk->header, sizeof(block_header_t), 1, chainFile) != 1) {
             fclose(chainFile);
-            Block_Destroy(blk);
+            fclose(tableFile);
+            free(blk);
             return false;
         }
 
         size_t txSize = 0;
         if (fread(&txSize, sizeof(size_t), 1, chainFile) != 1) {
             fclose(chainFile);
-            Block_Destroy(blk);
+            fclose(tableFile);
+            free(blk);
             return false;
         }
+        (void)txSize;
 
         /*for (size_t j = 0; j < txSize; j++) {
             signed_transaction_t tx;
@@ -526,7 +562,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
         if (!DynArr_push_back(chain->blocks, blk)) {
             fclose(chainFile);
             fclose(tableFile);
-            Block_Destroy(blk);
+            free(blk);
             return false;
         }
         chain->size++;
@@ -537,6 +573,8 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
     }
 
     chain->size = savedSize;
+    fclose(chainFile);
+    fclose(tableFile);
 
     // After read, you SHOULD verify chain validity. We're not doing it here since returning false is a bit unclear if the read failed or if the chain is invalid.
     return true;

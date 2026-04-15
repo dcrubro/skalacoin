@@ -15,6 +15,8 @@
 #include <autolykos2/autolykos2.h>
 #include <time.h>
 
+#include <nets/net_node.h>
+
 #ifndef CHAIN_DATA_DIR
 #define CHAIN_DATA_DIR "chain_data"
 #endif
@@ -168,6 +170,12 @@ int main(int argc, char* argv[]) {
     const double targetSeconds = TARGET_BLOCK_TIME;
 
     uint256_t currentSupply = uint256_from_u64(0);
+
+    net_node_t* node = Node_Create();
+    if (!node) {
+        BalanceSheet_Destroy();
+        return 1;
+    }
 
     blockchain_t* chain = Chain_Create();
     if (!chain) {
@@ -479,5 +487,8 @@ int main(int argc, char* argv[]) {
 
     Chain_Destroy(chain);
     Block_ShutdownPowContext();
+
+    Node_Destroy(node);
+
     return 0;
 }

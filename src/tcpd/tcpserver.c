@@ -1,7 +1,9 @@
+#ifndef _WIN32
+
 #include <tcpd/tcpserver.h>
 
-TcpServer* TcpServer_Create() {
-    TcpServer* svr = (TcpServer*)malloc(sizeof(TcpServer));
+tcp_server_t* TcpServer_Create() {
+    tcp_server_t* svr = (tcp_server_t*)malloc(sizeof(tcp_server_t));
 
     if (!svr) {
         perror("tcpserver - creation failure");
@@ -20,7 +22,7 @@ TcpServer* TcpServer_Create() {
     return svr;
 }
 
-void TcpServer_Destroy(TcpServer* ptr) {
+void TcpServer_Destroy(tcp_server_t* ptr) {
     if (ptr) {
         if (ptr->clientsArrPtr) {
             for (size_t i = 0; i < ptr->clients; i++) {
@@ -37,7 +39,7 @@ void TcpServer_Destroy(TcpServer* ptr) {
     }
 }
 
-void TcpServer_Init(TcpServer* ptr, unsigned short port, const char* addr) {
+void TcpServer_Init(tcp_server_t* ptr, unsigned short port, const char* addr) {
     if (ptr) {
         // Create socket
         ptr->sockFd = socket(AF_INET, SOCK_STREAM, 0);
@@ -74,8 +76,8 @@ void* TcpServer_clientthreadprocess(void* ptr) {
 
     tcpclient_thread_args* args = (tcpclient_thread_args*)ptr;
 
-    TcpClient* cli = args->clientPtr;
-    TcpServer* svr = args->serverPtr;
+    tcp_connection_t* cli = args->clientPtr;
+    tcp_server_t* svr = args->serverPtr;
 
     if (args) {
         free(args);
@@ -97,13 +99,15 @@ void* TcpServer_clientthreadprocess(void* ptr) {
         pthread_testcancel(); // Check for thread death
     }
 
-    cli->on_disconnect(cli);
+    if (cli->on_disconnect) {
+        cli->on_disconnect(cli);
+    }
 
     // Close on exit
     close(cli->clientFd);
 
     // Destroy
-    TcpClient** arr = svr->clientsArrPtr;
+    tcp_connection_t** arr = svr->clientsArrPtr;
     size_t idx = Generic_FindClientInArrayByPtr(arr, cli, svr->clients);
     if (idx != SIZE_MAX) {
         if (arr[idx]) {
@@ -126,9 +130,9 @@ void* TcpServer_threadprocess(void* ptr) {
         return NULL;
     }
     
-    TcpServer* svr = (TcpServer*)ptr;
+    tcp_server_t* svr = (tcp_server_t*)ptr;
     while (1) {
-        TcpClient tempclient;
+        tcp_connection_t tempclient;
         socklen_t clientsize = sizeof(tempclient.clientAddr);
         int client = accept(svr->sockFd, (struct sockaddr*)&tempclient.clientAddr, &clientsize);
         if (client >= 0) {
@@ -137,7 +141,7 @@ void* TcpServer_threadprocess(void* ptr) {
             tempclient.on_disconnect = svr->on_disconnect;
 
             // I'm lazy, so I'm just copying the data for now (I should probably make this a better way)
-            TcpClient* heapCli = (TcpClient*)malloc(sizeof(TcpClient));
+            tcp_connection_t* heapCli = (tcp_connection_t*)malloc(sizeof(tcp_connection_t));
             if (!heapCli) {
                 perror("tcpserver - client failed to allocate");
                 exit(EXIT_FAILURE); // Wtf just happened???
@@ -193,7 +197,7 @@ void* TcpServer_threadprocess(void* ptr) {
     return NULL;
 }
 
-void TcpServer_Start(TcpServer* ptr, int maxcons) {
+void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
     if (ptr) {
         if (listen(ptr->sockFd, maxcons) < 0) {
             perror("tcpserver - listen");
@@ -202,7 +206,7 @@ void TcpServer_Start(TcpServer* ptr, int maxcons) {
         }
 
         ptr->clients = maxcons;
-        ptr->clientsArrPtr = (TcpClient**)malloc(sizeof(TcpClient*) * maxcons);
+        ptr->clientsArrPtr = (tcp_connection_t**)malloc(sizeof(tcp_connection_t*) * maxcons);
 
         if (!ptr->clientsArrPtr) {
             perror("tcpserver - allocation of client space fatally errored");
@@ -219,7 +223,7 @@ void TcpServer_Start(TcpServer* ptr, int maxcons) {
     pthread_create(&ptr->svrThread, NULL, TcpServer_threadprocess, ptr);
 }
 
-void TcpServer_Stop(TcpServer* ptr) {
+void TcpServer_Stop(tcp_server_t* ptr) {
     if (ptr && ptr->svrThread != 0) {
         // Stop server
         pthread_cancel(ptr->svrThread);
@@ -227,7 +231,7 @@ void TcpServer_Stop(TcpServer* ptr) {
 
         // Disconnect clients
         for (size_t i = 0; i < ptr->clients; i++) {
-            TcpClient* cliPtr = ptr->clientsArrPtr[i];
+            tcp_connection_t* cliPtr = ptr->clientsArrPtr[i];
             if (cliPtr) {
                 close(cliPtr->clientFd);
                 pthread_cancel(cliPtr->clientThread);
@@ -238,7 +242,7 @@ void TcpServer_Stop(TcpServer* ptr) {
     }
 }
 
-void TcpServer_Send(TcpServer* ptr, TcpClient* cli, void* data, size_t len) {
+void TcpServer_Send(tcp_server_t* ptr, tcp_connection_t* cli, void* data, size_t len) {
     if (ptr && cli && data && len > 0) {
         size_t sent = 0;
         while (sent < len) {
@@ -267,7 +271,7 @@ void Generic_SendSocket(int sock, void* data, size_t len) {
     }
 }
 
-void TcpServer_Disconnect(TcpServer* ptr, TcpClient* cli) {
+void TcpServer_Disconnect(tcp_server_t* ptr, tcp_connection_t* cli) {
     if (ptr && cli) {
         close(cli->clientFd);
         pthread_cancel(cli->clientThread);
@@ -284,7 +288,7 @@ void TcpServer_Disconnect(TcpServer* ptr, TcpClient* cli) {
     }
 }
 
-void TcpServer_KillClient(TcpServer* ptr, TcpClient* cli) {
+void TcpServer_KillClient(tcp_server_t* ptr, tcp_connection_t* cli) {
     if (ptr && cli) {
         // RST the connection
         struct linger so_linger;
@@ -306,7 +310,7 @@ void TcpServer_KillClient(TcpServer* ptr, TcpClient* cli) {
     }
 }
 
-size_t Generic_FindClientInArrayByPtr(TcpClient** arr, TcpClient* ptr, size_t len) {
+size_t Generic_FindClientInArrayByPtr(tcp_connection_t** arr, tcp_connection_t* ptr, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (arr[i] == ptr) {
             return i;
@@ -315,3 +319,5 @@ size_t Generic_FindClientInArrayByPtr(TcpClient** arr, TcpClient* ptr, size_t le
 
     return SIZE_MAX; // Returns max unsigned, likely improbable to be correct
 }
+
+#endif

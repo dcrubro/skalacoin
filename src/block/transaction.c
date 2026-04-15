@@ -30,7 +30,7 @@ void Transaction_Sign(signed_transaction_t* tx, const uint8_t* privateKey) {
     Transaction_CalculateHash(tx, txHash);
     Crypto_SignData(
         txHash,
-        sizeof(transaction_t),
+        32,
         privateKey,
         tx->signature.signature
     );

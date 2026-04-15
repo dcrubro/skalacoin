@@ -11,19 +11,19 @@
 
 #define MTU 1500
 
-struct TcpClient {
+struct tcp_connection_t {
     int clientFd;
     struct sockaddr_in clientAddr;
     uint32_t clientId;
 
     unsigned char dataBuf[MTU];
     ssize_t dataBufLen;
-    void (*on_data)(struct TcpClient* client);
-    void (*on_disconnect)(struct TcpClient* client);
+    void (*on_data)(struct tcp_connection_t* client);
+    void (*on_disconnect)(struct tcp_connection_t* client);
 
     pthread_t clientThread;
 };
 
-typedef struct TcpClient TcpClient;
+typedef struct tcp_connection_t tcp_connection_t;
 
 #endif
