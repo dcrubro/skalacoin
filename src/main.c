@@ -13,6 +13,7 @@
 
 #include <constants.h>
 #include <autolykos2/autolykos2.h>
+#include <time.h>
 
 #ifndef CHAIN_DATA_DIR
 #define CHAIN_DATA_DIR "chain_data"
@@ -80,13 +81,17 @@ static bool GenerateTestMinerIdentity(uint8_t privateKey[32], uint8_t compressed
     return false;
 }
 
+static int testCounts = 0;
 static void MakeTestRecipientAddress(uint8_t outAddress[32]) {
     if (!outAddress) {
         return;
     }
 
-    const char* label = "skalacoin-test-recipient-address";
-    SHA256((const unsigned char*)label, strlen(label), outAddress);
+    const char* label = "skalacoin-test-recipient-address-";
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "%s%d", label, testCounts);
+    SHA256((const unsigned char*)buffer, strlen(buffer), outAddress);
+    testCounts++;
 }
 
 static void Uint256ToDecimal(const uint256_t* value, char* out, size_t outSize) {
@@ -155,6 +160,7 @@ static bool MineBlock(block_t* block) {
 
 int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint);
+    srand((unsigned int)time(NULL));
 
     BalanceSheet_Init();
     const char* chainDataDir = CHAIN_DATA_DIR;
@@ -337,25 +343,30 @@ int main(int argc, char* argv[]) {
             isFirstBlockOfLoadedChain = false;
         }
 
-        // Post-loop test: spend 10 coins from the miner address to a different address.
+        // Post-loop test: spend some coins from the miner address to a different address.
         // This validates sender balance checks, transaction signing, merkle root generation,
         // and PoW mining for a non-coinbase transaction.
-        const uint64_t spendAmount = 10ULL * DECIMALS;
-        uint8_t recipientAddress[32];
-        MakeTestRecipientAddress(recipientAddress);
+        signed_transaction_t spends[100];
+        for (int i = 0; i < 100; i++) {
+            int rng = rand() % 10; // Random amount between 0 and 9 (inclusive)
+            const uint64_t spendAmount = rng * DECIMALS;
+            uint8_t recipientAddress[32];
+            MakeTestRecipientAddress(recipientAddress);
 
-        signed_transaction_t spendTx;
-        Transaction_Init(&spendTx);
-        spendTx.transaction.version = 1;
-        spendTx.transaction.fee = 0;
-        spendTx.transaction.amount1 = spendAmount;
-        spendTx.transaction.amount2 = 0;
-        memcpy(spendTx.transaction.senderAddress, minerAddress, sizeof(minerAddress));
-        memcpy(spendTx.transaction.recipientAddress1, recipientAddress, sizeof(recipientAddress));
-        memset(spendTx.transaction.recipientAddress2, 0, sizeof(spendTx.transaction.recipientAddress2));
-        memcpy(spendTx.transaction.compressedPublicKey, minerCompressedPubkey, sizeof(minerCompressedPubkey));
+            signed_transaction_t spendTx;
+            Transaction_Init(&spendTx);
+            spendTx.transaction.version = 1;
+            spendTx.transaction.fee = 0;
+            spendTx.transaction.amount1 = spendAmount;
+            spendTx.transaction.amount2 = 0;
+            memcpy(spendTx.transaction.senderAddress, minerAddress, sizeof(minerAddress));
+            memcpy(spendTx.transaction.recipientAddress1, recipientAddress, sizeof(recipientAddress));
+            memset(spendTx.transaction.recipientAddress2, 0, sizeof(spendTx.transaction.recipientAddress2));
+            memcpy(spendTx.transaction.compressedPublicKey, minerCompressedPubkey, sizeof(minerCompressedPubkey));
 
-        Transaction_Sign(&spendTx, minerPrivateKey);
+            Transaction_Sign(&spendTx, minerPrivateKey);
+            spends[i] = spendTx;
+        }
 
         block_t* spendBlock = Block_Create();
         if (!spendBlock) {
@@ -395,7 +406,9 @@ int main(int argc, char* argv[]) {
         memset(testCoinbaseTx.transaction.senderAddress, 0xFF, sizeof(testCoinbaseTx.transaction.senderAddress));
 
         Block_AddTransaction(spendBlock, &testCoinbaseTx);
-        Block_AddTransaction(spendBlock, &spendTx);
+        for (int i = 0; i < 100; i++) {
+            Block_AddTransaction(spendBlock, &spends[i]);
+        }
 
         uint8_t merkleRoot[32];
         Block_CalculateMerkleRoot(spendBlock, merkleRoot);
@@ -422,14 +435,21 @@ int main(int argc, char* argv[]) {
         (void)uint256_add_u64(&currentSupply, testCoinbaseTx.transaction.amount1);
         currentReward = CalculateBlockReward(currentSupply, chain);
 
-        printf("Mined test spend block (height=%llu) sending %llu base units to a new address\n",
-            (unsigned long long)spendBlock->header.blockNumber,
-            (unsigned long long)spendAmount);
+        //printf("Mined test spend block (height=%llu) sending %llu base units to a new address\n",
+        //    (unsigned long long)spendBlock->header.blockNumber,
+        //    (unsigned long long)spendAmount);
 
         free(spendBlock);
 
-        if (!Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward)) {
-            fprintf(stderr, "failed to save chain to %s\n", chainDataDir);
+        bool chainSaved = Chain_SaveToFile(chain, chainDataDir, currentSupply, currentReward);
+        bool sheetSaved = BalanceSheet_SaveToFile(chainDataDir);
+        if (!chainSaved || !sheetSaved) {
+            if (!chainSaved) {
+                fprintf(stderr, "failed to save chain to %s\n", chainDataDir);
+            }
+            if (!sheetSaved) {
+                fprintf(stderr, "failed to save balance sheet to %s\n", chainDataDir);
+            }
         } else {
             char supplyStr[80];
             Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
@@ -453,7 +473,9 @@ int main(int argc, char* argv[]) {
     }*/
 
     BalanceSheet_Print();
-    BalanceSheet_SaveToFile(chainDataDir);
+    if (!BalanceSheet_SaveToFile(chainDataDir)) {
+        fprintf(stderr, "failed to save balance sheet to %s\n", chainDataDir);
+    }
 
     Chain_Destroy(chain);
     Block_ShutdownPowContext();
