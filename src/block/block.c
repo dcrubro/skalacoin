@@ -199,7 +199,9 @@ void Block_RemoveTransaction(block_t* block, uint8_t* txHash) {
 
     for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
         signed_transaction_t* currentTx = (signed_transaction_t*)DynArr_at(block->transactions, i);
-        if (memcmp(currentTx->signature.txHash, txHash, 32) == 0) {
+        uint8_t currentTxHash[32];
+        Transaction_CalculateHash(currentTx, currentTxHash);
+        if (memcmp(currentTxHash, txHash, 32) == 0) {
             DynArr_remove(block->transactions, i);
             return;
         }

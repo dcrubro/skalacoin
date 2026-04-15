@@ -44,7 +44,6 @@ typedef struct {
 #pragma pack(pop)
 
 typedef struct {
-    uint8_t txHash[32];
     uint8_t signature[64]; // Signature of the hash
 } transaction_sig_t;
 

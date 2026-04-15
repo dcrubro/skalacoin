@@ -26,9 +26,10 @@ void Transaction_Sign(signed_transaction_t* tx, const uint8_t* privateKey) {
         return;
     }
 
-    Transaction_CalculateHash(tx, tx->signature.txHash);
+    uint8_t txHash[32];
+    Transaction_CalculateHash(tx, txHash);
     Crypto_SignData(
-        (const uint8_t*)&tx->transaction,
+        txHash,
         sizeof(transaction_t),
         privateKey,
         tx->signature.signature
@@ -81,13 +82,9 @@ bool Transaction_Verify(const signed_transaction_t* tx) {
     uint8_t txHash[32];
     Transaction_CalculateHash(tx, txHash);
 
-    if (memcmp(txHash, tx->signature.txHash, 32) != 0) {
-        return false; // Hash does not match signature hash
-    }
-
     // If all checks pass, verify the signature
     return Crypto_VerifySignature(
-        (const uint8_t*)&tx->transaction,
+        txHash,
         sizeof(transaction_t),
         tx->signature.signature,
         tx->transaction.compressedPublicKey
