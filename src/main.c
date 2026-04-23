@@ -671,7 +671,7 @@ int main(int argc, char* argv[]) {
 
             char addrHex[65];
             AddressToHexString(effectiveAddress, addrHex);
-            printf("Balance %s: %s unit(s)\n", addrHex, balanceStr);
+            printf("Balance %s: %s pebble(s)\n", addrHex, balanceStr);
             continue;
         }
 
