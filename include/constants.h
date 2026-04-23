@@ -10,6 +10,8 @@
 // Nets
 #define MAX_CONS 32 // Some baseline for now
 #define LISTEN_PORT 9393
+#define TCP_THREAD_STACK_SIZE (512 * 1024) // 512 KB. We could get away with like 128 KB since it's mostly just recv bufs, but it's good having some breathing room.
+                                           // This is also for client threads. The server has the default (~8 MB on POSIX).
 
 // Economics
 #define DECIMALS 1000000000000ULL

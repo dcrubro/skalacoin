@@ -126,12 +126,18 @@ int TcpClient_Connect(
         client->on_connect(conn);
     }
 
-    if (pthread_create(&conn->ioThread, NULL, TcpClient_ThreadProc, client) != 0) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, TCP_THREAD_STACK_SIZE);
+
+    if (pthread_create(&conn->ioThread, &attr, TcpClient_ThreadProc, client) != 0) {
         TcpConnection_Destroy(conn);
         free(conn);
         client->connection = NULL;
+        pthread_attr_destroy(&attr);
         return -1;
     }
+    pthread_attr_destroy(&attr);
 
     return 0;
 }

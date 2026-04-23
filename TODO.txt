@@ -8,6 +8,8 @@ I need to figure out a way to make the privacy work without a UTXO system, and i
 Move the Networking Code to support win32 as well, as I'm just doing POSIX right now
 Maybe move the node system to an async event loop instead of spawning threads.
 
+A potential race could occur if the P2P node receives a new block, or flushes a new block to disk while the user is running a full verify.
+
 DONE:
 I want to move away from the Monero emission. I want to do something a bit radical for cryptocurrency, but I feel like it's necessary to make it more like money:
 a constant inflation rate of 1.5% per year. It's lower than fiat (USD is ~2.8% per year), and it additionally doesn't fluctuate during crisis. It's constant.

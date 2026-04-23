@@ -85,7 +85,7 @@ bool Transaction_Verify(const signed_transaction_t* tx) {
     // If all checks pass, verify the signature
     return Crypto_VerifySignature(
         txHash,
-        sizeof(transaction_t),
+        32,
         tx->signature.signature,
         tx->transaction.compressedPublicKey
     );

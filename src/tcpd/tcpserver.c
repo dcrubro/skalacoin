@@ -144,11 +144,17 @@ static void* TcpServer_threadprocess(void* ptr) {
         arg->clientPtr = heapCli;
         arg->serverPtr = svr;
 
-        if (pthread_create(&heapCli->ioThread, NULL, TcpServer_clientthreadprocess, arg) != 0) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, TCP_THREAD_STACK_SIZE);
+
+        if (pthread_create(&heapCli->ioThread, &attr, TcpServer_clientthreadprocess, arg) != 0) {
             free(arg);
             TcpServer_Disconnect(svr, heapCli);
+            pthread_attr_destroy(&attr);
             continue;
         }
+        pthread_attr_destroy(&attr);
     }
 
     return NULL;

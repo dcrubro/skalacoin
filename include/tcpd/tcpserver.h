@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <constants.h>
 
 #include <tcpd/tcpconnection.h>
 

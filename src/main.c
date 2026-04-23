@@ -416,6 +416,11 @@ static bool VerifyChainFully(blockchain_t* chain) {
         if (memcmp(blk->header.merkleRoot, expectedMerkle, sizeof(expectedMerkle)) != 0) {
             return false;
         }
+
+        // Transactions are persisted on disk. Once this block is fully verified,
+        // release its in-memory transaction list to reduce peak memory usage.
+        DynArr_destroy(blk->transactions);
+        blk->transactions = NULL;
     }
 
     return true;
