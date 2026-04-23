@@ -90,7 +90,6 @@ void BalanceSheet_Print() {
 
     // Iterate through every entry
     khiter_t k;
-    size_t iter = 0;
     for (k = kh_begin(sheetMap); k != kh_end(sheetMap); ++k) {
         if (kh_exist(sheetMap, k)) {
             key32_t key = kh_key(sheetMap, k);
@@ -99,12 +98,13 @@ void BalanceSheet_Print() {
             char balanceStr[80];
             uint256_serialize(&val.balance, balanceStr);
 
-            printf("Sheet entry %llu: mapkey=%02x%02x%02x%02x... address=%02x%02x%02x%02x... balance=%s\n",
-                (unsigned long long)(iter),
-                key.bytes[0], key.bytes[1], key.bytes[2], key.bytes[3],
-                val.address[0], val.address[1], val.address[2], val.address[3],
-                balanceStr,
-                iter++);
+            char addrHex[65];
+            AddressToHexString(key.bytes, addrHex);
+
+            // Print full address
+            printf("Address %s: balance=%s pebble(s)\n",
+                addrHex,
+                balanceStr);
         }
     }
 }

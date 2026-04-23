@@ -9,6 +9,7 @@
 #include <khash/khash.h>
 #include <crypto/crypto.h>
 #include <string.h>
+#include <utils.h>
 #include <uint256.h>
 
 typedef struct {

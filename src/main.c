@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <balance_sheet.h>
 
+
 #include <constants.h>
 #include <autolykos2/autolykos2.h>
 
@@ -179,13 +180,6 @@ static bool ParseHexAddress32(const char* in, uint8_t outAddress[32]) {
     }
 
     return true;
-}
-
-static void AddressToHexString(const uint8_t address[32], char out[65]) {
-    if (!address || !out) {
-        return;
-    }
-    to_hex(address, out);
 }
 
 static bool FlushChainAndSheet(blockchain_t* chain,
@@ -653,6 +647,12 @@ int main(int argc, char* argv[]) {
             uint8_t* effectiveAddress = minerAddress;
 
             if (addressStr) {
+                if (strcmp(addressStr, "all") == 0) {
+                    printf("All balances:\n");
+                    BalanceSheet_Print();
+                    continue;
+                }
+
                 if (!ParseHexAddress32(addressStr, queryAddress)) {
                     printf("invalid address: expected 64 hex chars (optionally prefixed with 0x)\n");
                     continue;
