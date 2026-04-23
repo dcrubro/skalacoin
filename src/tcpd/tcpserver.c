@@ -2,322 +2,352 @@
 
 #include <tcpd/tcpserver.h>
 
-tcp_server_t* TcpServer_Create() {
-    tcp_server_t* svr = (tcp_server_t*)malloc(sizeof(tcp_server_t));
+#include <errno.h>
+#include <numgen.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-    if (!svr) {
-        perror("tcpserver - creation failure");
-        exit(1);
+static void TcpServer_RemoveClientByPtrUnlocked(tcp_server_t* svr, tcp_connection_t* cli) {
+    if (!svr || !svr->clientsArrPtr || !cli) {
+        return;
     }
 
+    size_t idx = Generic_FindClientInArrayByPtr(svr->clientsArrPtr, cli, svr->maxClients);
+    if (idx != SIZE_MAX) {
+        svr->clientsArrPtr[idx] = NULL;
+    }
+}
+
+static void* TcpServer_clientthreadprocess(void* ptr) {
+    tcpclient_thread_args* args = (tcpclient_thread_args*)ptr;
+    if (!args || !args->clientPtr || !args->serverPtr) {
+        free(args);
+        return NULL;
+    }
+
+    tcp_connection_t* cli = args->clientPtr;
+    tcp_server_t* svr = args->serverPtr;
+    free(args);
+
+    unsigned char ioBuf[TCP_IO_BUFFER_SIZE];
+
+    while (1) {
+        ssize_t n = recv(cli->sockFd, ioBuf, sizeof(ioBuf), 0);
+        if (n == 0) {
+            break;
+        }
+
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        if (TcpConnection_FeedFramedData(cli, ioBuf, (size_t)n) != 0) {
+            break;
+        }
+    }
+
+    TcpConnection_RequestClose(cli);
+
+    if (!TcpConnection_IsDisconnectNotified(cli) && cli->on_disconnect) {
+        TcpConnection_MarkDisconnectNotified(cli);
+        cli->on_disconnect(cli);
+    }
+
+    pthread_mutex_lock(&svr->clientsMutex);
+    TcpServer_RemoveClientByPtrUnlocked(svr, cli);
+    pthread_mutex_unlock(&svr->clientsMutex);
+
+    TcpConnection_Destroy(cli);
+    free(cli);
+
+    return NULL;
+}
+
+static void* TcpServer_threadprocess(void* ptr) {
+    tcp_server_t* svr = (tcp_server_t*)ptr;
+    if (!svr) {
+        return NULL;
+    }
+
+    while (svr->isRunning) {
+        struct sockaddr_in clientAddr;
+        socklen_t clientSize = sizeof(clientAddr);
+        int clientFd = accept(svr->sockFd, (struct sockaddr*)&clientAddr, &clientSize);
+
+        if (clientFd < 0) {
+            if (!svr->isRunning) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            continue;
+        }
+
+        tcp_connection_t* heapCli = (tcp_connection_t*)malloc(sizeof(*heapCli));
+        if (!heapCli) {
+            close(clientFd);
+            continue;
+        }
+
+        if (TcpConnection_Init(heapCli, clientFd, &clientAddr, TCP_CONNECTION_ROLE_INBOUND) != 0) {
+            close(clientFd);
+            free(heapCli);
+            continue;
+        }
+
+        heapCli->connectionId = random_four_byte();
+        heapCli->on_data = svr->on_data;
+        heapCli->on_disconnect = svr->on_disconnect;
+        heapCli->owner = svr->owner;
+
+        pthread_mutex_lock(&svr->clientsMutex);
+
+        size_t insertIdx = SIZE_MAX;
+        for (size_t i = 0; i < svr->maxClients; ++i) {
+            if (svr->clientsArrPtr[i] == NULL) {
+                insertIdx = i;
+                break;
+            }
+        }
+
+        if (insertIdx == SIZE_MAX) {
+            pthread_mutex_unlock(&svr->clientsMutex);
+            struct linger so_linger;
+            so_linger.l_onoff = 1;
+            so_linger.l_linger = 0;
+            setsockopt(heapCli->sockFd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
+            TcpConnection_Destroy(heapCli);
+            free(heapCli);
+            continue;
+        }
+
+        svr->clientsArrPtr[insertIdx] = heapCli;
+        pthread_mutex_unlock(&svr->clientsMutex);
+
+        if (svr->on_connect) {
+            svr->on_connect(heapCli);
+        }
+
+        tcpclient_thread_args* arg = (tcpclient_thread_args*)malloc(sizeof(*arg));
+        if (!arg) {
+            TcpServer_Disconnect(svr, heapCli);
+            continue;
+        }
+
+        arg->clientPtr = heapCli;
+        arg->serverPtr = svr;
+
+        if (pthread_create(&heapCli->ioThread, NULL, TcpServer_clientthreadprocess, arg) != 0) {
+            free(arg);
+            TcpServer_Disconnect(svr, heapCli);
+            continue;
+        }
+    }
+
+    return NULL;
+}
+
+tcp_server_t* TcpServer_Create() {
+    tcp_server_t* svr = (tcp_server_t*)malloc(sizeof(*svr));
+    if (!svr) {
+        return NULL;
+    }
+
+    memset(svr, 0, sizeof(*svr));
     svr->sockFd = -1;
     svr->svrThread = 0;
-    svr->on_connect = NULL;
-    svr->on_data = NULL;
-    svr->on_disconnect = NULL;
-
-    svr->clients = 0;
+    svr->isRunning = 0;
+    svr->maxClients = 0;
     svr->clientsArrPtr = NULL;
+
+    if (pthread_mutex_init(&svr->clientsMutex, NULL) != 0) {
+        free(svr);
+        return NULL;
+    }
 
     return svr;
 }
 
 void TcpServer_Destroy(tcp_server_t* ptr) {
-    if (ptr) {
-        if (ptr->clientsArrPtr) {
-            for (size_t i = 0; i < ptr->clients; i++) {
-                if (ptr->clientsArrPtr[i]) {
-                    free(ptr->clientsArrPtr[i]);
-                }
-            }
-
-            free(ptr->clientsArrPtr);
-        }
-
-        close(ptr->sockFd);
-        free(ptr);
+    if (!ptr) {
+        return;
     }
+
+    TcpServer_Stop(ptr);
+
+    free(ptr->clientsArrPtr);
+    ptr->clientsArrPtr = NULL;
+
+    pthread_mutex_destroy(&ptr->clientsMutex);
+    free(ptr);
 }
 
 void TcpServer_Init(tcp_server_t* ptr, unsigned short port, const char* addr) {
-    if (ptr) {
-        // Create socket
-        ptr->sockFd = socket(AF_INET, SOCK_STREAM, 0);
-        if (ptr->sockFd < 0) {
-            perror("tcpserver - socket");
-            exit(EXIT_FAILURE);
-        }
-
-        // Allow quick port resue
-        ptr->opt = 1;
-        setsockopt(ptr->sockFd, SOL_SOCKET, SO_REUSEADDR, &ptr->opt, sizeof(int));
-
-        // Fill address structure
-        memset(&ptr->addr, 0, sizeof(ptr->addr));
-        ptr->addr.sin_family = AF_INET;
-        ptr->addr.sin_port = htons(port);
-        inet_pton(AF_INET, addr, &ptr->addr.sin_addr);
-
-        // Bind
-        if (bind(ptr->sockFd, (struct sockaddr*)&ptr->addr, sizeof(ptr->addr)) < 0) {
-            perror("tcpserver - bind");
-            close(ptr->sockFd);
-            exit(EXIT_FAILURE);
-        }
-    }
-}
-
-// Do not call outside of func.
-void* TcpServer_clientthreadprocess(void* ptr) {
-    if (!ptr) {
-        perror("Client ptr is null!\n");
-        return NULL;
+    if (!ptr || !addr) {
+        return;
     }
 
-    tcpclient_thread_args* args = (tcpclient_thread_args*)ptr;
-
-    tcp_connection_t* cli = args->clientPtr;
-    tcp_server_t* svr = args->serverPtr;
-
-    if (args) {
-        free(args);
+    ptr->sockFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (ptr->sockFd < 0) {
+        return;
     }
 
-    while (1) {
-        memset(cli->dataBuf, 0, MTU); // Reset buffer
-        ssize_t n = recv(cli->clientFd, cli->dataBuf, MTU, 0);
-        cli->dataBufLen = n;
+    ptr->opt = 1;
+    setsockopt(ptr->sockFd, SOL_SOCKET, SO_REUSEADDR, &ptr->opt, sizeof(int));
 
-        if (n == 0) {
-            break; // Client disconnected
-        } else if (n > 0) {
-            if (cli->on_data) {
-                cli->on_data(cli);
-            }
-        }
+    memset(&ptr->addr, 0, sizeof(ptr->addr));
+    ptr->addr.sin_family = AF_INET;
+    ptr->addr.sin_port = htons(port);
+    inet_pton(AF_INET, addr, &ptr->addr.sin_addr);
 
-        pthread_testcancel(); // Check for thread death
+    if (bind(ptr->sockFd, (struct sockaddr*)&ptr->addr, sizeof(ptr->addr)) < 0) {
+        close(ptr->sockFd);
+        ptr->sockFd = -1;
     }
-
-    if (cli->on_disconnect) {
-        cli->on_disconnect(cli);
-    }
-
-    // Close on exit
-    close(cli->clientFd);
-
-    // Destroy
-    tcp_connection_t** arr = svr->clientsArrPtr;
-    size_t idx = Generic_FindClientInArrayByPtr(arr, cli, svr->clients);
-    if (idx != SIZE_MAX) {
-        if (arr[idx]) {
-            free(arr[idx]);
-            arr[idx] = NULL;
-        }
-    } else {
-        perror("tcpserver (client thread) - something already freed the client!");
-    }
-    
-    //free(ptr);
-
-    return NULL;
-}
-
-// Do not call outside of func.
-void* TcpServer_threadprocess(void* ptr) {
-    if (!ptr) {
-        perror("Client ptr is null!\n");
-        return NULL;
-    }
-    
-    tcp_server_t* svr = (tcp_server_t*)ptr;
-    while (1) {
-        tcp_connection_t tempclient;
-        socklen_t clientsize = sizeof(tempclient.clientAddr);
-        int client = accept(svr->sockFd, (struct sockaddr*)&tempclient.clientAddr, &clientsize);
-        if (client >= 0) {
-            tempclient.clientFd = client;
-            tempclient.on_data = svr->on_data;
-            tempclient.on_disconnect = svr->on_disconnect;
-
-            // I'm lazy, so I'm just copying the data for now (I should probably make this a better way)
-            tcp_connection_t* heapCli = (tcp_connection_t*)malloc(sizeof(tcp_connection_t));
-            if (!heapCli) {
-                perror("tcpserver - client failed to allocate");
-                exit(EXIT_FAILURE); // Wtf just happened???
-            }
-
-            heapCli->clientAddr = tempclient.clientAddr;
-            heapCli->clientFd = tempclient.clientFd;
-            heapCli->on_data = tempclient.on_data;
-            heapCli->on_disconnect = tempclient.on_disconnect;
-            heapCli->clientId = random_four_byte();
-            heapCli->dataBufLen = 0;
-
-            size_t i;
-            for (i = 0; i < svr->clients; i++) {
-                if (svr->clientsArrPtr[i] == NULL) {
-                    // Make use of that space
-                    svr->clientsArrPtr[i] = heapCli; // We have now transfered the ownership :)
-                    break;
-                }
-            }
-
-            if (i == svr->clients) {
-                // Not found
-                // RST; Thread doesn't exist yet
-                struct linger so_linger;
-                so_linger.l_onoff = 1;
-                so_linger.l_linger = 0;
-                setsockopt(heapCli->clientFd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
-                close(heapCli->clientFd);
-                
-                free(heapCli);
-                heapCli = NULL;
-                //svr->clientsArrPtr[i] = NULL;
-
-                continue;
-            }
-            
-            tcpclient_thread_args* arg = (tcpclient_thread_args*)malloc(sizeof(tcpclient_thread_args));
-            arg->clientPtr = heapCli;
-            arg->serverPtr = svr;
-
-            if (svr->on_connect) {
-                svr->on_connect(heapCli);
-            }
-            
-            pthread_create(&heapCli->clientThread, NULL, TcpServer_clientthreadprocess, arg);
-            pthread_detach(heapCli->clientThread); // May not work :(
-        }
-
-        pthread_testcancel(); // Check for thread death
-    }
-
-    return NULL;
 }
 
 void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
-    if (ptr) {
-        if (listen(ptr->sockFd, maxcons) < 0) {
-            perror("tcpserver - listen");
-            close(ptr->sockFd);
-            exit(EXIT_FAILURE);
-        }
-
-        ptr->clients = maxcons;
-        ptr->clientsArrPtr = (tcp_connection_t**)malloc(sizeof(tcp_connection_t*) * maxcons);
-
-        if (!ptr->clientsArrPtr) {
-            perror("tcpserver - allocation of client space fatally errored");
-            exit(EXIT_FAILURE);
-        }
-
-        // Fucking null out everything
-        for (int i = 0; i < maxcons; i++) {
-            ptr->clientsArrPtr[i] = NULL;
-        }
+    if (!ptr || ptr->sockFd < 0 || maxcons <= 0 || ptr->isRunning) {
+        return;
     }
 
-    // Spawn server thread
-    pthread_create(&ptr->svrThread, NULL, TcpServer_threadprocess, ptr);
+    if (listen(ptr->sockFd, maxcons) < 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&ptr->clientsMutex);
+
+    ptr->maxClients = (size_t)maxcons;
+    ptr->clientsArrPtr = (tcp_connection_t**)malloc(sizeof(tcp_connection_t*) * ptr->maxClients);
+    if (!ptr->clientsArrPtr) {
+        ptr->maxClients = 0;
+        pthread_mutex_unlock(&ptr->clientsMutex);
+        return;
+    }
+
+    for (size_t i = 0; i < ptr->maxClients; ++i) {
+        ptr->clientsArrPtr[i] = NULL;
+    }
+
+    ptr->isRunning = 1;
+    pthread_mutex_unlock(&ptr->clientsMutex);
+
+    if (pthread_create(&ptr->svrThread, NULL, TcpServer_threadprocess, ptr) != 0) {
+        pthread_mutex_lock(&ptr->clientsMutex);
+        ptr->isRunning = 0;
+        free(ptr->clientsArrPtr);
+        ptr->clientsArrPtr = NULL;
+        ptr->maxClients = 0;
+        pthread_mutex_unlock(&ptr->clientsMutex);
+    }
 }
 
 void TcpServer_Stop(tcp_server_t* ptr) {
-    if (ptr && ptr->svrThread != 0) {
-        // Stop server
-        pthread_cancel(ptr->svrThread);
+    if (!ptr || !ptr->isRunning) {
+        return;
+    }
+
+    ptr->isRunning = 0;
+
+    if (ptr->sockFd >= 0) {
+        shutdown(ptr->sockFd, SHUT_RDWR);
+        close(ptr->sockFd);
+        ptr->sockFd = -1;
+    }
+
+    if (ptr->svrThread != 0 && !pthread_equal(ptr->svrThread, pthread_self())) {
         pthread_join(ptr->svrThread, NULL);
+    }
+    ptr->svrThread = 0;
 
-        // Disconnect clients
-        for (size_t i = 0; i < ptr->clients; i++) {
-            tcp_connection_t* cliPtr = ptr->clientsArrPtr[i];
-            if (cliPtr) {
-                close(cliPtr->clientFd);
-                pthread_cancel(cliPtr->clientThread);
-            }
+    pthread_mutex_lock(&ptr->clientsMutex);
+    size_t maxClients = ptr->maxClients;
+    tcp_connection_t** local = ptr->clientsArrPtr;
+    pthread_mutex_unlock(&ptr->clientsMutex);
+
+    for (size_t i = 0; i < maxClients; ++i) {
+        tcp_connection_t* cli = local[i];
+        if (!cli) {
+            continue;
         }
 
-        ptr->svrThread = 0;
+        TcpConnection_RequestClose(cli);
     }
+
+    for (size_t i = 0; i < maxClients; ++i) {
+        tcp_connection_t* cli = local[i];
+        if (!cli) {
+            continue;
+        }
+
+        if (!pthread_equal(cli->ioThread, pthread_self())) {
+            pthread_join(cli->ioThread, NULL);
+        }
+    }
+
+    pthread_mutex_lock(&ptr->clientsMutex);
+    free(ptr->clientsArrPtr);
+    ptr->clientsArrPtr = NULL;
+    ptr->maxClients = 0;
+    pthread_mutex_unlock(&ptr->clientsMutex);
 }
 
-void TcpServer_Send(tcp_server_t* ptr, tcp_connection_t* cli, void* data, size_t len) {
-    if (ptr && cli && data && len > 0) {
-        size_t sent = 0;
-        while (sent < len) {
-            // Ensure that all data is sent. TCP can split sends.
-            ssize_t n = send(cli->clientFd, (unsigned char*)data + sent, len - sent, 0);
-            if (n < 0) {
-                perror("tcpserver - send error");
-                break;
-            }
-            sent += n;
-        }
+int TcpServer_Send(tcp_server_t* ptr, tcp_connection_t* cli, const void* data, size_t len) {
+    if (!ptr || !cli || !data || len == 0) {
+        return -1;
     }
+
+    return TcpConnection_SendFramed(cli, data, len);
 }
 
-void Generic_SendSocket(int sock, void* data, size_t len) {
-    if (sock > 0 && data && len > 0) {
-        size_t sent = 0;
-        while (sent < len) {
-            ssize_t n = send(sock, (unsigned char*)data + sent, len - sent, 0);
-            if (n < 0) {
-                perror("generic - send socket error");
-                break;
-            }
-            sent += n;
-        }
-    }
+void Generic_SendSocket(int sock, const void* data, size_t len) {
+    (void)TcpConnection_SendRaw(sock, data, len);
 }
 
 void TcpServer_Disconnect(tcp_server_t* ptr, tcp_connection_t* cli) {
-    if (ptr && cli) {
-        close(cli->clientFd);
-        pthread_cancel(cli->clientThread);
+    if (!ptr || !cli) {
+        return;
+    }
 
-        size_t idx = Generic_FindClientInArrayByPtr(ptr->clientsArrPtr, cli, ptr->clients);
-        if (idx != SIZE_MAX) {
-            if (ptr->clientsArrPtr[idx]) {
-                free(ptr->clientsArrPtr[idx]);
-            }
-            ptr->clientsArrPtr[idx] = NULL;
-        } else {
-            perror("tcpserver - didn't find client to disconnect in array!");
-        }
+    TcpConnection_RequestClose(cli);
+
+    if (!pthread_equal(cli->ioThread, pthread_self())) {
+        pthread_join(cli->ioThread, NULL);
     }
 }
 
 void TcpServer_KillClient(tcp_server_t* ptr, tcp_connection_t* cli) {
-    if (ptr && cli) {
-        // RST the connection
-        struct linger so_linger;
-        so_linger.l_onoff = 1;
-        so_linger.l_linger = 0;
-        setsockopt(cli->clientFd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
-        close(cli->clientFd);
-        pthread_cancel(cli->clientThread);
-        
-        size_t idx = Generic_FindClientInArrayByPtr(ptr->clientsArrPtr, cli, ptr->clients);
-        if (idx != SIZE_MAX) {
-            if (ptr->clientsArrPtr[idx]) {
-                free(ptr->clientsArrPtr[idx]);
-            }
-            ptr->clientsArrPtr[idx] = NULL;
-        } else {
-            perror("tcpserver - didn't find client to kill in array!");
-        }
+    if (!ptr || !cli) {
+        return;
     }
+
+    struct linger so_linger;
+    so_linger.l_onoff = 1;
+    so_linger.l_linger = 0;
+    setsockopt(cli->sockFd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
+
+    TcpServer_Disconnect(ptr, cli);
 }
 
 size_t Generic_FindClientInArrayByPtr(tcp_connection_t** arr, tcp_connection_t* ptr, size_t len) {
-    for (size_t i = 0; i < len; i++) {
+    if (!arr || !ptr) {
+        return SIZE_MAX;
+    }
+
+    for (size_t i = 0; i < len; ++i) {
         if (arr[i] == ptr) {
             return i;
         }
     }
 
-    return SIZE_MAX; // Returns max unsigned, likely improbable to be correct
+    return SIZE_MAX;
 }
 
 #endif

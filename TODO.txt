@@ -6,6 +6,7 @@ I want to make an "optional privacy" system, where the TX can be public or priva
 I need to figure out a way to make the privacy work without a UTXO system, and instead, with a "Balance Sheet" approach.
 
 Move the Networking Code to support win32 as well, as I'm just doing POSIX right now
+Maybe move the node system to an async event loop instead of spawning threads.
 
 DONE:
 I want to move away from the Monero emission. I want to do something a bit radical for cryptocurrency, but I feel like it's necessary to make it more like money:

@@ -401,14 +401,18 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     size_t newSize = DynArr_size(chain->blocks);
     fseek(metaFile, 0, SEEK_SET);
     fwrite(&newSize, sizeof(size_t), 1, metaFile);
+    uint32_t difficultyTarget = INITIAL_DIFFICULTY;
     if (newSize > 0) {
         block_t* lastBlock = (block_t*)DynArr_at(chain->blocks, newSize - 1);
         uint8_t lastHash[32];
         Block_CalculateHash(lastBlock, lastHash);
         fwrite(lastHash, sizeof(uint8_t), 32, metaFile);
+        difficultyTarget = lastBlock->header.difficultyTarget;
+    } else {
+        uint8_t zeroHash[32] = {0};
+        fwrite(zeroHash, sizeof(uint8_t), 32, metaFile);
     }
     fwrite(&currentSupply, sizeof(uint256_t), 1, metaFile);
-    uint32_t difficultyTarget = ((block_t*)DynArr_at(chain->blocks, newSize - 1))->header.difficultyTarget;
     fwrite(&difficultyTarget, sizeof(uint32_t), 1, metaFile);
     fwrite(&currentReward, sizeof(uint64_t), 1, metaFile);
 
@@ -425,7 +429,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     return true;
 }
 
-bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget, uint64_t* outCurrentReward, uint8_t* outLastSavedHash) {
+bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget, uint64_t* outCurrentReward, uint8_t* outLastSavedHash, bool loadTransactions) {
     if (!chain || !chain->blocks || !dirpath || !outCurrentSupply || !outLastSavedHash) {
         return false;
     }
@@ -521,7 +525,6 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
             return false;
         }
 
-        // Header-only load path: do not allocate per-block transaction arrays.
         block_t* blk = (block_t*)calloc(1, sizeof(block_t));
         if (!blk) {
             fclose(chainFile);
@@ -544,18 +547,42 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
             free(blk);
             return false;
         }
-        (void)txSize;
-
-        /*for (size_t j = 0; j < txSize; j++) {
-            signed_transaction_t tx;
-            if (fread(&tx, sizeof(signed_transaction_t), 1, blockFile) != 1) {
-                fclose(blockFile);
-                Block_Destroy(blk);
+        if (loadTransactions) {
+            blk->transactions = DYNARR_CREATE(signed_transaction_t, txSize == 0 ? 1 : txSize);
+            if (!blk->transactions) {
+                fclose(chainFile);
+                fclose(tableFile);
+                free(blk);
                 return false;
             }
-            Block_AddTransaction(blk, &tx);
-        }*/ // Transactions are not read, we use the merkle root for validity
-        blk->transactions = NULL;
+
+            for (size_t j = 0; j < txSize; j++) {
+                signed_transaction_t tx;
+                if (fread(&tx, sizeof(signed_transaction_t), 1, chainFile) != 1) {
+                    fclose(chainFile);
+                    fclose(tableFile);
+                    DynArr_destroy(blk->transactions);
+                    free(blk);
+                    return false;
+                }
+
+                if (!DynArr_push_back(blk->transactions, &tx)) {
+                    fclose(chainFile);
+                    fclose(tableFile);
+                    DynArr_destroy(blk->transactions);
+                    free(blk);
+                    return false;
+                }
+            }
+        } else {
+            if (txSize > 0 && fseek(chainFile, (long)(txSize * sizeof(signed_transaction_t)), SEEK_CUR) != 0) {
+                fclose(chainFile);
+                fclose(tableFile);
+                free(blk);
+                return false;
+            }
+            blk->transactions = NULL;
+        }
 
         // Loading from disk currently restores headers only. Do not run Chain_AddBlock,
         // because it enforces transaction presence and mutates balances.
@@ -568,7 +595,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
         chain->size++;
 
         // DynArr_push_back stores blocks by value, so the copied block now owns
-        // blk->transactions (NULL in header-only load mode). Free wrapper only.
+        // blk->transactions. Free wrapper only.
         free(blk);
     }
 
