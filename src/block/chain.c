@@ -3,6 +3,8 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+uint64_t currentBlockHeight = 0;
+
 static bool EnsureDirectoryExists(const char* dirpath) {
     if (!dirpath || dirpath[0] == '\0') {
         return false;
@@ -176,6 +178,7 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
         return false;
     }
     chain->size++;
+    currentBlockHeight = (uint64_t)(chain->size - 1);
 
     // Second pass: apply the ledger changes.
     if (blk->transactions) {
@@ -269,6 +272,7 @@ bool Chain_IsValid(blockchain_t* chain) {
 
 void Chain_Wipe(blockchain_t* chain) {
     Chain_ClearBlocks(chain);
+    currentBlockHeight = 0;
 }
 
 bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply, uint64_t currentReward) {

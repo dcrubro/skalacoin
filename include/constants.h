@@ -7,6 +7,8 @@
 #include <block/chain.h>
 #include <block/block.h>
 
+extern uint64_t currentBlockHeight;
+
 // Nets
 #define MAX_CONS 32 // Some baseline for now
 #define LISTEN_PORT 9393

@@ -55,6 +55,9 @@ size_t DynArr_capacity(DynArr* p);
 
 void DynArr_destroy(DynArr* p);
 
+// Note: Make sure to not overread or overwrite
+void* DynArr_c_arr(DynArr* p);
+
 #define DYNARR_CREATE(T, initialCapacity) DynArr_create(sizeof(T), initialCapacity)
 
 #endif

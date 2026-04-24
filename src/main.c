@@ -561,7 +561,14 @@ int main(int argc, char* argv[]) {
                 }
 
                 free(block); // Chain stores block by value and owns copied transaction array.
+
+                if (i % 1000 == 0) {
+                    // Mid-mine flush
+                    (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
+                }
             }
+
+            
 
             if (minedAll) {
                 (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);

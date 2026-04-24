@@ -173,3 +173,7 @@ void DynArr_destroy(DynArr* p) {
     free(p->data);
     free(p);
 }
+
+void* DynArr_c_arr(DynArr* p) {
+    return p->data;
+}

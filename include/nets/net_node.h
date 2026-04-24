@@ -13,6 +13,8 @@
 
 #include <stddef.h>
 
+#include <dynarr.h>
+
 typedef struct {
     tcp_server_t* server;
     tcp_client_t outboundClients[MAX_CONS];

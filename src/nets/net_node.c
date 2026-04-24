@@ -160,6 +160,7 @@ int Node_SendPacket(net_node_t* node, tcp_connection_t* conn, packet_type_t pack
         return -1;
     }
 
+    /*
     if (conn->role == TCP_CONNECTION_ROLE_INBOUND && packetType != PACKET_TYPE_RESPONSE) {
         return -1;
     }
@@ -167,6 +168,7 @@ int Node_SendPacket(net_node_t* node, tcp_connection_t* conn, packet_type_t pack
     if (conn->role == TCP_CONNECTION_ROLE_OUTBOUND && packetType != PACKET_TYPE_REQUEST) {
         return -1;
     }
+    */
 
     size_t framePayloadLen = payloadLen + 1;
     unsigned char* framed = (unsigned char*)malloc(framePayloadLen);
@@ -200,9 +202,34 @@ void Node_Server_OnData(tcp_connection_t* client) {
         return;
     }
 
-    if (packetType != PACKET_TYPE_REQUEST) {
-        return;
-    }
+    switch (packetType) {
+        case PACKET_TYPE_HELLO: {
+            // Decode HELLO
+            if (payloadLen < sizeof(uint32_t) + sizeof(uint64_t)) {
+                return;
+            }
+
+            uint32_t protoVersion;
+            uint64_t blockHeight;
+            memcpy(&protoVersion, payload, sizeof(protoVersion));
+            memcpy(&blockHeight, payload + sizeof(protoVersion), sizeof(blockHeight));
+
+            // TODO: Save these somewhere and maybe respond
+            printf("Received HELLO from node %u: protoVersion=%u, blockHeight=%" PRIu64 "\n",
+                client ? client->connectionId : 0U, protoVersion, blockHeight);
+
+            break;
+        }
+        case PACKET_TYPE_FETCH_BLOCK:
+        case PACKET_TYPE_BLOCK_DATA:
+        case PACKET_TYPE_BROADCAST_BLOCK:
+        case PACKET_TYPE_ACK_BLOCK:
+        case PACKET_TYPE_BROADCAST_TX:
+        case PACKET_TYPE_ACK_TX:
+            break;
+        default:
+            return;
+    } 
 
     net_node_t* node = Node_FromConnection(client);
     Node_ForwardData(node, client, payload, payloadLen);
@@ -218,6 +245,22 @@ void Node_Client_OnConnect(tcp_connection_t* client) {
     net_node_t* node = Node_FromConnection(client);
     Node_ForwardConnect(node, client);
     printf("Outbound node connected: %u\n", client ? client->connectionId : 0U);
+
+    // Construct and send HELLO
+    if (node) {
+        uint8_t buf[100];
+        uint8_t* data = buf;
+        
+        size_t offset = 0;
+        uint32_t protoVersion = 1; // little-endian
+        uint64_t blockHeight = currentBlockHeight;
+        memcpy((unsigned char*)data + offset, &protoVersion, sizeof(protoVersion)); // This is technically "unsafe", but I honestly just don't give a shit at this point
+        offset += sizeof(protoVersion);
+        memcpy((unsigned char*)data + offset, &blockHeight, sizeof(blockHeight));
+        offset += sizeof(blockHeight);
+
+        Node_SendPacket(node, client, PACKET_TYPE_HELLO, data, offset);
+    }
 }
 
 void Node_Client_OnData(tcp_connection_t* client) {
@@ -229,8 +272,17 @@ void Node_Client_OnData(tcp_connection_t* client) {
         return;
     }
 
-    if (packetType != PACKET_TYPE_RESPONSE) {
-        return;
+    switch (packetType) {
+        case PACKET_TYPE_HELLO:
+        case PACKET_TYPE_FETCH_BLOCK:
+        case PACKET_TYPE_BLOCK_DATA:
+        case PACKET_TYPE_BROADCAST_BLOCK:
+        case PACKET_TYPE_ACK_BLOCK:
+        case PACKET_TYPE_BROADCAST_TX:
+        case PACKET_TYPE_ACK_TX:
+            break;
+        default:
+            return;
     }
 
     net_node_t* node = Node_FromConnection(client);
