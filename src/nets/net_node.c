@@ -227,6 +227,8 @@ void Node_Server_OnData(tcp_connection_t* client) {
             memcpy(ackData + ackOffset, &currentBlockHeight, sizeof(currentBlockHeight));
             ackOffset += sizeof(currentBlockHeight);
 
+            Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ACK_HELLO, ackData, ackOffset);
+
             break;
         }
         case PACKET_TYPE_ACK_HELLO: {
