@@ -218,7 +218,26 @@ void Node_Server_OnData(tcp_connection_t* client) {
             printf("Received HELLO from node %u: protoVersion=%u, blockHeight=%" PRIu64 "\n",
                 client ? client->connectionId : 0U, protoVersion, blockHeight);
 
+            // Craft and send ACK_HELLO
+            uint8_t ackBuf[100];
+            uint8_t* ackData = ackBuf;
+            size_t ackOffset = 0;
+            memcpy(ackData + ackOffset, &protoVersion, sizeof(protoVersion));
+            ackOffset += sizeof(protoVersion);
+            memcpy(ackData + ackOffset, &currentBlockHeight, sizeof(currentBlockHeight));
+            ackOffset += sizeof(currentBlockHeight);
+
             break;
+        }
+        case PACKET_TYPE_ACK_HELLO: {
+            // This is illegal
+            printf("Received unexpected ACK_HELLO packet from node %u\n", client ? client->connectionId : 0U);
+
+            // Send the error and kill the connection
+            const char* msg = "You can't ACK_HELLO me! I'm a server!";
+            Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+            TcpConnection_RequestClose(client);
+            return;
         }
         case PACKET_TYPE_FETCH_BLOCK:
         case PACKET_TYPE_BLOCK_DATA:
@@ -226,7 +245,20 @@ void Node_Server_OnData(tcp_connection_t* client) {
         case PACKET_TYPE_ACK_BLOCK:
         case PACKET_TYPE_BROADCAST_TX:
         case PACKET_TYPE_ACK_TX:
+        case PACKET_TYPE_ERROR: {
+            // Decode the message inside as text
+            char* text = (char*)malloc(payloadLen + 1);
+            if (!text) {
+                return;
+            }
+            memcpy(text, payload, payloadLen);
+            text[payloadLen] = '\0';
+            printf("Received packet type %u from node %u with message: %s\n",
+                (unsigned int)packetType, client ? client->connectionId : 0U, text);
+            free(text);
+            
             break;
+        }
         default:
             return;
     } 
@@ -273,14 +305,50 @@ void Node_Client_OnData(tcp_connection_t* client) {
     }
 
     switch (packetType) {
-        case PACKET_TYPE_HELLO:
+        case PACKET_TYPE_HELLO: {
+            // This is illegal
+            printf("Received unexpected HELLO packet from node %u\n", client ? client->connectionId : 0U);
+
+            // Send the error and kill the connection
+            const char* msg = "You can't HELLO me! I'm a client!";
+            Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+            TcpConnection_RequestClose(client);
+            return;
+        }
+        case PACKET_TYPE_ACK_HELLO: {
+            // Decode ACK_HELLO
+            if (payloadLen < sizeof(uint32_t) + sizeof(uint64_t)) {
+                return;
+            }
+
+            uint32_t protoVersion;
+            uint64_t blockHeight;
+            memcpy(&protoVersion, payload, sizeof(protoVersion));
+            memcpy(&blockHeight, payload + sizeof(protoVersion), sizeof(blockHeight));
+
+            printf("Received ACK_HELLO from node %u with protoVersion %u and blockHeight %lu\n", client ? client->connectionId : 0U, protoVersion, (unsigned long)blockHeight);
+            break;
+        }
         case PACKET_TYPE_FETCH_BLOCK:
         case PACKET_TYPE_BLOCK_DATA:
         case PACKET_TYPE_BROADCAST_BLOCK:
         case PACKET_TYPE_ACK_BLOCK:
         case PACKET_TYPE_BROADCAST_TX:
         case PACKET_TYPE_ACK_TX:
+        case PACKET_TYPE_ERROR: {
+            // Decode the message inside as text
+            char* text = (char*)malloc(payloadLen + 1);
+            if (!text) {
+                return;
+            }
+            memcpy(text, payload, payloadLen);
+            text[payloadLen] = '\0';
+            printf("Received packet type %u from node %u with message: %s\n",
+                (unsigned int)packetType, client ? client->connectionId : 0U, text);
+            free(text);
+            
             break;
+        }
         default:
             return;
     }

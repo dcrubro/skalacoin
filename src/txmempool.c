@@ -10,7 +10,7 @@ int TxMempool_Insert(signed_transaction_t tx) {
     if (!txMempool) { return -1; }
 
     uint8_t txHash[32];
-    Transaction_CalculateHash(&tx.transaction, txHash);
+    Transaction_CalculateHash(&tx, txHash);
 
     key32_t key;
     memcpy(key.bytes, txHash, 32);
