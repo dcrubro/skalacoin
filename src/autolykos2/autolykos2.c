@@ -179,7 +179,8 @@ static bool ReadDagLaneFromSeed(const uint8_t seed32[32], uint32_t laneIndex, ui
 }
 
 static bool Autolykos2_HashCore(
-    const uint8_t seed32[32],
+    const uint8_t messageSeed32[32],
+    const uint8_t dagSeed32[32],
     const uint8_t* message,
     size_t messageLen,
     uint64_t nonce,
@@ -189,7 +190,7 @@ static bool Autolykos2_HashCore(
     bool useContextDag,
     uint8_t outHash[32]
 ) {
-    if (!seed32 || !message || !outHash || laneCount == 0) {
+    if (!messageSeed32 || !message || !outHash || laneCount == 0) {
         return false;
     }
 
@@ -200,7 +201,7 @@ static bool Autolykos2_HashCore(
         uint32_t laneIndex = 0;
         uint8_t lane[32];
 
-        if (!ComputeLaneIndex(seed32, nonce, height, round, laneCount, &laneIndex)) {
+        if (!ComputeLaneIndex(messageSeed32, nonce, height, round, laneCount, &laneIndex)) {
             return false;
         }
 
@@ -209,7 +210,7 @@ static bool Autolykos2_HashCore(
                 return false;
             }
         } else {
-            if (!ReadDagLaneFromSeed(seed32, laneIndex, lane)) {
+            if (!ReadDagLaneFromSeed(dagSeed32 ? dagSeed32 : messageSeed32, laneIndex, lane)) {
                 return false;
             }
         }
@@ -221,7 +222,7 @@ static bool Autolykos2_HashCore(
 
     uint8_t baseHash[32];
     uint8_t accHash[32];
-    if (!Autolykos2_FallbackHash(seed32, message, messageLen, nonce, height, baseHash)) {
+    if (!Autolykos2_FallbackHash(messageSeed32, message, messageLen, nonce, height, baseHash)) {
         return false;
     }
     if (!Blake2b_Hash(acc, sizeof(acc), accHash, sizeof(accHash))) {
@@ -377,6 +378,7 @@ bool Autolykos2_Hash(
 
     return Autolykos2_HashCore(
         seed32,
+        NULL,
         message,
         messageLen,
         nonce,
@@ -408,7 +410,45 @@ bool Autolykos2_LightHash(const uint8_t* seed, blockchain_t* chain, uint64_t non
     return Autolykos2_HashCore(
         seed,
         seed,
+        seed,
         32,
+        nonce,
+        height,
+        (uint32_t)laneCount64,
+        NULL,
+        false,
+        out
+    );
+}
+
+bool Autolykos2_LightHashAtHeight(
+    const uint8_t seed32[32],
+    const uint8_t* message,
+    size_t messageLen,
+    uint64_t nonce,
+    uint64_t height,
+    size_t dagBytes,
+    uint8_t out[32]
+) {
+    if (!seed32 || !message || !out || dagBytes < 32 || (dagBytes % 32) != 0) {
+        return false;
+    }
+
+    const size_t laneCount64 = dagBytes / 32u;
+    if (laneCount64 == 0 || laneCount64 > UINT32_MAX) {
+        return false;
+    }
+
+    uint8_t messageSeed32[32];
+    if (!DeriveSeedFromMessage(message, messageLen, messageSeed32)) {
+        return false;
+    }
+
+    return Autolykos2_HashCore(
+        messageSeed32,
+        seed32,
+        message,
+        messageLen,
         nonce,
         height,
         (uint32_t)laneCount64,

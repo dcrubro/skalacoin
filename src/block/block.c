@@ -1,5 +1,6 @@
 #include <block/block.h>
 #include <autolykos2/autolykos2.h>
+#include <utils.h>
 #include <stdlib.h>
 
 static Autolykos2Context* g_autolykos2Ctx = NULL;
@@ -85,79 +86,51 @@ void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash) {
         return;
     }
 
-    // TODO: Make this not shit
-    DynArr* hashes1 = DynArr_create(sizeof(uint8_t) * 32, 1);
-    DynArr* hashes2 = DynArr_create(sizeof(uint8_t) * 32, 1);
-    if (!hashes1 || !hashes2) {
-        if (hashes1) DynArr_destroy(hashes1);
-        if (hashes2) DynArr_destroy(hashes2);
+    uint8_t* current = (uint8_t*)malloc(txCount * 32u);
+    uint8_t* next = (uint8_t*)malloc(txCount * 32u);
+    if (!current || !next) {
+        free(current);
+        free(next);
+        memset(outHash, 0, 32);
         return;
     }
 
-    // Handle the transactions
-    for (size_t i = 0; i < txCount - 1; i++) {
+    for (size_t i = 0; i < txCount; ++i) {
         signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
-        signed_transaction_t* txNext = (signed_transaction_t*)DynArr_at(block->transactions, i + 1);
-        uint8_t buf1[32] = {0}; uint8_t buf2[32] = {0}; // Zeroed out
-
-        // Unless if by some miracle the hash just so happens to be all zeros,
-        // I think we can safely assume that a 1 : 2^256 chance will NEVER be hit
-        Transaction_CalculateHash(tx, buf1);
-        Transaction_CalculateHash(txNext, buf2);
-
-        // Concat the two hashes
-        uint8_t dataInBuffer[64] = {0};
-        uint8_t* nextStart = dataInBuffer;
-        nextStart += 32;
-        memcpy(dataInBuffer, buf1, 32);
-        if (txNext) { memcpy(nextStart, buf2, 32); }
-
-        // Double hash that tx set
-        uint8_t outHash[32];
-        SHA256((const unsigned char*)dataInBuffer, 64, outHash);
-        SHA256(outHash, 32, outHash);
-
-        // Copy to the hashes dynarr
-        DynArr_push_back(hashes1, outHash);
+        if (!tx) {
+            free(current);
+            free(next);
+            memset(outHash, 0, 32);
+            return;
+        }
+        Transaction_CalculateHash(tx, current + (i * 32u));
     }
 
-    // Move to hashing the existing ones until only one remains
-    do {
-        for (size_t i = 0; i < DynArr_size(hashes1) - 1; i++) {
-            uint8_t* hash1 = (uint8_t*)DynArr_at(hashes1, i); uint8_t* hash2 = (uint8_t*)DynArr_at(hashes1, i + 1);
+    size_t levelCount = txCount;
+    while (levelCount > 1) {
+        size_t nextCount = 0;
+        for (size_t i = 0; i < levelCount; i += 2) {
+            const uint8_t* left = current + (i * 32u);
+            const uint8_t* right = (i + 1 < levelCount) ? current + ((i + 1) * 32u) : left;
 
-            // Concat the two hashes
-            uint8_t dataInBuffer[64] = {0};
-            uint8_t* nextStart = dataInBuffer;
-            nextStart += 32;
-            memcpy(dataInBuffer, hash1, 32);
-            memcpy(nextStart, hash2, 32);
+            uint8_t dataInBuffer[64];
+            memcpy(dataInBuffer, left, 32);
+            memcpy(dataInBuffer + 32, right, 32);
 
-            // Double hash that tx set
-            uint8_t outHash[32];
-            SHA256((const unsigned char*)dataInBuffer, 64, outHash);
-            SHA256(outHash, 32, outHash);
-
-            DynArr_push_back(hashes2, outHash);
+            SHA256((const unsigned char*)dataInBuffer, 64, next + (nextCount * 32u));
+            SHA256(next + (nextCount * 32u), 32, next + (nextCount * 32u));
+            ++nextCount;
         }
 
-        DynArr_erase(hashes1);
-        for (size_t i = 0; i < DynArr_size(hashes2); i++) {
-            DynArr_push_back(hashes1, (uint8_t*)DynArr_at(hashes2, i));
-        }
-        DynArr_erase(hashes2);
-    } while (DynArr_size(hashes1) > 1);
-
-    // Final Merkle
-    uint8_t* merkle = (uint8_t*)DynArr_at(hashes1, 0);
-    if (merkle) {
-        memcpy(outHash, merkle, 32);
-    } else {
-        memset(outHash, 0, 32);
+        uint8_t* swap = current;
+        current = next;
+        next = swap;
+        levelCount = nextCount;
     }
 
-    DynArr_destroy(hashes1);
-    DynArr_destroy(hashes2);
+    memcpy(outHash, current, 32);
+    free(current);
+    free(next);
 }
 
 void Block_CalculateAutolykos2Hash(const block_t* block, uint8_t* outHash) {
@@ -214,39 +187,6 @@ static int Uint256_CompareBE(const uint8_t a[32], const uint8_t b[32]) {
         if (a[i] > b[i]) return 1;
     }
     return 0;
-}
-
-static bool DecodeCompactTarget(uint32_t nBits, uint8_t target[32]) {
-    memset(target, 0, 32);
-
-    uint32_t exponent = nBits >> 24;
-    uint32_t mantissa = nBits & 0x007fffff;  // ignore sign bit for now
-    bool negative = (nBits & 0x00800000) != 0;
-
-    if (negative || mantissa == 0) {
-        return false;
-    }
-
-    // Compute: target = mantissa * 256^(exponent - 3)
-    if (exponent <= 3) {
-        mantissa >>= 8 * (3 - exponent);
-
-        target[29] = (mantissa >> 16) & 0xff;
-        target[30] = (mantissa >> 8) & 0xff;
-        target[31] = mantissa & 0xff;
-    } else {
-        uint32_t byte_index = exponent - 3;  // number of zero-bytes appended on right
-
-        if (byte_index > 29) {
-            return false; // overflow 256 bits
-        }
-
-        target[32 - byte_index - 3] = (mantissa >> 16) & 0xff;
-        target[32 - byte_index - 2] = (mantissa >> 8) & 0xff;
-        target[32 - byte_index - 1] = mantissa & 0xff;
-    }
-
-    return true;
 }
 
 bool Block_HasValidProofOfWork(const block_t* block) {

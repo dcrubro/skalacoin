@@ -1,6 +1,6 @@
 #include <block/chain.h>
 #include <block/transaction.h>
-#include <openssl/sha.h>
+#include <utils.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -16,7 +16,6 @@
 #include <autolykos2/autolykos2.h>
 
 #include <nets/net_node.h>
-#include <crypto/crypto.h>
 
 #ifndef CHAIN_DATA_DIR
 #define CHAIN_DATA_DIR "chain_data"
@@ -33,56 +32,6 @@ uint32_t difficultyTarget = INITIAL_DIFFICULTY;
 
 // extern the currentReward from constants.h so we can update it as we mine blocks and save it to disk
 extern uint64_t currentReward;
-
-static void AddressFromCompressedPubkey(const uint8_t compressedPubkey[33], uint8_t outAddress[32]) {
-    if (!compressedPubkey || !outAddress) {
-        return;
-    }
-
-    SHA256(compressedPubkey, 33, outAddress);
-}
-
-static bool GenerateTestMinerIdentity(uint8_t privateKey[32], uint8_t compressedPubkey[33], uint8_t address[32]) {
-    if (!privateKey || !compressedPubkey || !address) {
-        return false;
-    }
-
-    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
-    if (!ctx) {
-        return false;
-    }
-
-    uint8_t seed[64];
-    secp256k1_pubkey pubkey;
-
-    for (uint64_t counter = 0; counter < 1024; ++counter) {
-        const char* base = "skalacoin-test-miner-key";
-        size_t baseLen = strlen(base);
-        memcpy(seed, base, baseLen);
-        memcpy(seed + baseLen, &counter, sizeof(counter));
-        SHA256(seed, baseLen + sizeof(counter), privateKey);
-
-        if (!secp256k1_ec_seckey_verify(ctx, privateKey)) {
-            continue;
-        }
-
-        if (!secp256k1_ec_pubkey_create(ctx, &pubkey, privateKey)) {
-            continue;
-        }
-
-        size_t pubLen = 33;
-        if (!secp256k1_ec_pubkey_serialize(ctx, compressedPubkey, &pubLen, &pubkey, SECP256K1_EC_COMPRESSED) || pubLen != 33) {
-            continue;
-        }
-
-        AddressFromCompressedPubkey(compressedPubkey, address);
-        secp256k1_context_destroy(ctx);
-        return true;
-    }
-
-    secp256k1_context_destroy(ctx);
-    return false;
-}
 
 static bool MineBlock(block_t* block) {
     if (!block) {
@@ -157,6 +106,158 @@ static void AddCoinbaseTransaction(block_t* block, const uint8_t minerAddress[32
     Block_AddTransaction(block, &coinbaseTx);
 }
 
+static void PrintBlockDetail(const block_t* block, size_t txCount, const uint8_t canonicalHash[32], const uint8_t powHash[32]) {
+    if (!block) {
+        return;
+    }
+
+    printf("Block #%llu\n", (unsigned long long)block->header.blockNumber);
+    printf("  Timestamp: %llu\n", (unsigned long long)block->header.timestamp);
+    printf("  Nonce: %llu\n", (unsigned long long)block->header.nonce);
+    printf("  Difficulty Target: 0x%08x\n", block->header.difficultyTarget);
+    printf("  Version: %u\n", block->header.version);
+    printf("  Reserved: %02x %02x %02x\n",
+        block->header.reserved[0],
+        block->header.reserved[1],
+        block->header.reserved[2]);
+    printf("  Previous Hash: ");
+    PrintHexBytes(block->header.prevHash, sizeof(block->header.prevHash));
+    printf("\n");
+    printf("  Merkle Root: ");
+    PrintHexBytes(block->header.merkleRoot, sizeof(block->header.merkleRoot));
+    printf("\n");
+    printf("  Transactions on disk: %zu\n", txCount);
+    printf("  Canonical Hash: ");
+    PrintHexBytes(canonicalHash, 32);
+    printf("\n");
+    printf("  PoW Hash: ");
+    PrintHexBytes(powHash, 32);
+    printf("\n");
+}
+
+static bool ComputeEpochSeedForHeightFromChain(const blockchain_t* chain, uint64_t blockHeight, uint8_t outSeed[32]) {
+    if (!chain || !outSeed) {
+        return false;
+    }
+
+    const uint64_t epochIndex = blockHeight / EPOCH_LENGTH;
+    if (epochIndex == 0) {
+        memset(outSeed, DAG_GENESIS_SEED, 32);
+        return true;
+    }
+
+    const uint64_t seedBlockNumber = (epochIndex * EPOCH_LENGTH) - 1ULL;
+    if (seedBlockNumber >= Chain_Size((blockchain_t*)chain)) {
+        return false;
+    }
+
+    block_t* seedBlock = Chain_GetBlock((blockchain_t*)chain, (size_t)seedBlockNumber);
+    if (!seedBlock) {
+        return false;
+    }
+
+    Block_CalculateHash(seedBlock, outSeed);
+    return true;
+}
+
+static bool ComputeEpochDagBytesForHeightFromChain(const blockchain_t* chain, uint64_t blockHeight, size_t* outDagBytes) {
+    if (!chain || !outDagBytes) {
+        return false;
+    }
+
+    if (blockHeight <= EPOCH_LENGTH) {
+        *outDagBytes = DAG_BASE_SIZE;
+        return true;
+    }
+
+    const uint64_t lastBlockNumber = blockHeight - 1ULL;
+    const uint64_t epochStartBlockNumber = lastBlockNumber - EPOCH_LENGTH;
+    if (lastBlockNumber >= Chain_Size((blockchain_t*)chain) || epochStartBlockNumber >= Chain_Size((blockchain_t*)chain)) {
+        return false;
+    }
+
+    block_t* lastBlock = Chain_GetBlock((blockchain_t*)chain, (size_t)lastBlockNumber);
+    block_t* epochStartBlock = Chain_GetBlock((blockchain_t*)chain, (size_t)epochStartBlockNumber);
+    if (!lastBlock || !epochStartBlock) {
+        return false;
+    }
+
+    int64_t difficultyDelta = (int64_t)epochStartBlock->header.difficultyTarget - (int64_t)lastBlock->header.difficultyTarget;
+    int64_t growth = (int64_t)((int64_t)DAG_BASE_GROWTH * difficultyDelta);
+
+    if (growth > 0) {
+        int64_t maxUp = (int64_t)((DAG_BASE_SIZE * 15ULL) / 100ULL);
+        if (growth > maxUp) {
+            growth = maxUp;
+        }
+        if (growth > (int64_t)DAG_MAX_UP_SWING_GB) {
+            growth = (int64_t)DAG_MAX_UP_SWING_GB;
+        }
+    } else {
+        int64_t maxDown = (int64_t)((DAG_BASE_SIZE * 10ULL) / 100ULL);
+        if (-growth > maxDown) {
+            growth = -maxDown;
+        }
+        if (-growth > (int64_t)DAG_MAX_DOWN_SWING_GB) {
+            growth = -(int64_t)DAG_MAX_DOWN_SWING_GB;
+        }
+    }
+
+    const int64_t targetSize = (int64_t)DAG_BASE_SIZE + growth;
+    if (targetSize <= 0) {
+        return false;
+    }
+
+    *outDagBytes = (size_t)targetSize;
+    return true;
+}
+
+static bool ComputeHistoricalAutolykosHashFromChain(const blockchain_t* chain, const block_t* block, uint64_t blockHeight, uint8_t outHash[32]) {
+    if (!chain || !block || !outHash) {
+        return false;
+    }
+
+    uint8_t seed[32];
+    size_t dagBytes = 0;
+    if (!ComputeEpochSeedForHeightFromChain(chain, blockHeight, seed)) {
+        return false;
+    }
+    if (!ComputeEpochDagBytesForHeightFromChain(chain, blockHeight, &dagBytes)) {
+        return false;
+    }
+
+    return Autolykos2_LightHashAtHeight(
+        seed,
+        (const uint8_t*)&block->header,
+        sizeof(block_header_t),
+        block->header.nonce,
+        blockHeight,
+        dagBytes,
+        outHash
+    );
+}
+
+static bool ComputeHistoricalAutolykosHashFromDisk(const char* chainDataDir, uint64_t blockHeight, const block_t* block, uint8_t outHash[32]) {
+    if (!chainDataDir || !block || !outHash) {
+        return false;
+    }
+
+    blockchain_t* headerChain = Chain_Create();
+    if (!headerChain) {
+        return false;
+    }
+
+    uint256_t supply = uint256_from_u64(0);
+    uint32_t difficulty = INITIAL_DIFFICULTY;
+    uint64_t reward = 0;
+    uint8_t lastHash[32] = {0};
+    bool loaded = Chain_LoadFromFile(headerChain, chainDataDir, &supply, &difficulty, &reward, lastHash, false);
+    bool ok = loaded && ComputeHistoricalAutolykosHashFromChain(headerChain, block, blockHeight, outHash);
+
+    Chain_Destroy(headerChain);
+    return ok;
+}
+
 static bool MineAndAppendBlock(blockchain_t* chain,
                                block_t* block,
                                uint256_t* currentSupply,
@@ -221,47 +322,6 @@ static bool MineAndAppendBlock(blockchain_t* chain,
     return true;
 }
 
-static bool GenerateRandomTestAddress(uint8_t outAddress[32]) {
-    if (!outAddress) {
-        return false;
-    }
-
-    uint8_t privateKey[32];
-    uint8_t compressedPubkey[33];
-    secp256k1_pubkey pubkey;
-
-    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
-    if (!ctx) {
-        return false;
-    }
-
-    for (size_t attempt = 0; attempt < 4096; ++attempt) {
-        for (size_t i = 0; i < sizeof(privateKey); ++i) {
-            privateKey[i] = (uint8_t)(rand() & 0xFF);
-        }
-
-        if (!secp256k1_ec_seckey_verify(ctx, privateKey)) {
-            continue;
-        }
-
-        if (!secp256k1_ec_pubkey_create(ctx, &pubkey, privateKey)) {
-            continue;
-        }
-
-        size_t pubLen = sizeof(compressedPubkey);
-        if (!secp256k1_ec_pubkey_serialize(ctx, compressedPubkey, &pubLen, &pubkey, SECP256K1_EC_COMPRESSED) || pubLen != 33) {
-            continue;
-        }
-
-        AddressFromCompressedPubkey(compressedPubkey, outAddress);
-        secp256k1_context_destroy(ctx);
-        return true;
-    }
-
-    secp256k1_context_destroy(ctx);
-    return false;
-}
-
 static void WipeChainFiles(const char* chainDataDir) {
     if (!chainDataDir) {
         return;
@@ -288,45 +348,81 @@ static bool VerifyChainFully(blockchain_t* chain) {
     }
 
     size_t chainSize = Chain_Size(chain);
+    // Build a lightweight previous-block-only chain to compute expected difficulty
+    blockchain_t* prevChain = Chain_Create();
+    if (!prevChain) { return false; }
+
+    uint32_t expectedDifficulty = INITIAL_DIFFICULTY;
     for (size_t i = 0; i < chainSize; ++i) {
         block_t* blk = Chain_GetBlock(chain, i);
         if (!blk || !blk->transactions) {
+            Chain_Destroy(prevChain);
             return false;
         }
 
         if (blk->header.blockNumber != (uint64_t)i) {
+            Chain_Destroy(prevChain);
             return false;
         }
 
         if (i == 0) {
             uint8_t zeroHash[32] = {0};
             if (memcmp(blk->header.prevHash, zeroHash, sizeof(zeroHash)) != 0) {
+                Chain_Destroy(prevChain);
                 return false;
             }
         } else {
             block_t* prevBlk = Chain_GetBlock(chain, i - 1);
             if (!prevBlk) {
+                Chain_Destroy(prevChain);
                 return false;
             }
 
             uint8_t expectedPrevHash[32];
             Block_CalculateHash(prevBlk, expectedPrevHash);
             if (memcmp(blk->header.prevHash, expectedPrevHash, sizeof(expectedPrevHash)) != 0) {
+                Chain_Destroy(prevChain);
                 return false;
             }
         }
 
-        if (!Block_HasValidProofOfWork(blk)) {
+        // Determine expected difficulty for this block. TODO: Optimize to recompute at adjustment intervals only instead of every block.
+        if (i < DIFFICULTY_ADJUSTMENT_INTERVAL) {
+            expectedDifficulty = INITIAL_DIFFICULTY;
+        } else if ((i % DIFFICULTY_ADJUSTMENT_INTERVAL) == 0) {
+            // Compute target using previous blocks only (0..i-1)
+            expectedDifficulty = Chain_ComputeNextTarget(prevChain, expectedDifficulty);
+        }
+
+        // Ensure the block's header difficulty matches the expected difficulty (can't cheat easier)
+        if (blk->header.difficultyTarget != expectedDifficulty) {
+            Chain_Destroy(prevChain);
+            return false;
+        }
+
+        uint8_t powHash[32];
+        if (!ComputeHistoricalAutolykosHashFromChain(chain, blk, (uint64_t)i, powHash)) {
+            Chain_Destroy(prevChain);
+            return false;
+        }
+
+        uint8_t target[32];
+        if (!DecodeCompactTarget(blk->header.difficultyTarget, target)) {
+            return false;
+        }
+        if (CompareHashToTarget(powHash, target) > 0) {
             return false;
         }
 
         if (!Block_AllTransactionsValid(blk)) {
+            Chain_Destroy(prevChain);
             return false;
         }
 
         uint8_t expectedMerkle[32];
         Block_CalculateMerkleRoot(blk, expectedMerkle);
         if (memcmp(blk->header.merkleRoot, expectedMerkle, sizeof(expectedMerkle)) != 0) {
+            Chain_Destroy(prevChain);
             return false;
         }
 
@@ -334,8 +430,16 @@ static bool VerifyChainFully(blockchain_t* chain) {
         // release its in-memory transaction list to reduce peak memory usage.
         DynArr_destroy(blk->transactions);
         blk->transactions = NULL;
+
+        // Push a header-only copy of this block into prevChain for future difficulty calculations.
+        block_t headerOnly;
+        memset(&headerOnly, 0, sizeof(headerOnly));
+        headerOnly.header = blk->header;
+        headerOnly.transactions = NULL;
+        (void)DynArr_push_back(prevChain->blocks, &headerOnly);
     }
 
+    Chain_Destroy(prevChain);
     return true;
 }
 
@@ -426,7 +530,7 @@ int main(int argc, char* argv[]) {
     char supplyStr[80];
     Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
     printf("Current chain has %zu blocks, total supply %s\n", Chain_Size(chain), supplyStr);
-    printf("Commands: mine <x>, send <address> <amount>, balance [address], connect <ipv4>, flushchain, fullverify, wipechain, genaddr, exit\n");
+    printf("Commands: mine <x>, send <address> <amount>, balance [address], connect <ipv4>, flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
 
     char line[1024];
     while (true) {
@@ -481,7 +585,7 @@ int main(int argc, char* argv[]) {
 
                 free(block); // Chain stores block by value and owns copied transaction array.
 
-                if (i % 1000 == 0) {
+                if (i % 50 == 0) {
                     // Mid-mine flush
                     (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
                 }
@@ -550,14 +654,56 @@ int main(int argc, char* argv[]) {
             Transaction_Sign(&spendTx, minerPrivateKey);
 
             Block_AddTransaction(block, &spendTx);
-
+            printf("Created transaction sending %llu pebble(s) to ", (unsigned long long)amount);
+            char recipientHex[65];
+            AddressToHexString(recipientAddress, recipientHex);
+            printf("%s\n\nMining block...\n", recipientHex);
+            
             if (!MineAndAppendBlock(chain, block, &currentSupply, &currentReward, &difficultyTarget)) {
                 Block_Destroy(block);
                 continue;
             }
 
+            FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
+
             free(block);
             printf("send committed in mined block\n");
+            continue;
+        }
+
+        if (strcmp(cmd, "blockdetail") == 0) {
+            char* blockNumberStr = strtok(NULL, " \t");
+            char* extra = strtok(NULL, " \t");
+            if (!blockNumberStr || extra) {
+                printf("usage: blockdetail <block number>\n");
+                continue;
+            }
+
+            char* endptr = NULL;
+            unsigned long long requestedBlock = strtoull(blockNumberStr, &endptr, 10);
+            if (*blockNumberStr == '\0' || blockNumberStr[0] == '-' || (endptr && *endptr != '\0')) {
+                printf("invalid block number\n");
+                continue;
+            }
+
+            block_t* detailBlock = NULL;
+            size_t txCount = 0;
+            if (!Chain_LoadBlockFromFile(chainDataDir, (uint64_t)requestedBlock, false, &detailBlock, &txCount)) {
+                printf("block %llu not found\n", requestedBlock);
+                continue;
+            }
+
+            uint8_t canonicalHash[32];
+            uint8_t powHash[32];
+            Block_CalculateHash(detailBlock, canonicalHash);
+            if (!ComputeHistoricalAutolykosHashFromDisk(chainDataDir, (uint64_t)requestedBlock, detailBlock, powHash)) {
+                Block_Destroy(detailBlock);
+                printf("failed to calculate block %llu proof hash\n", requestedBlock);
+                continue;
+            }
+
+            PrintBlockDetail(detailBlock, txCount, canonicalHash, powHash);
+            Block_Destroy(detailBlock);
             continue;
         }
 
@@ -654,9 +800,6 @@ int main(int argc, char* argv[]) {
 
             bool ok = false;
             if (loaded) {
-                uint8_t dagSeed[32];
-                GetNextDAGSeed(verifyChain, dagSeed);
-                (void)Block_RebuildAutolykos2Dag(CalculateTargetDAGSize(verifyChain), dagSeed);
                 ok = VerifyChainFully(verifyChain);
             }
 
@@ -699,7 +842,7 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        printf("Unknown command. Available: mine, send, balance, connect, flushchain, fullverify, wipechain, genaddr, exit\n");
+        printf("Unknown command. Available: mine, send, balance, connect, flushchain, fullverify, blockdetail, wipechain, genaddr, exit\n");
     }
 
     (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);

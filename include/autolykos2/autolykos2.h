@@ -31,6 +31,15 @@ bool Autolykos2_Hash(
 );
 
 bool Autolykos2_LightHash(const uint8_t* seed, blockchain_t* chain, uint64_t nonce, uint8_t* out);
+bool Autolykos2_LightHashAtHeight(
+	const uint8_t seed32[32],
+	const uint8_t* message,
+	size_t messageLen,
+	uint64_t nonce,
+	uint64_t height,
+	size_t dagBytes,
+	uint8_t out[32]
+);
 
 bool Autolykos2_CheckTarget(
 	Autolykos2Context* ctx,

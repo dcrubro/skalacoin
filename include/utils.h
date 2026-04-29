@@ -3,8 +3,10 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <crypto/crypto.h>
 #include <uint256.h>
 
 typedef struct {
@@ -29,6 +31,158 @@ static inline void AddressToHexString(const uint8_t address[32], char out[65]) {
         return;
     }
     to_hex(address, out);
+}
+
+static inline void AddressFromCompressedPubkey(const uint8_t compressedPubkey[33], uint8_t outAddress[32]) {
+    if (!compressedPubkey || !outAddress) {
+        return;
+    }
+
+    SHA256(compressedPubkey, 33, outAddress);
+}
+
+static inline void PrintHexBytes(const uint8_t* bytes, size_t length) {
+    if (!bytes) {
+        return;
+    }
+
+    for (size_t i = 0; i < length; ++i) {
+        printf("%02x", bytes[i]);
+    }
+}
+
+static inline int CompareHashToTarget(const uint8_t hash[32], const uint8_t target[32]) {
+    if (!hash || !target) {
+        return 1;
+    }
+
+    for (size_t i = 0; i < 32; ++i) {
+        if (hash[i] < target[i]) {
+            return -1;
+        }
+        if (hash[i] > target[i]) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static inline bool DecodeCompactTarget(uint32_t nBits, uint8_t target[32]) {
+    if (!target) {
+        return false;
+    }
+
+    memset(target, 0, 32);
+
+    uint32_t exponent = nBits >> 24;
+    uint32_t mantissa = nBits & 0x007fffff;
+    bool negative = (nBits & 0x00800000) != 0;
+
+    if (negative || mantissa == 0) {
+        return false;
+    }
+
+    if (exponent <= 3) {
+        mantissa >>= 8 * (3 - exponent);
+        target[29] = (uint8_t)((mantissa >> 16) & 0xffu);
+        target[30] = (uint8_t)((mantissa >> 8) & 0xffu);
+        target[31] = (uint8_t)(mantissa & 0xffu);
+    } else {
+        uint32_t byteIndex = exponent - 3;
+        if (byteIndex > 29) {
+            return false;
+        }
+
+        target[32 - byteIndex - 3] = (uint8_t)((mantissa >> 16) & 0xffu);
+        target[32 - byteIndex - 2] = (uint8_t)((mantissa >> 8) & 0xffu);
+        target[32 - byteIndex - 1] = (uint8_t)(mantissa & 0xffu);
+    }
+
+    return true;
+}
+
+static inline bool GenerateTestMinerIdentity(uint8_t privateKey[32], uint8_t compressedPubkey[33], uint8_t address[32]) {
+    if (!privateKey || !compressedPubkey || !address) {
+        return false;
+    }
+
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    if (!ctx) {
+        return false;
+    }
+
+    uint8_t seed[64];
+    secp256k1_pubkey pubkey;
+
+    for (uint64_t counter = 0; counter < 1024; ++counter) {
+        const char* base = "skalacoin-test-miner-key";
+        size_t baseLen = strlen(base);
+        memcpy(seed, base, baseLen);
+        memcpy(seed + baseLen, &counter, sizeof(counter));
+        SHA256(seed, baseLen + sizeof(counter), privateKey);
+
+        if (!secp256k1_ec_seckey_verify(ctx, privateKey)) {
+            continue;
+        }
+
+        if (!secp256k1_ec_pubkey_create(ctx, &pubkey, privateKey)) {
+            continue;
+        }
+
+        size_t pubLen = 33;
+        if (!secp256k1_ec_pubkey_serialize(ctx, compressedPubkey, &pubLen, &pubkey, SECP256K1_EC_COMPRESSED) || pubLen != 33) {
+            continue;
+        }
+
+        AddressFromCompressedPubkey(compressedPubkey, address);
+        secp256k1_context_destroy(ctx);
+        return true;
+    }
+
+    secp256k1_context_destroy(ctx);
+    return false;
+}
+
+static inline bool GenerateRandomTestAddress(uint8_t outAddress[32]) {
+    if (!outAddress) {
+        return false;
+    }
+
+    uint8_t privateKey[32];
+    uint8_t compressedPubkey[33];
+    secp256k1_pubkey pubkey;
+
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    if (!ctx) {
+        return false;
+    }
+
+    for (size_t attempt = 0; attempt < 4096; ++attempt) {
+        for (size_t i = 0; i < sizeof(privateKey); ++i) {
+            privateKey[i] = (uint8_t)(rand() & 0xFF);
+        }
+
+        if (!secp256k1_ec_seckey_verify(ctx, privateKey)) {
+            continue;
+        }
+
+        if (!secp256k1_ec_pubkey_create(ctx, &pubkey, privateKey)) {
+            continue;
+        }
+
+        size_t pubLen = sizeof(compressedPubkey);
+        if (!secp256k1_ec_pubkey_serialize(ctx, compressedPubkey, &pubLen, &pubkey, SECP256K1_EC_COMPRESSED) || pubLen != 33) {
+            continue;
+        }
+
+        AddressFromCompressedPubkey(compressedPubkey, outAddress);
+        secp256k1_context_destroy(ctx);
+        return true;
+    }
+
+    secp256k1_context_destroy(ctx);
+    return false;
 }
 
 static inline bool ParseHexAddress32(const char* in, uint8_t outAddress[32]) {

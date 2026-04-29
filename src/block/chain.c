@@ -1,6 +1,7 @@
 #include <block/chain.h>
 #include <constants.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 
 uint64_t currentBlockHeight = 0;
@@ -608,6 +609,178 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
     fclose(tableFile);
 
     // After read, you SHOULD verify chain validity. We're not doing it here since returning false is a bit unclear if the read failed or if the chain is invalid.
+    return true;
+}
+
+bool Chain_LoadBlockFromFile(const char* dirpath, uint64_t blockNumber, bool loadTransactions, block_t** outBlock, size_t* outTxCount) {
+    if (!dirpath || !outBlock) {
+        return false;
+    }
+
+    *outBlock = NULL;
+    if (outTxCount) {
+        *outTxCount = 0;
+    }
+
+    struct stat st;
+    if (stat(dirpath, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
+
+    char metaPath[512];
+    if (!BuildPath(metaPath, sizeof(metaPath), dirpath, "chain.meta")) {
+        return false;
+    }
+
+    char chainPath[512];
+    if (!BuildPath(chainPath, sizeof(chainPath), dirpath, "chain.data")) {
+        return false;
+    }
+
+    char tablePath[512];
+    if (!BuildPath(tablePath, sizeof(tablePath), dirpath, "chain.table")) {
+        return false;
+    }
+
+    FILE* metaFile = fopen(metaPath, "rb");
+    FILE* chainFile = fopen(chainPath, "rb");
+    FILE* tableFile = fopen(tablePath, "rb");
+    if (!metaFile || !chainFile || !tableFile) {
+        if (metaFile) fclose(metaFile);
+        if (chainFile) fclose(chainFile);
+        if (tableFile) fclose(tableFile);
+        return false;
+    }
+
+    size_t savedSize = 0;
+    if (fread(&savedSize, sizeof(size_t), 1, metaFile) != 1) {
+        fclose(metaFile);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    fclose(metaFile);
+
+    if (blockNumber >= (uint64_t)savedSize) {
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    uint64_t tableOffset = blockNumber * (uint64_t)sizeof(block_table_entry_t);
+    if (blockNumber != 0 && tableOffset / blockNumber != (uint64_t)sizeof(block_table_entry_t)) {
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+    if (tableOffset > (uint64_t)LONG_MAX || fseek(tableFile, (long)tableOffset, SEEK_SET) != 0) {
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    block_table_entry_t loc;
+    if (fread(&loc, sizeof(block_table_entry_t), 1, tableFile) != 1) {
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    if (loc.blockNumber != blockNumber) {
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    if (loc.byteNumber > (uint64_t)LONG_MAX || fseek(chainFile, (long)loc.byteNumber, SEEK_SET) != 0) {
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    block_t* blk = (block_t*)calloc(1, sizeof(block_t));
+    if (!blk) {
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    if (fread(&blk->header, sizeof(block_header_t), 1, chainFile) != 1) {
+        free(blk);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    size_t txSize = 0;
+    if (fread(&txSize, sizeof(size_t), 1, chainFile) != 1) {
+        free(blk);
+        fclose(chainFile);
+        fclose(tableFile);
+        return false;
+    }
+
+    if (outTxCount) {
+        *outTxCount = txSize;
+    }
+
+    if (loadTransactions) {
+        blk->transactions = DYNARR_CREATE(signed_transaction_t, txSize == 0 ? 1 : txSize);
+        if (!blk->transactions) {
+            free(blk);
+            fclose(chainFile);
+            fclose(tableFile);
+            return false;
+        }
+
+        for (size_t i = 0; i < txSize; ++i) {
+            signed_transaction_t tx;
+            if (fread(&tx, sizeof(signed_transaction_t), 1, chainFile) != 1) {
+                DynArr_destroy(blk->transactions);
+                free(blk);
+                fclose(chainFile);
+                fclose(tableFile);
+                return false;
+            }
+
+            if (!DynArr_push_back(blk->transactions, &tx)) {
+                DynArr_destroy(blk->transactions);
+                free(blk);
+                fclose(chainFile);
+                fclose(tableFile);
+                return false;
+            }
+        }
+    } else {
+        if (txSize > 0) {
+            uint64_t skipBytes = (uint64_t)txSize * (uint64_t)sizeof(signed_transaction_t);
+            if (txSize != 0 && skipBytes / txSize != (uint64_t)sizeof(signed_transaction_t)) {
+                free(blk);
+                fclose(chainFile);
+                fclose(tableFile);
+                return false;
+            }
+            if (skipBytes > (uint64_t)LONG_MAX) {
+                free(blk);
+                fclose(chainFile);
+                fclose(tableFile);
+                return false;
+            }
+            if (fseek(chainFile, (long)skipBytes, SEEK_CUR) != 0) {
+                free(blk);
+                fclose(chainFile);
+                fclose(tableFile);
+                return false;
+            }
+        }
+        blk->transactions = NULL;
+    }
+
+    fclose(chainFile);
+    fclose(tableFile);
+
+    *outBlock = blk;
     return true;
 }
 
