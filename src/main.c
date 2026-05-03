@@ -444,8 +444,28 @@ static bool VerifyChainFully(blockchain_t* chain) {
 }
 
 int main(int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
+    //(void)argc;
+    //(void)argv;
+    if (argc > 1) {
+        // Check for potential startup args.
+        if (strcmp(argv[1], "--throttle") == 0) {
+            // Get throttle value in microseconds if provided, otherwise default to 1000 microseconds (1ms) between hash operations.
+            uint64_t throttleUs = 1000;
+            if (argc > 2) {
+                char* endptr = NULL;
+                throttleUs = strtoull(argv[2], &endptr, 10);
+                if (*argv[2] == '\0' || argv[2][0] == '-' || (endptr && *endptr != '\0')) {
+                    printf("invalid throttle value\n");
+                    return 1;
+                }
+            }
+            Autolykos2_SetSleepBetweenHashOperations(throttleUs);
+            printf("Throttling hash operations with a sleep of %llu microseconds\n", (unsigned long long)throttleUs);
+        } else {
+            printf("Unknown argument: %s\n", argv[1]);
+            return 1;
+        }
+    }
 
     signal(SIGINT, handle_sigint);
     srand((unsigned int)time(NULL));

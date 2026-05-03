@@ -4,6 +4,13 @@
 
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+uint64_t autolykos2_sleepBetweenHashOperationsMicroseconds = 0;
 
 typedef struct {
     uint8_t* buf;
@@ -239,7 +246,19 @@ static bool Autolykos2_HashCore(
     memcpy(finalInput + 32, accHash, 32);
     memcpy(finalInput + 64, nonceBytes, 8);
     memcpy(finalInput + 72, heightBytes, 8);
-    return Blake2b_Hash(finalInput, sizeof(finalInput), outHash, 32);
+    bool ok = Blake2b_Hash(finalInput, sizeof(finalInput), outHash, 32);
+
+    // Throttle between hash operations if configured (applies to all hash paths).
+    if (autolykos2_sleepBetweenHashOperationsMicroseconds > 0) {
+#if defined(_WIN32) || defined(_WIN64)
+        DWORD ms = (DWORD)((autolykos2_sleepBetweenHashOperationsMicroseconds + 999) / 1000);
+        Sleep(ms);
+#else
+        usleep((useconds_t)autolykos2_sleepBetweenHashOperationsMicroseconds);
+#endif
+    }
+
+    return ok;
 }
 
 Autolykos2Context* Autolykos2_Create(void) {
@@ -509,4 +528,8 @@ bool Autolykos2_FindNonceSingleCore(
     }
 
     return false;
+}
+
+void Autolykos2_SetSleepBetweenHashOperations(uint64_t sleepMicroseconds) {
+    autolykos2_sleepBetweenHashOperationsMicroseconds = sleepMicroseconds;
 }

@@ -12,6 +12,8 @@ extern "C" {
 
 typedef struct Autolykos2Context Autolykos2Context;
 
+extern uint64_t autolykos2_sleepBetweenHashOperationsMicroseconds;
+
 Autolykos2Context* Autolykos2_Create(void);
 void Autolykos2_Destroy(Autolykos2Context* ctx);
 
@@ -60,6 +62,8 @@ bool Autolykos2_FindNonceSingleCore(
 	uint64_t* outNonce,
 	uint8_t outHash[32]
 );
+
+void Autolykos2_SetSleepBetweenHashOperations(uint64_t sleepMicroseconds);
 
 #ifdef __cplusplus
 }
