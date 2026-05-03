@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <crypto/crypto.h>
 #include <uint256.h>
+#include <time.h>
 
 typedef struct {
     uint8_t bytes[32];
@@ -24,6 +25,15 @@ static inline uint32_t hash_key32(key32_t k) {
 
 static inline int eq_key32(key32_t a, key32_t b) {
     return memcmp(a.bytes, b.bytes, 32) == 0;
+}
+
+static inline uint64_t get_current_time_ms(void) {
+    struct timespec spec;
+    if (clock_gettime(CLOCK_REALTIME, &spec) == -1) {
+        return 0; // Handle error
+    }
+    // Convert seconds to milliseconds and add nanoseconds converted to milliseconds
+    return (spec.tv_sec * 1000) + (spec.tv_nsec / 1000000);
 }
 
 static inline void AddressToHexString(const uint8_t address[32], char out[65]) {

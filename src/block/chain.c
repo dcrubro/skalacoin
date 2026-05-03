@@ -804,6 +804,7 @@ uint32_t Chain_ComputeNextTarget(blockchain_t* chain, uint32_t currentTarget) {
 
     // Retarget uses whole-window span. Per-block average is implicit:
     // (actualTime / interval) / targetBlockTime == actualTime / targetTime.
+    // Block timestamps are stored in milliseconds, so the target window must be ms too.
     uint64_t actualTime = 0;
     if (lastBlock->header.timestamp > adjustmentBlock->header.timestamp) {
         actualTime = lastBlock->header.timestamp - adjustmentBlock->header.timestamp;
@@ -812,7 +813,7 @@ uint32_t Chain_ComputeNextTarget(blockchain_t* chain, uint32_t currentTarget) {
         return currentTarget; // Invalid/non-increasing time window; keep current target
     }
 
-    const uint64_t targetTime = (uint64_t)TARGET_BLOCK_TIME * (uint64_t)DIFFICULTY_ADJUSTMENT_INTERVAL;
+    const uint64_t targetTime = (uint64_t)TARGET_BLOCK_TIME * 1000ULL * (uint64_t)DIFFICULTY_ADJUSTMENT_INTERVAL;
     double timeRatio = (double)actualTime / (double)targetTime;
 
     // Clamp per-epoch target movement: at most x2 easier or x2 harder. TODO: Check if the clamp should be more aggressive or looser

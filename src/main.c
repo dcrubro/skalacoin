@@ -85,7 +85,7 @@ static block_t* BuildNextBlock(blockchain_t* chain, uint32_t difficultyTarget) {
     } else {
         memset(block->header.prevHash, 0, sizeof(block->header.prevHash));
     }
-    block->header.timestamp = (uint64_t)time(NULL);
+    block->header.timestamp = (uint64_t)get_current_time_ms();
     block->header.difficultyTarget = difficultyTarget;
     block->header.nonce = 0;
 
