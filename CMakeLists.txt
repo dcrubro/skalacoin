@@ -176,11 +176,15 @@ target_link_libraries(node PRIVATE
     OpenSSL::Crypto
 )
 
-if(SECP256K1_FOUND)
+if(TARGET PkgConfig::SECP256K1)
     target_link_libraries(node PRIVATE PkgConfig::SECP256K1)
-else()
+elseif(DEFINED SECP256K1_TARGET AND TARGET ${SECP256K1_TARGET})
+    target_link_libraries(node PRIVATE ${SECP256K1_TARGET})
+elseif(SECP256K1_FOUND AND SECP256K1_LIBRARY)
     target_include_directories(node PRIVATE ${SECP256K1_INCLUDE_DIR})
     target_link_libraries(node PRIVATE ${SECP256K1_LIBRARY})
+else()
+    message(FATAL_ERROR "secp256k1 not found and no vendored target available. Install libsecp256k1 or enable FetchContent builds.")
 endif()
 
 if(SKALACOIN_AUTOLYKOS2_REF_AVAILABLE)
