@@ -35,11 +35,73 @@ if(PkgConfig_FOUND)
     pkg_check_modules(SECP256K1 QUIET IMPORTED_TARGET libsecp256k1)
 endif()
 
+# Try pkg-config / system first, then fall back to find_*(). If still not found
+# attempt to fetch and build a bundled copy of libsecp256k1 using FetchContent.
 if(NOT SECP256K1_FOUND)
     find_path(SECP256K1_INCLUDE_DIR NAMES secp256k1.h)
     find_library(SECP256K1_LIBRARY NAMES secp256k1)
-    if(NOT SECP256K1_INCLUDE_DIR OR NOT SECP256K1_LIBRARY)
-        message(FATAL_ERROR "secp256k1 not found. Install with: brew install secp256k1")
+    if(SECP256K1_INCLUDE_DIR AND SECP256K1_LIBRARY)
+        set(SECP256K1_FOUND TRUE)
+    endif()
+endif()
+
+if(NOT SECP256K1_FOUND)
+    message(STATUS "secp256k1 not found on system; fetching and building a vendored copy")
+    include(FetchContent)
+    FetchContent_Declare(
+        secp256k1
+        GIT_REPOSITORY https://github.com/bitcoin-core/secp256k1.git
+        GIT_TAG master
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_GetProperties(secp256k1)
+    if(NOT secp256k1_POPULATED)
+        FetchContent_Populate(secp256k1)
+        # Prefer a CMake build if present
+        if(EXISTS "${secp256k1_SOURCE_DIR}/CMakeLists.txt")
+            add_subdirectory(${secp256k1_SOURCE_DIR} ${secp256k1_BINARY_DIR})
+            if(TARGET secp256k1)
+                set(SECP256K1_FOUND TRUE)
+                set(SECP256K1_TARGET secp256k1)
+            elseif(TARGET libsecp256k1)
+                set(SECP256K1_FOUND TRUE)
+                set(SECP256K1_TARGET libsecp256k1)
+            endif()
+        else()
+            # Fall back to the autotools build path. Install into a private prefix
+            set(SECP256K1_INSTALL_DIR "${CMAKE_BINARY_DIR}/_deps/secp256k1/install")
+            file(MAKE_DIRECTORY ${SECP256K1_INSTALL_DIR})
+            execute_process(COMMAND ./autogen.sh
+                WORKING_DIRECTORY ${secp256k1_SOURCE_DIR}
+                RESULT_VARIABLE _secp_autogen_result
+                OUTPUT_QUIET ERROR_QUIET)
+            if(NOT _secp_autogen_result EQUAL 0)
+                message(FATAL_ERROR "Failed to run autogen.sh for secp256k1")
+            endif()
+            execute_process(COMMAND ./configure --enable-module-ecdh --enable-experimental --prefix=${SECP256K1_INSTALL_DIR}
+                WORKING_DIRECTORY ${secp256k1_SOURCE_DIR}
+                RESULT_VARIABLE _secp_configure_result
+                OUTPUT_QUIET ERROR_QUIET)
+            if(NOT _secp_configure_result EQUAL 0)
+                message(FATAL_ERROR "Failed to configure secp256k1")
+            endif()
+            execute_process(COMMAND make
+                WORKING_DIRECTORY ${secp256k1_SOURCE_DIR}
+                RESULT_VARIABLE _secp_make_result
+                OUTPUT_QUIET ERROR_QUIET)
+            if(NOT _secp_make_result EQUAL 0)
+                message(FATAL_ERROR "Failed to build secp256k1")
+            endif()
+            execute_process(COMMAND make install
+                WORKING_DIRECTORY ${secp256k1_SOURCE_DIR}
+                RESULT_VARIABLE _secp_make_install_result
+                OUTPUT_QUIET ERROR_QUIET)
+            set(SECP256K1_INCLUDE_DIR ${SECP256K1_INSTALL_DIR}/include)
+            set(SECP256K1_LIBRARY ${SECP256K1_INSTALL_DIR}/lib/libsecp256k1.a)
+            if(EXISTS ${SECP256K1_LIBRARY})
+                set(SECP256K1_FOUND TRUE)
+            endif()
+        endif()
     endif()
 endif()
 
