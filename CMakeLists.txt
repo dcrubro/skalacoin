@@ -29,6 +29,20 @@ if(NOT OpenSSL_FOUND)
     find_package(OpenSSL REQUIRED)
 endif()
 
+# libcurl (required by autolykos2 vendored code)
+find_package(CURL QUIET)
+if(NOT CURL_FOUND)
+    message(STATUS "libcurl not found on system; attempting to fetch/build via FetchContent")
+    FetchContent_Declare(
+        curl
+        GIT_REPOSITORY https://github.com/curl/curl.git
+        GIT_TAG curl-8_4_0
+        GIT_SHALLOW TRUE
+    )
+    # Try to make it available (this will add_subdirectory if curl provides CMake)
+    FetchContent_MakeAvailable(curl)
+endif()
+
 # secp256k1 (Bitcoin Core library)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
@@ -145,11 +159,24 @@ if(SKALACOIN_ENABLE_AUTOLYKOS2_REF)
             $<$<COMPILE_LANGUAGE:CXX>:/FIstdlib.h>
         )
     endif()
+    if(TARGET CURL::libcurl)
+        set(_AUTOLYKOS2_CURL_LIB CURL::libcurl)
+    elseif(DEFINED CURL_LIBRARIES AND CURL_LIBRARIES)
+        set(_AUTOLYKOS2_CURL_LIB ${CURL_LIBRARIES})
+    else()
+        set(_AUTOLYKOS2_CURL_LIB "")
+    endif()
+
     target_link_libraries(autolykos2_ref PRIVATE
         ${CMAKE_THREAD_LIBS_INIT}
         OpenSSL::SSL
         OpenSSL::Crypto
+        $<$<BOOL:$_AUTOLYKOS2_CURL_LIB>:$_AUTOLYKOS2_CURL_LIB>
     )
+
+    if(NOT _AUTOLYKOS2_CURL_LIB)
+        message(FATAL_ERROR "autolykos2_ref requires libcurl (curl/curl.h). Install libcurl devel package or allow FetchContent to build it.")
+    endif()
     set(SKALACOIN_AUTOLYKOS2_REF_AVAILABLE ON)
 endif()
 
