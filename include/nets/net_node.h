@@ -15,6 +15,10 @@
 
 #include <dynarr.h>
 
+#include <block/block.h>
+#include <block/chain.h>
+#include <block/transaction.h>
+
 typedef struct {
     tcp_server_t* server;
     tcp_client_t outboundClients[MAX_CONS];

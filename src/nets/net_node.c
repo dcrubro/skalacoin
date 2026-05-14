@@ -4,12 +4,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <runtime_state.h>
+
 static net_node_t* Node_FromConnection(tcp_connection_t* conn) {
     if (!conn) {
         return NULL;
     }
 
     return (net_node_t*)conn->owner;
+}
+
+static uint64_t Node_GetCurrentBlockHeight(void) {
+    if (currentChain) {
+        return (uint64_t)Chain_Size(currentChain);
+    }
+
+    return currentBlockHeight;
 }
 
 static int Node_DecodePacket(const tcp_connection_t* conn, packet_type_t* outType, const unsigned char** outPayload, size_t* outPayloadLen) {
@@ -224,8 +234,9 @@ void Node_Server_OnData(tcp_connection_t* client) {
             size_t ackOffset = 0;
             memcpy(ackData + ackOffset, &protoVersion, sizeof(protoVersion));
             ackOffset += sizeof(protoVersion);
-            memcpy(ackData + ackOffset, &currentBlockHeight, sizeof(currentBlockHeight));
-            ackOffset += sizeof(currentBlockHeight);
+            uint64_t currentHeight = Node_GetCurrentBlockHeight();
+            memcpy(ackData + ackOffset, &currentHeight, sizeof(currentHeight));
+            ackOffset += sizeof(currentHeight);
 
             Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ACK_HELLO, ackData, ackOffset);
 
@@ -241,9 +252,86 @@ void Node_Server_OnData(tcp_connection_t* client) {
             TcpConnection_RequestClose(client);
             return;
         }
-        case PACKET_TYPE_FETCH_BLOCK:
-        case PACKET_TYPE_BLOCK_DATA:
-        case PACKET_TYPE_BROADCAST_BLOCK:
+        case PACKET_TYPE_FETCH_BLOCK: {
+            // Decode FETCH_BLOCK - payload is the block height as uint64_t
+            if (payloadLen != sizeof(uint64_t)) {
+                return;
+            }
+
+            uint64_t requestedHeight;
+            memcpy(&requestedHeight, payload, sizeof(requestedHeight));
+
+            printf("Received FETCH_BLOCK for height %" PRIu64 " from node %u\n", requestedHeight, client ? client->connectionId : 0U);
+            if (requestedHeight > Node_GetCurrentBlockHeight()) {
+                printf("Requested block height %" PRIu64 " is higher than current height, ignoring\n", requestedHeight);
+
+                // Error the client, but don't kill
+                const char* msg = "Requested block height is higher than my current height!";
+                Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+
+                return;
+            }
+
+            // Find the block
+            block_t* block = Chain_GetBlock(currentChain, (size_t)requestedHeight);
+            if (!block) {
+                printf("Requested block height %" PRIu64 " not found, ignoring\n", requestedHeight);
+                const char* msg = "Requested block not found!";
+                Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+                return;
+            }
+
+            if (block->transactions == NULL) {
+                // Just reload from disk pure
+                Chain_LoadBlockFromFile(chainDataDir, requestedHeight - 1, true, &block, NULL); // blockNumber = height - 1 because of 0-indexing
+            }
+
+            // Serialize into a BLOCK_DATA packet [block header][tx count - 8 bytes][transactions...]
+            size_t blockDataSize = sizeof(block_header_t) + sizeof(uint64_t) + (block->transactions ? block->transactions->size * sizeof(signed_transaction_t) : 0);
+            unsigned char* blockData = (unsigned char*)malloc(blockDataSize);
+            if (!blockData) {
+                // Generic error response
+                printf("Failed to allocate memory for block data response to node %u\n", client ? client->connectionId : 0U);
+                const char* msg = "Generic error for block data!";
+                Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+                return;
+            }
+
+            size_t offset = 0;
+            memcpy(blockData + offset, &block->header, sizeof(block_header_t));
+            offset += sizeof(block_header_t);
+            uint64_t txCount = block->transactions ? (uint64_t)block->transactions->size : 0;
+            memcpy(blockData + offset, &txCount, sizeof(txCount));
+            offset += sizeof(txCount);
+            if (block->transactions && block->transactions->size > 0) {
+                memcpy(blockData + offset, block->transactions->data, block->transactions->size * sizeof(signed_transaction_t));
+                offset += block->transactions->size * sizeof(signed_transaction_t);
+            }
+
+            // Send the block data
+            Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_BLOCK_DATA, blockData, offset);
+            free(blockData);
+        }
+        case PACKET_TYPE_BLOCK_DATA: {
+            // Server can't receive these!
+            printf("Received unexpected packet type %u from node %u\n", (unsigned int)packetType, client ? client->connectionId : 0U);
+
+            // Send the error and kill the connection
+            const char* msg = "You can't send me BLOCK_DATA! I'm a server!";
+            Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+            TcpConnection_RequestClose(client);
+            return;
+        }
+        case PACKET_TYPE_BROADCAST_BLOCK: {
+            // Server cannot receive these either.
+            printf("Received unexpected BROADCAST_BLOCK packet from node %u\n", client ? client->connectionId : 0U);
+
+            // Send the error and kill the connection
+            const char* msg = "You can't send me BROADCAST_BLOCK! I'm a server!";
+            Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+            TcpConnection_RequestClose(client);
+            return;
+        }
         case PACKET_TYPE_ACK_BLOCK:
         case PACKET_TYPE_BROADCAST_TX:
         case PACKET_TYPE_ACK_TX:
@@ -287,7 +375,7 @@ void Node_Client_OnConnect(tcp_connection_t* client) {
         
         size_t offset = 0;
         uint32_t protoVersion = 1; // little-endian
-        uint64_t blockHeight = currentBlockHeight;
+        uint64_t blockHeight = Node_GetCurrentBlockHeight();
         memcpy((unsigned char*)data + offset, &protoVersion, sizeof(protoVersion)); // This is technically "unsafe", but I honestly just don't give a shit at this point
         offset += sizeof(protoVersion);
         memcpy((unsigned char*)data + offset, &blockHeight, sizeof(blockHeight));
@@ -331,9 +419,73 @@ void Node_Client_OnData(tcp_connection_t* client) {
             printf("Received ACK_HELLO from node %u with protoVersion %u and blockHeight %lu\n", client ? client->connectionId : 0U, protoVersion, (unsigned long)blockHeight);
             break;
         }
-        case PACKET_TYPE_FETCH_BLOCK:
-        case PACKET_TYPE_BLOCK_DATA:
-        case PACKET_TYPE_BROADCAST_BLOCK:
+        case PACKET_TYPE_FETCH_BLOCK: {
+            // A client can't serve a block!
+            printf("Received unexpected FETCH_BLOCK packet from node %u\n", client ? client->connectionId : 0U);
+
+            // Send the error and kill the connection (this might be too aggressive)
+            const char* msg = "You can't FETCH_BLOCK from me! I'm a client!";
+            Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+            TcpConnection_RequestClose(client);
+            return;
+        }
+        case PACKET_TYPE_BLOCK_DATA: {
+            // TODO
+            break;
+        }
+        case PACKET_TYPE_BROADCAST_BLOCK: {
+            // TODO: Handle based on the current block height of the node; if for n + 1, ignore it for now, since we're probably syncing.
+            // If higher than n + 1, request missing blocks.
+            // We just assume n + 1 for now.
+
+            // Decode - [1 byte packet type][8 byte block height][block header][8 byte transation count][remaining bytes block data]; TODO: This is just for v1 transactions right now.
+            if (payloadLen < 1 + sizeof(uint64_t) + sizeof(uint64_t)) {
+                return;
+            }
+
+            char* ptr = (char*)payload;
+            ptr += 1; // skip packet type, we already know it
+
+            uint64_t blockHeight;
+            memcpy(&blockHeight, ptr, sizeof(blockHeight));
+            ptr += sizeof(blockHeight);
+
+            block_t blockHeader;
+            memcpy(&blockHeader, ptr, sizeof(blockHeader));
+            ptr += sizeof(blockHeader);
+
+            uint64_t txCount;
+            memcpy(&txCount, ptr, sizeof(txCount));
+            ptr += sizeof(txCount);
+
+            DynArr* transactions = DYNARR_CREATE(sizeof(signed_transaction_t), 0);
+            for (uint64_t i = 0; i < txCount; ++i) {
+                if (ptr + sizeof(signed_transaction_t) > (char*)payload + payloadLen) {
+                    // Malformed packet - TODO: Error the sender
+                    DynArr_destroy(transactions);
+                    return;
+                }
+                signed_transaction_t tx;
+                memcpy(&tx, ptr, sizeof(tx));
+                ptr += sizeof(tx);
+                DynArr_push_back(transactions, &tx);
+            }
+
+            blockHeader.transactions = transactions;
+
+            // Verify
+            if (!Block_IsFullyValid(&blockHeader)) {
+                // Invalid block
+                DynArr_destroy(transactions);
+                return;
+            }
+
+            // Push to chain - TODO: Handle orphans, reorgs, etc.
+            if (currentChain) {
+                Chain_AddBlock(currentChain, &blockHeader);
+                Chain_SaveToFile(currentChain, chainDataDir, currentSupply, currentReward); // Note: this destroy the transactions inside the block automatically, so we don't have to worry about that here.
+            }
+        }
         case PACKET_TYPE_ACK_BLOCK:
         case PACKET_TYPE_BROADCAST_TX:
         case PACKET_TYPE_ACK_TX:

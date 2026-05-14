@@ -13,6 +13,7 @@
 
 
 #include <constants.h>
+#include <runtime_state.h>
 #include <autolykos2/autolykos2.h>
 
 #include <nets/net_node.h>
@@ -20,6 +21,11 @@
 #ifndef CHAIN_DATA_DIR
 #define CHAIN_DATA_DIR "chain_data"
 #endif
+
+blockchain_t* currentChain = NULL;
+const char* chainDataDir = CHAIN_DATA_DIR;
+uint256_t currentSupply = {{0, 0, 0, 0}};
+uint64_t currentReward = 750000000000ULL;
 
 void handle_sigint(int sig) {
     printf("Caught signal %d, exiting...\n", sig);
@@ -29,9 +35,6 @@ void handle_sigint(int sig) {
 }
 
 uint32_t difficultyTarget = INITIAL_DIFFICULTY;
-
-// extern the currentReward from constants.h so we can update it as we mine blocks and save it to disk
-extern uint64_t currentReward;
 
 static bool MineBlock(block_t* block) {
     if (!block) {
@@ -471,20 +474,20 @@ int main(int argc, char* argv[]) {
     srand((unsigned int)time(NULL));
 
     BalanceSheet_Init();
-    const char* chainDataDir = CHAIN_DATA_DIR;
-
-    uint256_t currentSupply = uint256_from_u64(0);
-
-    net_node_t* node = Node_Create();
-    if (!node) {
-        BalanceSheet_Destroy();
-        return 1;
-    }
 
     blockchain_t* chain = Chain_Create();
     if (!chain) {
         fprintf(stderr, "failed to create chain\n");
-        Node_Destroy(node);
+        BalanceSheet_Destroy();
+        return 1;
+    }
+
+    currentChain = chain;
+
+    net_node_t* node = Node_Create();
+    if (!node) {
+        currentChain = NULL;
+        Chain_Destroy(chain);
         BalanceSheet_Destroy();
         return 1;
     }
@@ -536,8 +539,9 @@ int main(int argc, char* argv[]) {
     uint8_t minerCompressedPubkey[33];
     if (!GenerateTestMinerIdentity(minerPrivateKey, minerCompressedPubkey, minerAddress)) {
         fprintf(stderr, "failed to generate test miner keypair\n");
-        Chain_Destroy(chain);
         Node_Destroy(node);
+        currentChain = NULL;
+        Chain_Destroy(chain);
         Block_ShutdownPowContext();
         BalanceSheet_Destroy();
         return 1;
@@ -867,9 +871,10 @@ int main(int argc, char* argv[]) {
 
     (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
 
-    Chain_Destroy(chain);
     Block_ShutdownPowContext();
     Node_Destroy(node);
+    currentChain = NULL;
+    Chain_Destroy(chain);
     BalanceSheet_Destroy();
 
     return 0;

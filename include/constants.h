@@ -7,7 +7,7 @@
 #include <block/chain.h>
 #include <block/block.h>
 
-extern uint64_t currentBlockHeight;
+#include <runtime_state.h>
 
 // Nets
 #define MAX_CONS 32 // Some baseline for now
@@ -56,10 +56,7 @@ extern uint64_t currentBlockHeight;
 
 static const uint64_t M_CAP = 18446744073709551615ULL; // Max uint64
 static const uint64_t TAIL_EMISSION = 750000000000ULL; // 0.75 coins per block floor
-static uint64_t currentReward = 750000000000ULL; // Epoch reward cache for phase 3
 // No max supply. Instead of halving, it'll follow a more gradual, Monero-like emission curve.
-
-static uint256_t currentSupply = {{0, 0, 0, 0}}; // Global variable to track total supply; updated with each block mined
 
 // Phase 3: update once per effective epoch and keep a fixed per-block reward for that epoch.
 static inline uint64_t GetInflationRateReward(uint256_t currentSupply, blockchain_t* chain) {

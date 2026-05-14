@@ -1,5 +1,6 @@
 #include <block/chain.h>
 #include <constants.h>
+#include <runtime_state.h>
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>

@@ -231,6 +231,17 @@ bool Block_AllTransactionsValid(const block_t* block) {
     return true && hasCoinbase && DynArr_size(block->transactions) > 0; // Every block must have at least one transaction (the coinbase)
 }
 
+bool Block_IsFullyValid(const block_t* block) {
+    bool merkleValid = false;
+    uint8_t calculatedMerkleRoot[32];
+    if (block && block->transactions) {
+        Block_CalculateMerkleRoot(block, calculatedMerkleRoot);
+        merkleValid = (memcmp(calculatedMerkleRoot, block->header.merkleRoot, 32) == 0);
+    }
+
+    return Block_HasValidProofOfWork(block) && Block_AllTransactionsValid(block) && DynArr_size(block->transactions) > 0 && merkleValid;
+}
+
 void Block_Destroy(block_t* block) {
     if (!block) return;
     DynArr_destroy(block->transactions);

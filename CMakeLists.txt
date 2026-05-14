@@ -160,21 +160,20 @@ if(SKALACOIN_ENABLE_AUTOLYKOS2_REF)
         )
     endif()
     if(TARGET CURL::libcurl)
-        set(_AUTOLYKOS2_CURL_LIB CURL::libcurl)
+        target_link_libraries(autolykos2_ref PRIVATE
+            ${CMAKE_THREAD_LIBS_INIT}
+            OpenSSL::SSL
+            OpenSSL::Crypto
+            CURL::libcurl
+        )
     elseif(DEFINED CURL_LIBRARIES AND CURL_LIBRARIES)
-        set(_AUTOLYKOS2_CURL_LIB ${CURL_LIBRARIES})
+        target_link_libraries(autolykos2_ref PRIVATE
+            ${CMAKE_THREAD_LIBS_INIT}
+            OpenSSL::SSL
+            OpenSSL::Crypto
+            ${CURL_LIBRARIES}
+        )
     else()
-        set(_AUTOLYKOS2_CURL_LIB "")
-    endif()
-
-    target_link_libraries(autolykos2_ref PRIVATE
-        ${CMAKE_THREAD_LIBS_INIT}
-        OpenSSL::SSL
-        OpenSSL::Crypto
-        $<$<BOOL:$_AUTOLYKOS2_CURL_LIB>:$_AUTOLYKOS2_CURL_LIB>
-    )
-
-    if(NOT _AUTOLYKOS2_CURL_LIB)
         message(FATAL_ERROR "autolykos2_ref requires libcurl (curl/curl.h). Install libcurl devel package or allow FetchContent to build it.")
     endif()
     set(SKALACOIN_AUTOLYKOS2_REF_AVAILABLE ON)
