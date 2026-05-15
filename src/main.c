@@ -1004,6 +1004,8 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        }
+
         if (strcmp(cmd, "blockdetail") == 0) {
             char* blockNumberStr = strtok(NULL, " \t");
             char* extra = strtok(NULL, " \t");
@@ -1180,8 +1182,6 @@ int main(int argc, char* argv[]) {
         }
 
         printf("Unknown command. Available: mine, send, balance, connect, flushchain, fullverify, blockdetail, wipechain, genaddr, exit\n");
-    }
-
     }
 
     (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
