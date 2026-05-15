@@ -75,6 +75,7 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
     if (!blk) { return false; }
 
     memcpy(&blk->header, payload + offset, sizeof(blk->header));
+    blk->header.blockNumber = blockHeight;
     offset += sizeof(blk->header);
 
     uint64_t txCount = 0;
@@ -102,12 +103,14 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
 
     // Validate block
     if (!Block_IsFullyValid(blk)) {
+        printf("Rejected BLOCK_DATA at height %" PRIu64 " during validation\n", blockHeight);
         DynArr_destroy(blk->transactions);
         free(blk);
         return false;
     }
 
     if (!currentChain) {
+        printf("Rejected BLOCK_DATA at height %" PRIu64 ": no active chain\n", blockHeight);
         DynArr_destroy(blk->transactions);
         free(blk);
         return false;
@@ -121,13 +124,15 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
             // Insert into orphan pool and take ownership of blk
             OrphanPool_Insert(blk, blockHeight);
             if (parentCopy) Block_Destroy(parentCopy);
-            return false;
+            printf("Queued orphan BLOCK_DATA at height %" PRIu64 "\n", blockHeight);
+            return true;
         }
         Block_Destroy(parentCopy);
     }
 
     if (!Chain_AddBlock(currentChain, blk)) {
         // Chain_AddBlock failed; cleanup
+        printf("Rejected BLOCK_DATA at height %" PRIu64 " during chain add\n", blockHeight);
         if (blk->transactions) {
             DynArr_destroy(blk->transactions);
         }
