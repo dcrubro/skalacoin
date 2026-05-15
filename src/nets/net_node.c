@@ -123,17 +123,40 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
     }
 
     // If parent is missing, insert into orphan pool instead of rejecting immediately.
-    if (blk->header.blockNumber > 0) {
-        uint64_t parentIndex = blk->header.blockNumber - 1;
-        block_t* parentCopy = NULL;
-        if (parentIndex >= Chain_Size(currentChain) || !Chain_GetBlockCopy(currentChain, (size_t)parentIndex, &parentCopy) || !parentCopy) {
-            // Insert into orphan pool and take ownership of blk
-            OrphanPool_Insert(blk, blockHeight);
-            if (parentCopy) Block_Destroy(parentCopy);
-            printf("Queued orphan BLOCK_DATA at height %" PRIu64 "\n", blockHeight);
-            return NODE_BLOCK_ORPHAN_QUEUED;
+    uint64_t chainSize = Chain_Size(currentChain);
+    if (blk->header.blockNumber > chainSize) {
+        // Parent(s) missing; queue as orphan
+        OrphanPool_Insert(blk, blockHeight);
+        printf("Queued orphan BLOCK_DATA at height %" PRIu64 "\n", blockHeight);
+        return NODE_BLOCK_ORPHAN_QUEUED;
+    } else if (blk->header.blockNumber < chainSize) {
+        // Older block than current chain tip: reject
+        printf("Rejected BLOCK_DATA at height %" PRIu64 ": older than current chain\n", blockHeight);
+        DynArr_destroy(blk->transactions);
+        free(blk);
+        return NODE_BLOCK_REJECTED;
+    } else {
+        // blk->header.blockNumber == chainSize -> candidate to append. Ensure prevHash matches current tip.
+        if (chainSize > 0) {
+            block_t* last = NULL;
+            if (!Chain_GetBlockCopy(currentChain, (size_t)(chainSize - 1), &last) || !last) {
+                // Can't verify parent; queue as orphan conservatively
+                OrphanPool_Insert(blk, blockHeight);
+                printf("Queued orphan BLOCK_DATA at height %" PRIu64 " (unable to verify parent)\n", blockHeight);
+                if (last) Block_Destroy(last);
+                return NODE_BLOCK_ORPHAN_QUEUED;
+            }
+            uint8_t lastHash[32];
+            Block_CalculateHash(last, lastHash);
+            if (memcmp(lastHash, blk->header.prevHash, 32) != 0) {
+                // Conflicting block at same height; queue as orphan until resolved by a subsequent extension.
+                OrphanPool_Insert(blk, blockHeight);
+                Block_Destroy(last);
+                printf("Queued conflicting BLOCK_DATA at same height %" PRIu64 " as orphan\n", blockHeight);
+                return NODE_BLOCK_ORPHAN_QUEUED;
+            }
+            Block_Destroy(last);
         }
-        Block_Destroy(parentCopy);
     }
 
     if (!Chain_AddBlock(currentChain, blk)) {

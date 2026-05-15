@@ -151,6 +151,15 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
     pthread_rwlock_wrlock(&chainLock);
     pthread_mutex_lock(&balanceSheetLock);
 
+    // Ensure the incoming block's header.blockNumber matches the index it will be appended at.
+    size_t expectedIndex = DynArr_size(chain->blocks);
+    if (block->header.blockNumber != expectedIndex) {
+        // Mismatched block number; reject to avoid duplicate indices or inconsistent headers.
+        pthread_mutex_unlock(&balanceSheetLock);
+        pthread_rwlock_unlock(&chainLock);
+        return false;
+    }
+
     do {
         // First pass: ensure all non-coinbase senders can cover the full spend
         // (amount1 + amount2 + fee) before mutating the chain or balance sheet.
@@ -521,9 +530,12 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     uint64_t byteCount = (uint64_t)pos; // Get the size
 
     // Save blocks that are not yet saved
+    // Acquire write lock to protect block transaction pointers from concurrent freeing.
+    pthread_rwlock_wrlock(&chainLock);
     for (size_t i = savedSize; i < DynArr_size(chain->blocks); i++) {
         block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
         if (!blk) {
+            pthread_rwlock_unlock(&chainLock);
             fclose(metaFile);
             fclose(chainFile);
             fclose(tableFile);
@@ -542,6 +554,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         for (size_t j = 0; j < txSize; j++) {
             signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, j);
             if (fwrite(tx, sizeof(signed_transaction_t), 1, chainFile) != 1) {
+                pthread_rwlock_unlock(&chainLock);
                 fclose(chainFile);
                 fclose(metaFile);
                 fclose(tableFile);
@@ -561,6 +574,8 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         DynArr_destroy(blk->transactions);
         blk->transactions = NULL; // Clear transactions to save memory since they're now saved on disk
     }
+
+    pthread_rwlock_unlock(&chainLock);
 
     // Update metadata with new size and last block hash
     size_t newSize = DynArr_size(chain->blocks);

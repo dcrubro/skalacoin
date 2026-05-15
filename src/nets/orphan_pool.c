@@ -67,6 +67,27 @@ size_t OrphanPool_AttemptAttach(blockchain_t* chain) {
             }
 
             if (parentExists) {
+                // Verify that the parent's hash matches the orphan's prevHash before attaching.
+                bool parentMatches = false;
+                if (e->height == 0) {
+                    parentMatches = (Chain_Size(chain) == 0);
+                } else {
+                    block_t* parent = NULL;
+                    if (Chain_GetBlockCopy(chain, (size_t)parentIndex, &parent) && parent) {
+                        uint8_t parentHash[32];
+                        Block_CalculateHash(parent, parentHash);
+                        parentMatches = (memcmp(parentHash, e->block->header.prevHash, 32) == 0);
+                        Block_Destroy(parent);
+                    } else {
+                        parentMatches = false;
+                    }
+                }
+
+                if (!parentMatches) {
+                    // Parent exists but does not match this orphan's prevHash; skip attaching now.
+                    continue;
+                }
+
                 // Try to add to chain
                 if (Chain_AddBlock(chain, e->block)) {
                     attached++;
