@@ -760,7 +760,10 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            uint64_t localHeight = (uint64_t)Chain_Size(chain);
+            // Continue syncing in a loop until we've caught up to the peer or no progress is made.
+            bool madeProgressOverall = false;
+            while (true) {
+                uint64_t localHeight = (uint64_t)Chain_Size(chain);
 
             // Only penalize small near-tip gaps. Large gaps are treated as normal catch-up,
             // because a much taller peer on the same chain is not evidence of a reorg. TODO: Maybe look at this again some other day.
@@ -786,9 +789,9 @@ int main(int argc, char* argv[]) {
             printf("syncing: peerHeight=%" PRIu64 " adjusted=%" PRIu64 " local=%" PRIu64 " penalty=%" PRIu64 "\n",
                 peerHeight, adjustedPeerHeight, localHeight, penalty);
 
-            // Windowed parallel fetch
-            uint64_t start = localHeight;
-            uint64_t end = adjustedPeerHeight; // exclusive target height
+                // Windowed parallel fetch
+                uint64_t start = localHeight;
+                uint64_t end = adjustedPeerHeight; // exclusive target height
             uint64_t nextReq = start;
 
             const int maxInFlight = MAX_PARALLEL_FETCHES;
@@ -825,8 +828,33 @@ int main(int argc, char* argv[]) {
                         break;
                     }
 
-                    requestedHeights[inFlight] = req;
-                    retryCount[inFlight] = 0;
+
+                uint64_t newLocal = (uint64_t)Chain_Size(chain);
+                if (newLocal > localHeight) madeProgressOverall = true;
+
+                printf("sync complete: localHeight=%" PRIu64 "\n", newLocal);
+
+                // If we've caught up to the peer, stop. Otherwise refresh peerHeight and loop again.
+                if (newLocal >= peerHeight) break;
+
+                // Refresh advertised peer height for this connection (it may have been updated during fetch)
+                pthread_mutex_lock(&node->outboundLock);
+                for (size_t i = 0; i < MAX_CONS; ++i) {
+                    if (node->outboundClients[i].connection == peerConn) {
+                        peerHeight = node->outboundClients[i].peerBlockHeight;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&node->outboundLock);
+
+                // If no progress was made in this iteration, stop to avoid tight loop
+                if (!madeProgressOverall) {
+                    break;
+                }
+
+                // Re-evaluate loop condition: continue while local < peerHeight
+                if ((uint64_t)Chain_Size(chain) >= peerHeight) break;
+            }
                     sentAtMs[inFlight] = get_current_time_ms();
                     inFlight++;
                     nextReq++;
