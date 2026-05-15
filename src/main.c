@@ -771,9 +771,16 @@ int main(int argc, char* argv[]) {
             uint64_t penalty = isInitialSync ? 0ULL : FetchScheduler_ComputeReorgPenaltyBlocks(delay);
             uint64_t adjustedPeerHeight = (peerHeight > penalty) ? (peerHeight - penalty) : 0ULL;
 
+            // Ensure we always make forward progress: if the penalty would reduce the
+            // target below our current height, fetch at least the next block. This
+            // lets us apply penalties for near-tip reorg risk while still allowing
+            // normal syncing when the peer is ahead by a small amount.
             if (adjustedPeerHeight <= localHeight) {
-                printf("already synced (local=%" PRIu64 ", peer=%" PRIu64 ", penalty=%" PRIu64 ")\n", localHeight, peerHeight, penalty);
-                continue;
+                adjustedPeerHeight = localHeight + 1;
+            }
+
+            if (adjustedPeerHeight > peerHeight) {
+                adjustedPeerHeight = peerHeight;
             }
 
             printf("syncing: peerHeight=%" PRIu64 " adjusted=%" PRIu64 " local=%" PRIu64 " penalty=%" PRIu64 "\n",

@@ -12,6 +12,8 @@ Maybe think about how block broadcasting works. Instead of unsolicited broadcast
 
 Check if Block FullVerify is actually verifying fully (not missing any conditions).
 
+A loophole in the reorg penalty system could potentially exist where someone broadcasts blocks one-at-a-time. Determine a solution to this.
+
 TO TEST:
 Implement Horizen's "Reorg Penalty" system to make it harder for the young chain to be attacked by a powerful miner.
 
