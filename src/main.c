@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <balance_sheet.h>
 #include <unistd.h>
+#include <errno.h>
 
 
 #include <constants.h>
@@ -1059,7 +1060,11 @@ int main(int argc, char* argv[]) {
             }
 
             if (Node_ConnectPeer(node, ipStr, LISTEN_PORT) != 0) {
-                printf("failed to connect to %s:%u\n", ipStr, (unsigned int)LISTEN_PORT);
+                if (errno == ETIMEDOUT) {
+                    printf("failed to connect to %s:%u (timeout)\n", ipStr, (unsigned int)LISTEN_PORT);
+                } else {
+                    printf("failed to connect to %s:%u\n", ipStr, (unsigned int)LISTEN_PORT);
+                }
                 continue;
             }
 

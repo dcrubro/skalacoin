@@ -9,6 +9,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/select.h>
 
 static void* TcpClient_ThreadProc(void* arg) {
     tcp_client_t* client = (tcp_client_t*)arg;
@@ -95,10 +97,51 @@ int TcpClient_Connect(
         return -1;
     }
 
-    if (connect(sockFd, (struct sockaddr*)&peerAddr, sizeof(peerAddr)) < 0) {
-        close(sockFd);
-        return -1;
+    // Use non-blocking connect with a timeout to avoid long blocking in the CLI.
+    int flags = fcntl(sockFd, F_GETFL, 0);
+    if (flags == -1) flags = 0;
+    fcntl(sockFd, F_SETFL, flags | O_NONBLOCK);
+
+    int rc = connect(sockFd, (struct sockaddr*)&peerAddr, sizeof(peerAddr));
+    if (rc < 0) {
+        if (errno != EINPROGRESS) {
+            close(sockFd);
+            return -1;
+        }
+
+        // Wait up to 5 seconds for the socket to become writable (connected)
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sockFd, &wfds);
+        int sel = select(sockFd + 1, NULL, &wfds, NULL, &tv);
+        if (sel <= 0) {
+            // timeout or error
+            if (sel == 0) {
+                errno = ETIMEDOUT;
+            }
+            close(sockFd);
+            return -1;
+        }
+
+        // Check for socket error
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        if (getsockopt(sockFd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0) {
+            close(sockFd);
+            return -1;
+        }
+        if (so_error != 0) {
+            errno = so_error;
+            close(sockFd);
+            return -1;
+        }
     }
+
+    // Restore blocking mode
+    fcntl(sockFd, F_SETFL, flags & ~O_NONBLOCK);
 
     tcp_connection_t* conn = (tcp_connection_t*)malloc(sizeof(*conn));
     if (!conn) {
