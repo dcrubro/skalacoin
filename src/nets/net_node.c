@@ -453,6 +453,7 @@ void Node_Server_OnData(tcp_connection_t* client) {
             Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_BLOCK_DATA, blockData, offset);
             free(blockData);
             Block_Destroy(block);
+            break;
         }
         case PACKET_TYPE_BLOCK_DATA: {
             // Server can't receive these!
