@@ -28,6 +28,12 @@ static uint64_t Node_GetCurrentBlockHeight(void) {
     return currentBlockHeight;
 }
 
+typedef enum {
+    NODE_BLOCK_REJECTED = 0,
+    NODE_BLOCK_ORPHAN_QUEUED = 1,
+    NODE_BLOCK_ACCEPTED = 2
+} node_block_accept_result_t;
+
 static void* Node_MaintenanceThread(void* arg) {
     net_node_t* n = (net_node_t*)arg;
     if (!n) return NULL;
@@ -61,18 +67,18 @@ static int Node_DecodePacket(const tcp_connection_t* conn, packet_type_t* outTyp
     return 0;
 }
 
-static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloadLen, bool persist) {
-    if (!payload) { return false; }
+static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloadLen, bool persist) {
+    if (!payload) { return NODE_BLOCK_REJECTED; }
 
     size_t offset = 0;
-    if (payloadLen < sizeof(uint64_t) + sizeof(block_header_t) + sizeof(uint64_t)) { return false; }
+    if (payloadLen < sizeof(uint64_t) + sizeof(block_header_t) + sizeof(uint64_t)) { return NODE_BLOCK_REJECTED; }
 
     uint64_t blockHeight = 0;
     memcpy(&blockHeight, payload + offset, sizeof(blockHeight));
     offset += sizeof(blockHeight);
 
     block_t* blk = (block_t*)calloc(1, sizeof(block_t));
-    if (!blk) { return false; }
+    if (!blk) { return NODE_BLOCK_REJECTED; }
 
     memcpy(&blk->header, payload + offset, sizeof(blk->header));
     blk->header.blockNumber = blockHeight;
@@ -83,13 +89,13 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
     offset += sizeof(txCount);
 
     blk->transactions = DYNARR_CREATE(signed_transaction_t, txCount == 0 ? 1 : (size_t)txCount);
-    if (!blk->transactions) { free(blk); return false; }
+    if (!blk->transactions) { free(blk); return NODE_BLOCK_REJECTED; }
 
     for (uint64_t i = 0; i < txCount; ++i) {
         if (offset + sizeof(signed_transaction_t) > payloadLen) {
             DynArr_destroy(blk->transactions);
             free(blk);
-            return false;
+            return NODE_BLOCK_REJECTED;
         }
         signed_transaction_t tx;
         memcpy(&tx, payload + offset, sizeof(tx));
@@ -97,7 +103,7 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
         if (!DynArr_push_back(blk->transactions, &tx)) {
             DynArr_destroy(blk->transactions);
             free(blk);
-            return false;
+            return NODE_BLOCK_REJECTED;
         }
     }
 
@@ -106,14 +112,14 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
         printf("Rejected BLOCK_DATA at height %" PRIu64 " during validation\n", blockHeight);
         DynArr_destroy(blk->transactions);
         free(blk);
-        return false;
+        return NODE_BLOCK_REJECTED;
     }
 
     if (!currentChain) {
         printf("Rejected BLOCK_DATA at height %" PRIu64 ": no active chain\n", blockHeight);
         DynArr_destroy(blk->transactions);
         free(blk);
-        return false;
+        return NODE_BLOCK_REJECTED;
     }
 
     // If parent is missing, insert into orphan pool instead of rejecting immediately.
@@ -125,7 +131,7 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
             OrphanPool_Insert(blk, blockHeight);
             if (parentCopy) Block_Destroy(parentCopy);
             printf("Queued orphan BLOCK_DATA at height %" PRIu64 "\n", blockHeight);
-            return true;
+            return NODE_BLOCK_ORPHAN_QUEUED;
         }
         Block_Destroy(parentCopy);
     }
@@ -137,7 +143,7 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
             DynArr_destroy(blk->transactions);
         }
         free(blk);
-        return false;
+        return NODE_BLOCK_REJECTED;
     }
 
     // Persist on accept if requested
@@ -156,7 +162,7 @@ static bool Node_ParseAndAcceptBlock(const unsigned char* payload, size_t payloa
         Chain_SaveToFile(currentChain, chainDataDir, currentSupply, currentReward);
         BalanceSheet_SaveToFile(chainDataDir);
     }
-    return true;
+    return NODE_BLOCK_ACCEPTED;
 }
 
 static void Node_ForwardConnect(net_node_t* node, tcp_connection_t* conn) {
@@ -359,7 +365,6 @@ void Node_Server_OnConnect(tcp_connection_t* client) {
         // We avoid connecting if we already have an outbound to the same IP.
         char ipbuf[INET_ADDRSTRLEN];
         if (inet_ntop(AF_INET, &client->peerAddr.sin_addr, ipbuf, sizeof(ipbuf))) {
-            unsigned short peerPort = (unsigned short)ntohs(client->peerAddr.sin_port);
             // Use LISTEN_PORT as target port for peer's listening service, not the ephemeral source port.
             unsigned short targetPort = LISTEN_PORT;
 
@@ -544,12 +549,15 @@ void Node_Server_OnData(tcp_connection_t* client) {
             if (payloadLen >= sizeof(uint64_t)) {
                 uint64_t blockHeight = 0;
                 memcpy(&blockHeight, payload, sizeof(blockHeight));
-                if (Node_ParseAndAcceptBlock(payload, payloadLen, true)) {
+                node_block_accept_result_t result = Node_ParseAndAcceptBlock(payload, payloadLen, true);
+                if (result == NODE_BLOCK_ACCEPTED) {
                     printf("Accepted BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
                     net_node_t* node = Node_FromConnection(client);
                     if (node) {
                         Node_BroadcastChainRange(node, (size_t)blockHeight, client);
                     }
+                } else if (result == NODE_BLOCK_ORPHAN_QUEUED) {
+                    printf("Queued orphan BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
                 } else {
                     printf("Rejected BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
                 }
@@ -670,7 +678,8 @@ void Node_Client_OnData(tcp_connection_t* client) {
             if (payloadLen >= sizeof(uint64_t)) {
                 uint64_t blockHeight = 0;
                 memcpy(&blockHeight, payload, sizeof(blockHeight));
-                if (Node_ParseAndAcceptBlock(payload, payloadLen, true)) {
+                node_block_accept_result_t result = Node_ParseAndAcceptBlock(payload, payloadLen, true);
+                if (result == NODE_BLOCK_ACCEPTED) {
                     printf("Accepted BLOCK_DATA from node %u\n", client ? client->connectionId : 0U);
                     net_node_t* node = Node_FromConnection(client);
                     if (node) {
@@ -688,6 +697,8 @@ void Node_Client_OnData(tcp_connection_t* client) {
 
                         Node_BroadcastChainRange(node, (size_t)blockHeight, client);
                     }
+                } else if (result == NODE_BLOCK_ORPHAN_QUEUED) {
+                    printf("Queued orphan BLOCK_DATA from node %u\n", client ? client->connectionId : 0U);
                 } else {
                     printf("Rejected BLOCK_DATA from node %u\n", client ? client->connectionId : 0U);
                 }
@@ -698,7 +709,8 @@ void Node_Client_OnData(tcp_connection_t* client) {
             if (payloadLen >= sizeof(uint64_t)) {
                 uint64_t blockHeight = 0;
                 memcpy(&blockHeight, payload, sizeof(blockHeight));
-                if (Node_ParseAndAcceptBlock(payload, payloadLen, true)) {
+                node_block_accept_result_t result = Node_ParseAndAcceptBlock(payload, payloadLen, true);
+                if (result == NODE_BLOCK_ACCEPTED) {
                     printf("Accepted BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
                     net_node_t* node = Node_FromConnection(client);
                     if (node) {
@@ -716,6 +728,8 @@ void Node_Client_OnData(tcp_connection_t* client) {
 
                         Node_BroadcastChainRange(node, (size_t)blockHeight, client);
                     }
+                } else if (result == NODE_BLOCK_ORPHAN_QUEUED) {
+                    printf("Queued orphan BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
                 } else {
                     printf("Rejected BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
                 }
@@ -798,20 +812,22 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
     size_t chainSize = Chain_Size(currentChain);
     if (startHeightInclusive >= chainSize) return;
 
+    uint32_t sourceIp = 0;
+    if (sourceConn) {
+        sourceIp = sourceConn->peerAddr.sin_addr.s_addr;
+    }
+
     for (size_t h = startHeightInclusive; h < chainSize; ++h) {
         block_t* blk = NULL;
-        bool loadedFromDisk = false;
         if (!Chain_GetBlockCopy(currentChain, h, &blk) || !blk) {
             if (!Chain_LoadBlockFromFile(chainDataDir, h, true, &blk, NULL) || !blk) {
                 continue;
             }
-            loadedFromDisk = true;
         } else if (!blk->transactions) {
             block_t* full = NULL;
             if (Chain_LoadBlockFromFile(chainDataDir, h, true, &full, NULL) && full) {
                 Block_Destroy(blk);
                 blk = full;
-                loadedFromDisk = true;
             }
         }
 
@@ -863,6 +879,7 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
             tcp_connection_t* conn = node->outboundClients[i].connection;
             if (!conn) continue;
             if (conn == sourceConn) continue;
+            if (sourceIp != 0 && conn->peerAddr.sin_addr.s_addr == sourceIp) continue;
             Node_SendPacket(node, conn, PACKET_TYPE_BROADCAST_BLOCK, payload, off);
         }
         pthread_mutex_unlock(&node->outboundLock);

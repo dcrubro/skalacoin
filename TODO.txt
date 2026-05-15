@@ -10,6 +10,8 @@ A potential race could occur if the P2P node receives a new block, or flushes a 
 
 Maybe think about how block broadcasting works. Instead of unsolicited broadcasting, maybe only advertise a new height and have peers request the block if they want it. This would reduce bandwidth usage, but it also means that blocks won't propagate as fast, which could lead to more orphaned blocks. It's a tradeoff.
 
+Check if Block FullVerify is actually verifying fully (not missing any conditions).
+
 TO TEST:
 Implement Horizen's "Reorg Penalty" system to make it harder for the young chain to be attacked by a powerful miner.
 
