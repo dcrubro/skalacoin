@@ -285,3 +285,34 @@ void Block_Print(const block_t* block) {
         printf("No transactions (or none loaded)\n");
     }
 }
+
+block_t* Block_Copy(const block_t* src) {
+    if (!src) return NULL;
+    block_t* dst = (block_t*)malloc(sizeof(block_t));
+    if (!dst) return NULL;
+    dst->header = src->header;
+    if (src->transactions) {
+        size_t txCount = DynArr_size(src->transactions);
+        dst->transactions = DYNARR_CREATE(signed_transaction_t, txCount == 0 ? 1 : txCount);
+        if (!dst->transactions) {
+            free(dst);
+            return NULL;
+        }
+        for (size_t i = 0; i < txCount; ++i) {
+            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(src->transactions, i);
+            if (!tx) {
+                DynArr_destroy(dst->transactions);
+                free(dst);
+                return NULL;
+            }
+            if (!DynArr_push_back(dst->transactions, tx)) {
+                DynArr_destroy(dst->transactions);
+                free(dst);
+                return NULL;
+            }
+        }
+    } else {
+        dst->transactions = NULL;
+    }
+    return dst;
+}

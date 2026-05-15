@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 uint64_t currentBlockHeight = 0;
 
@@ -136,6 +137,8 @@ void Chain_Destroy(blockchain_t* chain) {
 }
 
 bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
+    bool ok = true;
+
     if (!chain || !block || !chain->blocks) {
         return false;
     }
@@ -144,96 +147,124 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
         return false;
     }
 
-    // First pass: ensure all non-coinbase senders can cover the full spend
-    // (amount1 + amount2 + fee) before mutating the chain or balance sheet.
-    size_t txCount = DynArr_size(block->transactions);
-    for (size_t i = 0; i < txCount; ++i) {
-        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
-        if (!tx) {
-            return false;
-        }
+    // Acquire global write locks to protect chain and balance sheet mutations.
+    pthread_rwlock_wrlock(&chainLock);
+    pthread_mutex_lock(&balanceSheetLock);
 
-        if (Address_IsCoinbase(tx->transaction.senderAddress)) {
-            continue;
-        }
-
-        uint256_t spend;
-        if (!BuildSpendAmount(tx, &spend)) {
-            return false;
-        }
-
-        balance_sheet_entry_t senderEntry;
-        if (!BalanceSheet_Lookup(tx->transaction.senderAddress, &senderEntry)) {
-            fprintf(stderr, "Error: Sender address not found in balance sheet during block addition. Bailing!\n");
-            return false;
-        }
-
-        if (uint256_cmp(&senderEntry.balance, &spend) < 0) {
-            fprintf(stderr, "Error: Sender balance insufficient for block transaction. Bailing!\n");
-            return false;
-        }
-    }
-
-    // Push the block only after validation succeeds.
-    block_t* blk = (block_t*)DynArr_push_back(chain->blocks, block);
-    if (!blk) {
-        return false;
-    }
-    chain->size++;
-    currentBlockHeight = (uint64_t)(chain->size - 1);
-
-    // Second pass: apply the ledger changes.
-    if (blk->transactions) {
-        txCount = DynArr_size(blk->transactions);
+    do {
+        // First pass: ensure all non-coinbase senders can cover the full spend
+        // (amount1 + amount2 + fee) before mutating the chain or balance sheet.
+        size_t txCount = DynArr_size(block->transactions);
         for (size_t i = 0; i < txCount; ++i) {
-            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, i);
+            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
             if (!tx) {
+                ok = false; break;
+            }
+
+            if (Address_IsCoinbase(tx->transaction.senderAddress)) {
                 continue;
             }
 
-            if (!Address_IsCoinbase(tx->transaction.senderAddress)) {
-                uint256_t spend;
-                if (!BuildSpendAmount(tx, &spend) || !DebitAddress(tx->transaction.senderAddress, &spend)) {
-                    fprintf(stderr, "Error: Failed to debit sender balance during block addition. Bailing!\n");
-                    return false;
-                }
+            uint256_t spend;
+            if (!BuildSpendAmount(tx, &spend)) { ok = false; break; }
+
+            balance_sheet_entry_t senderEntry;
+            if (!BalanceSheet_Lookup(tx->transaction.senderAddress, &senderEntry)) {
+                fprintf(stderr, "Error: Sender address not found in balance sheet during block addition. Bailing!\n");
+                ok = false; break;
             }
 
-            if (!CreditAddress(tx->transaction.recipientAddress1, tx->transaction.amount1)) {
-                fprintf(stderr, "Error: Failed to credit recipient1 balance during block addition. Bailing!\n");
-                return false;
+            if (uint256_cmp(&senderEntry.balance, &spend) < 0) {
+                fprintf(stderr, "Error: Sender balance insufficient for block transaction. Bailing!\n");
+                ok = false; break;
             }
+        }
+        if (!ok) break;
 
-            if (tx->transaction.amount2 > 0) {
-                uint8_t zeroAddress[32] = {0};
-                if (memcmp(tx->transaction.recipientAddress2, zeroAddress, 32) == 0) {
-                    fprintf(stderr, "Error: amount2 is non-zero but recipient2 is empty during block addition. Bailing!\n");
-                    return false;
+        // Push the block only after validation succeeds.
+        block_t* blk = (block_t*)DynArr_push_back(chain->blocks, block);
+        if (!blk) { ok = false; break; }
+        chain->size++;
+        currentBlockHeight = (uint64_t)(chain->size - 1);
+
+        // Second pass: apply the ledger changes.
+        if (blk->transactions) {
+            txCount = DynArr_size(blk->transactions);
+            for (size_t i = 0; i < txCount; ++i) {
+                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, i);
+                if (!tx) {
+                    continue;
                 }
 
-                if (!CreditAddress(tx->transaction.recipientAddress2, tx->transaction.amount2)) {
-                    fprintf(stderr, "Error: Failed to credit recipient2 balance during block addition. Bailing!\n");
-                    return false;
+                if (!Address_IsCoinbase(tx->transaction.senderAddress)) {
+                    uint256_t spend;
+                    if (!BuildSpendAmount(tx, &spend) || !DebitAddress(tx->transaction.senderAddress, &spend)) {
+                        fprintf(stderr, "Error: Failed to debit sender balance during block addition. Bailing!\n");
+                        ok = false; break;
+                    }
+                }
+
+                    if (!CreditAddress(tx->transaction.recipientAddress1, tx->transaction.amount1)) {
+                    fprintf(stderr, "Error: Failed to credit recipient1 balance during block addition. Bailing!\n");
+                    ok = false; break;
+                }
+
+                if (tx->transaction.amount2 > 0) {
+                    uint8_t zeroAddress[32] = {0};
+                    if (memcmp(tx->transaction.recipientAddress2, zeroAddress, 32) == 0) {
+                        fprintf(stderr, "Error: amount2 is non-zero but recipient2 is empty during block addition. Bailing!\n");
+                        ok = false; break;
+                    }
+
+                    if (!CreditAddress(tx->transaction.recipientAddress2, tx->transaction.amount2)) {
+                        fprintf(stderr, "Error: Failed to credit recipient2 balance during block addition. Bailing!\n");
+                        ok = false; break;
+                    }
                 }
             }
         }
-    }
+        // ok remains true if no failures
+    } while (0);
 
-    return true;
+    // Release locks
+    pthread_mutex_unlock(&balanceSheetLock);
+    pthread_rwlock_unlock(&chainLock);
+
+    return ok;
 }
 
 block_t* Chain_GetBlock(blockchain_t* chain, size_t index) {
-    if (chain) {
-        return DynArr_at(chain->blocks, index);
+    if (!chain) return NULL;
+    block_t* blk = NULL;
+    pthread_rwlock_rdlock(&chainLock);
+    blk = (block_t*)DynArr_at(chain->blocks, index);
+    pthread_rwlock_unlock(&chainLock);
+    return blk;
+}
+
+bool Chain_GetBlockCopy(blockchain_t* chain, size_t index, block_t** outCopy) {
+    if (!chain || !outCopy) return false;
+    *outCopy = NULL;
+    pthread_rwlock_rdlock(&chainLock);
+    block_t* src = (block_t*)DynArr_at(chain->blocks, index);
+    if (!src) {
+        pthread_rwlock_unlock(&chainLock);
+        return false;
     }
-    return NULL;
+    block_t* copy = Block_Copy(src);
+    pthread_rwlock_unlock(&chainLock);
+    if (!copy) return false;
+    *outCopy = copy;
+    return true;
 }
 
 size_t Chain_Size(blockchain_t* chain) {
-    if (chain) {
-        return DynArr_size(chain->blocks);
-    }
-    return 0;
+    if (!chain) return 0;
+    size_t sz = 0;
+    pthread_rwlock_rdlock(&chainLock);
+    sz = DynArr_size(chain->blocks);
+    pthread_rwlock_unlock(&chainLock);
+    return sz;
 }
 
 bool Chain_IsValid(blockchain_t* chain) {
@@ -268,6 +299,131 @@ bool Chain_IsValid(blockchain_t* chain) {
     // Genesis needs special handling because the prevHash is always invalid (no previous block)
     block_t* genesis = (block_t*)DynArr_at(chain->blocks, 0);
     if (!genesis || genesis->header.blockNumber != 0) { return false; }
+
+    return true;
+}
+
+bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
+    if (!chain || !chain->blocks) return false;
+
+    pthread_rwlock_wrlock(&chainLock);
+    pthread_mutex_lock(&balanceSheetLock);
+
+    size_t cur = DynArr_size(chain->blocks);
+    if (height >= cur) {
+        pthread_mutex_unlock(&balanceSheetLock);
+        pthread_rwlock_unlock(&chainLock);
+        return true; // nothing to do
+    }
+
+    // Remove blocks above height
+    for (size_t i = cur; i > height; --i) {
+        size_t idx = i - 1;
+        block_t* blk = (block_t*)DynArr_at(chain->blocks, idx);
+        if (blk && blk->transactions) {
+            DynArr_destroy(blk->transactions);
+            blk->transactions = NULL;
+        }
+        DynArr_remove(chain->blocks, idx);
+    }
+
+    chain->size = DynArr_size(chain->blocks);
+    currentBlockHeight = chain->size ? (uint64_t)(chain->size - 1) : 0ULL;
+
+    // Rebuild balance sheet from scratch up to current chain size
+    BalanceSheet_Destroy();
+    BalanceSheet_Init();
+
+    for (size_t i = 0; i < chain->size; ++i) {
+        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
+        block_t* toProcess = blk;
+        bool loaded = false;
+
+        if (!blk || !blk->transactions) {
+            // Try to load from disk
+            block_t* loadedBlk = NULL;
+            size_t txCount = 0;
+            if (!Chain_LoadBlockFromFile(chainDataDir, (uint64_t)i, true, &loadedBlk, &txCount)) {
+                // Can't rebuild without transactions
+                pthread_mutex_unlock(&balanceSheetLock);
+                pthread_rwlock_unlock(&chainLock);
+                return false;
+            }
+            toProcess = loadedBlk;
+            loaded = true;
+        }
+
+        // Apply transactions
+        if (toProcess && toProcess->transactions) {
+            size_t txCount = DynArr_size(toProcess->transactions);
+            for (size_t ti = 0; ti < txCount; ++ti) {
+                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(toProcess->transactions, ti);
+                if (!tx) continue;
+
+                // Coinbase credit
+                if (Address_IsCoinbase(tx->transaction.senderAddress)) {
+                    balance_sheet_entry_t entry;
+                    if (!BalanceSheet_Lookup(tx->transaction.recipientAddress1, &entry)) {
+                        memset(&entry, 0, sizeof(entry));
+                        memcpy(entry.address, tx->transaction.recipientAddress1, 32);
+                        entry.balance = uint256_from_u64(tx->transaction.amount1);
+                    } else {
+                        (void)uint256_add_u64(&entry.balance, tx->transaction.amount1);
+                    }
+                    (void)BalanceSheet_Insert(entry);
+                    continue;
+                }
+
+                // Non-coinbase: debit sender
+                uint256_t spend = uint256_from_u64(0);
+                (void)uint256_add_u64(&spend, tx->transaction.amount1);
+                if (tx->transaction.amount2 > 0) (void)uint256_add_u64(&spend, tx->transaction.amount2);
+                if (tx->transaction.fee > 0) (void)uint256_add_u64(&spend, tx->transaction.fee);
+
+                balance_sheet_entry_t senderEntry;
+                if (!BalanceSheet_Lookup(tx->transaction.senderAddress, &senderEntry)) {
+                    // Missing sender; create zero and then subtract (will underflow if invalid)
+                    memset(&senderEntry, 0, sizeof(senderEntry));
+                    memcpy(senderEntry.address, tx->transaction.senderAddress, 32);
+                    senderEntry.balance = uint256_from_u64(0);
+                }
+                (void)uint256_subtract(&senderEntry.balance, &spend);
+                (void)BalanceSheet_Insert(senderEntry);
+
+                // Credit recipient1
+                balance_sheet_entry_t rec1;
+                if (!BalanceSheet_Lookup(tx->transaction.recipientAddress1, &rec1)) {
+                    memset(&rec1, 0, sizeof(rec1));
+                    memcpy(rec1.address, tx->transaction.recipientAddress1, 32);
+                    rec1.balance = uint256_from_u64(tx->transaction.amount1);
+                } else {
+                    (void)uint256_add_u64(&rec1.balance, tx->transaction.amount1);
+                }
+                (void)BalanceSheet_Insert(rec1);
+
+                // Credit recipient2 if any
+                if (tx->transaction.amount2 > 0) {
+                    balance_sheet_entry_t rec2;
+                    if (!BalanceSheet_Lookup(tx->transaction.recipientAddress2, &rec2)) {
+                        memset(&rec2, 0, sizeof(rec2));
+                        memcpy(rec2.address, tx->transaction.recipientAddress2, 32);
+                        rec2.balance = uint256_from_u64(tx->transaction.amount2);
+                    } else {
+                        (void)uint256_add_u64(&rec2.balance, tx->transaction.amount2);
+                    }
+                    (void)BalanceSheet_Insert(rec2);
+                }
+            }
+        }
+
+        if (loaded && toProcess) {
+            if (toProcess->transactions) DynArr_destroy(toProcess->transactions);
+            free(toProcess);
+        }
+    }
+
+    pthread_mutex_unlock(&balanceSheetLock);
+    pthread_rwlock_unlock(&chainLock);
 
     return true;
 }

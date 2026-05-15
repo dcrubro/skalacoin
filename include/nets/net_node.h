@@ -15,6 +15,8 @@
 
 #include <dynarr.h>
 
+#include <pthread.h>
+
 #include <block/block.h>
 #include <block/chain.h>
 #include <block/transaction.h>
@@ -27,6 +29,10 @@ typedef struct {
     void (*on_data)(tcp_connection_t* conn, const unsigned char* data, size_t len, void* user);
     void (*on_disconnect)(tcp_connection_t* conn, void* user);
     void* callbackUser;
+    // Maintenance thread for periodic tasks (orphan attach, pruning, metrics)
+    pthread_t maintenanceThread;
+    volatile int maintenanceRunning;
+    int maintenanceIntervalMs;
 } net_node_t;
 
 net_node_t* Node_Create();

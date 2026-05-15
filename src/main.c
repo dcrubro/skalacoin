@@ -18,6 +18,8 @@
 #include <autolykos2/autolykos2.h>
 
 #include <nets/net_node.h>
+#include <nets/fetch_scheduler.h>
+#include <nets/orphan_pool.h>
 
 #ifndef CHAIN_DATA_DIR
 #define CHAIN_DATA_DIR "chain_data"
@@ -27,6 +29,10 @@ blockchain_t* currentChain = NULL;
 const char* chainDataDir = CHAIN_DATA_DIR;
 uint256_t currentSupply = {{0, 0, 0, 0}};
 uint64_t currentReward = 750000000000ULL;
+
+// Define the synchronization primitives declared in runtime_state.h
+pthread_rwlock_t chainLock;
+pthread_mutex_t balanceSheetLock;
 
 void handle_sigint(int sig) {
     printf("Caught signal %d, exiting...\n", sig);
@@ -80,9 +86,10 @@ static block_t* BuildNextBlock(blockchain_t* chain, uint32_t difficultyTarget) {
     block->header.version = 1;
     block->header.blockNumber = (uint64_t)Chain_Size(chain);
     if (Chain_Size(chain) > 0) {
-        block_t* lastBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
-        if (lastBlock) {
+        block_t* lastBlock = NULL;
+        if (Chain_GetBlockCopy(chain, Chain_Size(chain) - 1, &lastBlock)) {
             Block_CalculateHash(lastBlock, block->header.prevHash);
+            Block_Destroy(lastBlock);
         } else {
             memset(block->header.prevHash, 0, sizeof(block->header.prevHash));
         }
@@ -155,12 +162,13 @@ static bool ComputeEpochSeedForHeightFromChain(const blockchain_t* chain, uint64
         return false;
     }
 
-    block_t* seedBlock = Chain_GetBlock((blockchain_t*)chain, (size_t)seedBlockNumber);
-    if (!seedBlock) {
+    block_t* seedBlock = NULL;
+    if (!Chain_GetBlockCopy((blockchain_t*)chain, (size_t)seedBlockNumber, &seedBlock)) {
         return false;
     }
 
     Block_CalculateHash(seedBlock, outSeed);
+    Block_Destroy(seedBlock);
     return true;
 }
 
@@ -180,11 +188,10 @@ static bool ComputeEpochDagBytesForHeightFromChain(const blockchain_t* chain, ui
         return false;
     }
 
-    block_t* lastBlock = Chain_GetBlock((blockchain_t*)chain, (size_t)lastBlockNumber);
-    block_t* epochStartBlock = Chain_GetBlock((blockchain_t*)chain, (size_t)epochStartBlockNumber);
-    if (!lastBlock || !epochStartBlock) {
-        return false;
-    }
+    block_t* lastBlock = NULL;
+    block_t* epochStartBlock = NULL;
+    if (!Chain_GetBlockCopy((blockchain_t*)chain, (size_t)lastBlockNumber, &lastBlock)) { return false; }
+    if (!Chain_GetBlockCopy((blockchain_t*)chain, (size_t)epochStartBlockNumber, &epochStartBlock)) { Block_Destroy(lastBlock); return false; }
 
     int64_t difficultyDelta = (int64_t)epochStartBlock->header.difficultyTarget - (int64_t)lastBlock->header.difficultyTarget;
     int64_t growth = (int64_t)((int64_t)DAG_BASE_GROWTH * difficultyDelta);
@@ -213,6 +220,8 @@ static bool ComputeEpochDagBytesForHeightFromChain(const blockchain_t* chain, ui
     }
 
     *outDagBytes = (size_t)targetSize;
+    Block_Destroy(lastBlock);
+    Block_Destroy(epochStartBlock);
     return true;
 }
 
@@ -283,6 +292,15 @@ static bool MineAndAppendBlock(blockchain_t* chain,
     if (!Chain_AddBlock(chain, block)) {
         fprintf(stderr, "failed to append block to chain\n");
         return false;
+    }
+
+    // After successfully appending a block, attempt to attach any orphans.
+    size_t attached = OrphanPool_AttemptAttach(chain);
+    if (attached > 0) {
+        printf("Attached %zu orphan(s) after mining/appending block\n", attached);
+        // Persist chain/sheet after attaching orphans
+        Chain_SaveToFile(chain, chainDataDir, *currentSupply, *currentReward);
+        BalanceSheet_SaveToFile(chainDataDir);
     }
 
     uint64_t coinbaseAmount = 0;
@@ -358,13 +376,15 @@ static bool VerifyChainFully(blockchain_t* chain) {
 
     uint32_t expectedDifficulty = INITIAL_DIFFICULTY;
     for (size_t i = 0; i < chainSize; ++i) {
-        block_t* blk = Chain_GetBlock(chain, i);
-        if (!blk || !blk->transactions) {
+        block_t* blk = NULL;
+        if (!Chain_GetBlockCopy(chain, i, &blk) || !blk || !blk->transactions) {
+            if (blk) Block_Destroy(blk);
             Chain_Destroy(prevChain);
             return false;
         }
 
         if (blk->header.blockNumber != (uint64_t)i) {
+            Block_Destroy(blk);
             Chain_Destroy(prevChain);
             return false;
         }
@@ -372,12 +392,15 @@ static bool VerifyChainFully(blockchain_t* chain) {
         if (i == 0) {
             uint8_t zeroHash[32] = {0};
             if (memcmp(blk->header.prevHash, zeroHash, sizeof(zeroHash)) != 0) {
+                Block_Destroy(blk);
                 Chain_Destroy(prevChain);
                 return false;
             }
         } else {
-            block_t* prevBlk = Chain_GetBlock(chain, i - 1);
-            if (!prevBlk) {
+            block_t* prevBlk = NULL;
+            if (!Chain_GetBlockCopy(chain, i - 1, &prevBlk) || !prevBlk) {
+                if (prevBlk) Block_Destroy(prevBlk);
+                Block_Destroy(blk);
                 Chain_Destroy(prevChain);
                 return false;
             }
@@ -385,9 +408,12 @@ static bool VerifyChainFully(blockchain_t* chain) {
             uint8_t expectedPrevHash[32];
             Block_CalculateHash(prevBlk, expectedPrevHash);
             if (memcmp(blk->header.prevHash, expectedPrevHash, sizeof(expectedPrevHash)) != 0) {
+                Block_Destroy(prevBlk);
+                Block_Destroy(blk);
                 Chain_Destroy(prevChain);
                 return false;
             }
+            Block_Destroy(prevBlk);
         }
 
         // Determine expected difficulty for this block. TODO: Optimize to recompute at adjustment intervals only instead of every block.
@@ -400,25 +426,32 @@ static bool VerifyChainFully(blockchain_t* chain) {
 
         // Ensure the block's header difficulty matches the expected difficulty (can't cheat easier)
         if (blk->header.difficultyTarget != expectedDifficulty) {
+            Block_Destroy(blk);
             Chain_Destroy(prevChain);
             return false;
         }
 
         uint8_t powHash[32];
         if (!ComputeHistoricalAutolykosHashFromChain(chain, blk, (uint64_t)i, powHash)) {
+            Block_Destroy(blk);
             Chain_Destroy(prevChain);
             return false;
         }
 
         uint8_t target[32];
         if (!DecodeCompactTarget(blk->header.difficultyTarget, target)) {
+            Block_Destroy(blk);
+            Chain_Destroy(prevChain);
             return false;
         }
         if (CompareHashToTarget(powHash, target) > 0) {
+            Block_Destroy(blk);
+            Chain_Destroy(prevChain);
             return false;
         }
 
         if (!Block_AllTransactionsValid(blk)) {
+            Block_Destroy(blk);
             Chain_Destroy(prevChain);
             return false;
         }
@@ -426,14 +459,17 @@ static bool VerifyChainFully(blockchain_t* chain) {
         uint8_t expectedMerkle[32];
         Block_CalculateMerkleRoot(blk, expectedMerkle);
         if (memcmp(blk->header.merkleRoot, expectedMerkle, sizeof(expectedMerkle)) != 0) {
+            Block_Destroy(blk);
             Chain_Destroy(prevChain);
             return false;
         }
 
         // Transactions are persisted on disk. Once this block is fully verified,
         // release its in-memory transaction list to reduce peak memory usage.
-        DynArr_destroy(blk->transactions);
-        blk->transactions = NULL;
+        if (blk->transactions) {
+            DynArr_destroy(blk->transactions);
+            blk->transactions = NULL;
+        }
 
         // Push a header-only copy of this block into prevChain for future difficulty calculations.
         block_t headerOnly;
@@ -441,6 +477,8 @@ static bool VerifyChainFully(blockchain_t* chain) {
         headerOnly.header = blk->header;
         headerOnly.transactions = NULL;
         (void)DynArr_push_back(prevChain->blocks, &headerOnly);
+
+        Block_Destroy(blk);
     }
 
     Chain_Destroy(prevChain);
@@ -475,7 +513,6 @@ int main(int argc, char* argv[]) {
     srand((unsigned int)time(NULL));
 
     BalanceSheet_Init();
-
     blockchain_t* chain = Chain_Create();
     if (!chain) {
         fprintf(stderr, "failed to create chain\n");
@@ -494,6 +531,9 @@ int main(int argc, char* argv[]) {
     }
 
     uint8_t lastSavedHash[32] = {0};
+        // Initialize runtime locks before starting modules
+        pthread_rwlock_init(&chainLock, NULL);
+        pthread_mutex_init(&balanceSheetLock, NULL);
     if (!Chain_LoadFromFile(chain, chainDataDir, &currentSupply, &difficultyTarget, &currentReward, lastSavedHash, false)) {
         printf("No existing chain loaded from %s\n", chainDataDir);
     }
@@ -697,12 +737,12 @@ int main(int argc, char* argv[]) {
         }
 
         if (strcmp(cmd, "sync") == 0) {
-            // Pick outbound peer with highest advertised height
             if (!node) {
                 printf("no node available\n");
                 continue;
             }
 
+            // Choose the best outbound peer by advertised height
             int bestIdx = -1;
             uint64_t bestHeight = 0;
             for (size_t i = 0; i < MAX_CONS; ++i) {
@@ -720,36 +760,211 @@ int main(int argc, char* argv[]) {
             }
 
             uint64_t localHeight = (uint64_t)Chain_Size(chain);
-            if (bestHeight <= localHeight) {
-                printf("already synced (local=%" PRIu64 ", peer=%" PRIu64 ")\n", localHeight, bestHeight);
+            uint64_t peerHeight = node->outboundClients[bestIdx].peerBlockHeight;
+
+            // Determine if this is an initial sync. If so, do not apply penalty.
+            bool isInitialSync = (localHeight == 0);
+
+            // Compute penalty and adjusted peer height (skip penalty for initial sync)
+            uint64_t delay = (peerHeight > localHeight) ? (peerHeight - localHeight) : 0ULL;
+            uint64_t penalty = isInitialSync ? 0ULL : FetchScheduler_ComputeReorgPenaltyBlocks(delay);
+            uint64_t adjustedPeerHeight = (peerHeight > penalty) ? (peerHeight - penalty) : 0ULL;
+
+            if (adjustedPeerHeight <= localHeight) {
+                printf("already synced (local=%" PRIu64 ", peer=%" PRIu64 ", penalty=%" PRIu64 ")\n", localHeight, peerHeight, penalty);
                 continue;
             }
 
-            printf("syncing from peer %d: peerHeight=%" PRIu64 " local=%" PRIu64 "\n", bestIdx, bestHeight, localHeight);
+            printf("syncing from peer %d: peerHeight=%" PRIu64 " adjusted=%" PRIu64 " local=%" PRIu64 " penalty=%" PRIu64 "\n",
+                bestIdx, peerHeight, adjustedPeerHeight, localHeight, penalty);
 
             tcp_connection_t* peerConn = node->outboundClients[bestIdx].connection;
-            for (uint64_t h = localHeight; h < bestHeight; ++h) {
-                uint64_t req = h;
-                if (Node_SendPacket(node, peerConn, PACKET_TYPE_FETCH_BLOCK, &req, sizeof(req)) != 0) {
-                    printf("failed to send FETCH_BLOCK for %" PRIu64 "\n", req);
-                    break;
+
+            // Windowed parallel fetch
+            uint64_t start = localHeight;
+            uint64_t end = adjustedPeerHeight; // exclusive target height
+            uint64_t nextReq = start;
+
+            const int maxInFlight = MAX_PARALLEL_FETCHES;
+            uint64_t requestedHeights[64];
+            int retryCount[64];
+            uint64_t sentAtMs[64];
+            int inFlight = 0;
+
+            if (maxInFlight > (int)(sizeof(requestedHeights)/sizeof(requestedHeights[0]))) {
+                printf("MAX_PARALLEL_FETCHES too large for local buffers\n");
+                continue;
+            }
+
+            // Keep track of expected last-hash to detect reorgs. Initialize to our current tip.
+            uint8_t expectedPrevHash[32];
+            if (localHeight > 0) {
+                block_t* lastBlock = NULL;
+                if (Chain_GetBlockCopy(chain, localHeight - 1, &lastBlock)) {
+                    Block_CalculateHash(lastBlock, expectedPrevHash);
+                    Block_Destroy(lastBlock);
+                } else {
+                    memset(expectedPrevHash, 0, sizeof(expectedPrevHash));
+                }
+            } else {
+                memset(expectedPrevHash, 0, sizeof(expectedPrevHash));
+            }
+
+            while (nextReq < end || inFlight > 0) {
+                // Fill window
+                while (inFlight < maxInFlight && nextReq < end) {
+                    uint64_t req = nextReq;
+                    if (Node_SendPacket(node, peerConn, PACKET_TYPE_FETCH_BLOCK, &req, sizeof(req)) != 0) {
+                        printf("failed to send FETCH_BLOCK for %" PRIu64 "\n", req);
+                        break;
+                    }
+
+                    requestedHeights[inFlight] = req;
+                    retryCount[inFlight] = 0;
+                    sentAtMs[inFlight] = get_current_time_ms();
+                    inFlight++;
+                    nextReq++;
                 }
 
-                // Wait up to 5 seconds for the block to be applied (Chain_Size to increase)
-                const int timeoutMs = 5000;
-                const int pollIntervalMs = 100;
-                int waited = 0;
-                uint64_t startSize = (uint64_t)Chain_Size(chain);
-                while ((uint64_t)Chain_Size(chain) == startSize && waited < timeoutMs) {
-                    usleep(pollIntervalMs * 1000);
-                    waited += pollIntervalMs;
+                // Poll for completions or timeouts
+                if (inFlight == 0) {
+                    // nothing in flight; small sleep to avoid busy-loop
+                    usleep(100 * 1000);
+                    continue;
                 }
 
-                if ((uint64_t)Chain_Size(chain) == startSize) {
-                    printf("timed out waiting for block %" PRIu64 "\n", req);
-                    break;
+                uint64_t now = get_current_time_ms();
+                // Check earliest outstanding entry for completion/timeout
+                bool progressed = false;
+                for (int i = 0; i < inFlight; ++i) {
+                    uint64_t h = requestedHeights[i];
+                    if ((uint64_t)Chain_Size(chain) > h) {
+                        // A new block at height h was applied. Retrieve it and verify parent.
+                        block_t* fetched = NULL;
+                        if (!Chain_GetBlockCopy(chain, (size_t)h, &fetched) || !fetched) {
+                            // Shouldn't happen, but be robust.
+                            printf("fetched block %" PRIu64 " applied but not found\n", h);
+                            // remove entry
+                            for (int j = i; j < inFlight - 1; ++j) {
+                                requestedHeights[j] = requestedHeights[j + 1];
+                                retryCount[j] = retryCount[j + 1];
+                                sentAtMs[j] = sentAtMs[j + 1];
+                            }
+                            inFlight--;
+                            progressed = true;
+                            break;
+                        }
+
+                        // Check whether this block builds on our expected tip. If not, it's a reorg.
+                        if (memcmp(fetched->header.prevHash, expectedPrevHash, sizeof(expectedPrevHash)) != 0) {
+                            // Find matching ancestor in our current chain (if any)
+                            ssize_t matchIndex = -1;
+                            size_t chainSz = Chain_Size(chain);
+                            uint8_t tmpHash[32];
+                            for (size_t bi = 0; bi < chainSz; ++bi) {
+                                block_t* b = NULL;
+                                if (!Chain_GetBlockCopy(chain, bi, &b) || !b) continue;
+                                Block_CalculateHash(b, tmpHash);
+                                if (memcmp(tmpHash, fetched->header.prevHash, sizeof(tmpHash)) == 0) {
+                                    matchIndex = (ssize_t)bi;
+                                    Block_Destroy(b);
+                                    break;
+                                }
+                                Block_Destroy(b);
+                            }
+
+                            uint64_t reorgDepth = 0ULL;
+                            if (matchIndex >= 0) {
+                                reorgDepth = (uint64_t)localHeight - ((uint64_t)matchIndex + 1ULL);
+                            } else {
+                                // No match found: treat as full reorg depth equal to localHeight
+                                reorgDepth = localHeight;
+                            }
+
+                            if (!isInitialSync) {
+                                uint64_t reorgPenalty = FetchScheduler_ComputeReorgPenaltyBlocks(reorgDepth);
+                                printf("Reorg detected at height %" PRIu64 ": depth=%" PRIu64 " penalty=%" PRIu64 "\n",
+                                       h, reorgDepth, reorgPenalty);
+
+                                // Rollback our chain to the matching ancestor (or to 0 if none)
+                                size_t rollbackTo = (matchIndex >= 0) ? (size_t)(matchIndex + 1) : 0;
+                                if (!Chain_RollbackToHeight(chain, rollbackTo)) {
+                                    printf("Failed to rollback to height %zu during reorg handling\n", rollbackTo);
+                                    inFlight = 0; // abort sync
+                                    break;
+                                }
+
+                                // Apply additional penalty by shrinking end and restart window from current Chain_Size
+                                if (peerHeight > reorgPenalty) {
+                                    end = peerHeight - reorgPenalty;
+                                } else {
+                                    end = start;
+                                }
+                            } else {
+                                printf("Initial sync: reorg-like divergence ignored (height=%" PRIu64 ")\n", h);
+                            }
+
+                            // Free fetched block and reset window to pick up new adjusted end and expectedPrevHash
+                            Block_Destroy(fetched);
+                            nextReq = Chain_Size(chain);
+                            inFlight = 0;
+                            // Recompute expectedPrevHash to current tip
+                            if (Chain_Size(chain) > 0) {
+                                block_t* tip = NULL;
+                                if (Chain_GetBlockCopy(chain, Chain_Size(chain) - 1, &tip) && tip) {
+                                    Block_CalculateHash(tip, expectedPrevHash);
+                                    Block_Destroy(tip);
+                                }
+                            } else {
+                                memset(expectedPrevHash, 0, sizeof(expectedPrevHash));
+                            }
+
+                            progressed = true;
+                            break; // restart loop
+                        }
+
+                        printf("fetched block %" PRIu64 "\n", h);
+                        // Update expectedPrevHash to this fetched block's hash (for next block)
+                        Block_CalculateHash(fetched, expectedPrevHash);
+                        // remove entry i by shifting left
+                        for (int j = i; j < inFlight - 1; ++j) {
+                            requestedHeights[j] = requestedHeights[j + 1];
+                            retryCount[j] = retryCount[j + 1];
+                            sentAtMs[j] = sentAtMs[j + 1];
+                        }
+                        inFlight--;
+                        progressed = true;
+                        Block_Destroy(fetched);
+                        break; // restart loop to re-evaluate
+                    }
+
+                    uint64_t elapsed = (now > sentAtMs[i]) ? (now - sentAtMs[i]) : 0ULL;
+                    if (elapsed > SYNC_REQUEST_TIMEOUT_MS) {
+                        if (retryCount[i] < MAX_SYNC_RETRIES) {
+                            // retry with exponential backoff
+                            retryCount[i]++;
+                            uint64_t backoff = SYNC_BACKOFF_BASE_MS * (1ULL << (retryCount[i] - 1));
+                            usleep((useconds_t)(backoff * 1000ULL));
+
+                            uint64_t req = requestedHeights[i];
+                            if (Node_SendPacket(node, peerConn, PACKET_TYPE_FETCH_BLOCK, &req, sizeof(req)) != 0) {
+                                printf("retry: failed to send FETCH_BLOCK for %" PRIu64 "\n", req);
+                            } else {
+                                sentAtMs[i] = get_current_time_ms();
+                                progressed = true;
+                            }
+                        } else {
+                            printf("timed out fetching block %" PRIu64 ", giving up\n", requestedHeights[i]);
+                            inFlight = 0; // abort sync on persistent failures
+                            break;
+                        }
+                    }
                 }
-                printf("fetched block %" PRIu64 "\n", req);
+
+                if (!progressed) {
+                    // small sleep to avoid spinning
+                    usleep(50 * 1000);
+                }
             }
 
             printf("sync complete: localHeight=%zu\n", Chain_Size(chain));
@@ -937,6 +1152,9 @@ int main(int argc, char* argv[]) {
     currentChain = NULL;
     Chain_Destroy(chain);
     BalanceSheet_Destroy();
+
+    pthread_mutex_destroy(&balanceSheetLock);
+    pthread_rwlock_destroy(&chainLock);
 
     return 0;
 }

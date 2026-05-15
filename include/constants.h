@@ -23,6 +23,22 @@
 //#define INITIAL_DIFFICULTY 0x1f0c1422 // Default compact target used by Autolykos2 PoW (This is ridiculously low)
 #define INITIAL_DIFFICULTY 0x1f1b7c51 // This takes 90s on my machine with a single thread, good for testing
 
+// Sync / Reorg tuning constants
+// Timeouts and retry/backoff behavior for block fetches during sync (milliseconds)
+static const uint64_t SYNC_REQUEST_TIMEOUT_MS = 5000ULL; // 5s
+static const int MAX_SYNC_RETRIES = 4; // retry attempts per block fetch
+static const uint64_t SYNC_BACKOFF_BASE_MS = 200ULL; // base backoff in ms (exponential)
+// Parallelism
+static const int MAX_PARALLEL_FETCHES = 8; // concurrent block fetches during windowed sync
+// Heuristic: if peer is this many blocks ahead, treat as initial sync
+static const uint64_t INITIAL_SYNC_HEIGHT_DIFF = 50ULL;
+
+// Reorg penalty configuration (used to penalize peers reporting higher heights but with delayed work)
+static const uint64_t REORG_PENALTY_GRACE_BLOCKS = 3ULL; // allow small reorgs without penalty
+static const double REORG_PENALTY_FACTOR = 1.0; // base scaling factor (theta)
+static const double REORG_PENALTY_EXPONENT = 2.0; // exponent p in penalty ~ B^p
+static const double REORG_PENALTY_REF_BLOCK_TIME = 150.0; // reference block time in seconds used by original scheme
+
 // Reward schedule acceleration: 1 means normal-speed progression.
 #define EMISSION_ACCELERATION_FACTOR 1ULL
 
@@ -166,10 +182,16 @@ static inline size_t CalculateTargetDAGSize(blockchain_t* chain) {
     }
 
     // Get the height - EPOCH_LENGTH block and the last block;
-    block_t* lastBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
-    block_t* epochStartBlock = Chain_GetBlock(chain, (size_t)(Chain_Size(chain) - 1 - EPOCH_LENGTH));
-    if (!lastBlock || !epochStartBlock) {
-        return 0; // Invalid
+    block_t* lastBlock = NULL;
+    block_t* epochStartBlock = NULL;
+    if (!Chain_GetBlockCopy(chain, Chain_Size(chain) - 1, &lastBlock) || !lastBlock) {
+        if (lastBlock) Block_Destroy(lastBlock);
+        return 0;
+    }
+    if (!Chain_GetBlockCopy(chain, (size_t)(Chain_Size(chain) - 1 - EPOCH_LENGTH), &epochStartBlock) || !epochStartBlock) {
+        Block_Destroy(lastBlock);
+        if (epochStartBlock) Block_Destroy(epochStartBlock);
+        return 0;
     }
 
     int64_t difficultyDelta = (int64_t)epochStartBlock->header.difficultyTarget - (int64_t)lastBlock->header.difficultyTarget;
@@ -190,10 +212,15 @@ static inline size_t CalculateTargetDAGSize(blockchain_t* chain) {
     
     int64_t targetSize = (int64_t)DAG_BASE_SIZE + growth;
     if (targetSize <= 0) {
+        Block_Destroy(lastBlock);
+        Block_Destroy(epochStartBlock);
         return 0;
     }
 
-    return (size_t)targetSize;
+    size_t out = (size_t)targetSize;
+    Block_Destroy(lastBlock);
+    Block_Destroy(epochStartBlock);
+    return out;
 }
 
 static inline void GetNextDAGSeed(blockchain_t* chain, uint8_t outSeed[32]) {
@@ -205,13 +232,15 @@ static inline void GetNextDAGSeed(blockchain_t* chain, uint8_t outSeed[32]) {
         return;
     }
 
-    block_t* prevBlock = Chain_GetBlock(chain, Chain_Size(chain) - 1);
-    if (!prevBlock) {
+    block_t* prevBlock = NULL;
+    if (!Chain_GetBlockCopy(chain, Chain_Size(chain) - 1, &prevBlock) || !prevBlock) {
         memset(outSeed, 0x00, 32); // Fallback to zeroes if we can't get the previous block for some reason; The caller should treat this as an error if height >= EPOCH_LENGTH
+        if (prevBlock) Block_Destroy(prevBlock);
         return;
     }
 
     Block_CalculateHash(prevBlock, outSeed);
+    Block_Destroy(prevBlock);
 }
 
 #endif

@@ -24,6 +24,13 @@ size_t Chain_Size(blockchain_t* chain);
 bool Chain_IsValid(blockchain_t* chain);
 void Chain_Wipe(blockchain_t* chain);
 
+// Roll back the chain to `height` (exclusive): after this call, Chain_Size(chain) == height
+// Returns true on success.
+bool Chain_RollbackToHeight(blockchain_t* chain, size_t height);
+
+// Retrieve a deep copy of the block at `index`. Caller must free with `Block_Destroy`.
+bool Chain_GetBlockCopy(blockchain_t* chain, size_t index, block_t** outCopy);
+
 // I/O
 bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply, uint64_t currentReward);
 bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* outCurrentSupply, uint32_t* outDifficultyTarget, uint64_t* outCurrentReward, uint8_t* outLastSavedHash, bool loadTransactions);

@@ -40,5 +40,7 @@ bool Block_IsFullyValid(const block_t* block);
 void Block_ShutdownPowContext(void);
 void Block_Destroy(block_t* block);
 void Block_Print(const block_t* block);
+// Deep-copy a block (allocates a new `block_t*`). Caller must call `Block_Destroy`.
+block_t* Block_Copy(const block_t* src);
 
 #endif
