@@ -512,6 +512,10 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint);
     srand((unsigned int)time(NULL));
 
+    // Initialize runtime locks before any thread or helper can touch chain state.
+    pthread_rwlock_init(&chainLock, NULL);
+    pthread_mutex_init(&balanceSheetLock, NULL);
+
     BalanceSheet_Init();
     blockchain_t* chain = Chain_Create();
     if (!chain) {
@@ -531,9 +535,6 @@ int main(int argc, char* argv[]) {
     }
 
     uint8_t lastSavedHash[32] = {0};
-        // Initialize runtime locks before starting modules
-        pthread_rwlock_init(&chainLock, NULL);
-        pthread_mutex_init(&balanceSheetLock, NULL);
     if (!Chain_LoadFromFile(chain, chainDataDir, &currentSupply, &difficultyTarget, &currentReward, lastSavedHash, false)) {
         printf("No existing chain loaded from %s\n", chainDataDir);
     }
@@ -595,7 +596,7 @@ int main(int argc, char* argv[]) {
     char supplyStr[80];
     Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
     printf("Current chain has %zu blocks, total supply %s\n", Chain_Size(chain), supplyStr);
-    printf("Commands: mine <x>, send <address> <amount>, balance [address], connect <ipv4>, flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
+    printf("Commands: mine <x>, send <address> <amount>, balance [address], connect <ipv4>, sync (requires nodes), flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
 
     char line[1024];
     while (true) {

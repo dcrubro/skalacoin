@@ -4,6 +4,24 @@
 khash_t(balance_sheet_map_m)* sheetMap = NULL;
 static pthread_mutex_t g_sheetLock;
 
+static int BalanceSheet_InsertLocked(balance_sheet_entry_t entry) {
+    if (!sheetMap) {
+        return -1;
+    }
+
+    key32_t key;
+    memcpy(key.bytes, entry.address, 32);
+
+    int ret = 0;
+    khiter_t k = kh_put(balance_sheet_map_m, sheetMap, key, &ret);
+    if (k == kh_end(sheetMap)) {
+        return -1;
+    }
+
+    kh_value(sheetMap, k) = entry;
+    return ret;
+}
+
 void BalanceSheet_Init() {
     sheetMap = kh_init(balance_sheet_map_m);
     pthread_mutex_init(&g_sheetLock, NULL);
@@ -13,19 +31,7 @@ int BalanceSheet_Insert(balance_sheet_entry_t entry) {
     if (!sheetMap) { return -1; }
 
     pthread_mutex_lock(&g_sheetLock);
-
-    // Encapsulate key
-    key32_t key;
-    memcpy(key.bytes, entry.address, 32);
-
-    int ret;
-    khiter_t k = kh_put(balance_sheet_map_m, sheetMap, key, &ret);
-    if (k == kh_end(sheetMap)) {
-        return -1;
-    }
-
-    kh_value(sheetMap, k) = entry;
-
+    int ret = BalanceSheet_InsertLocked(entry);
     pthread_mutex_unlock(&g_sheetLock);
     return ret;
 }
@@ -94,7 +100,7 @@ bool BalanceSheet_LoadFromFile(const char* inPath) {
 
     balance_sheet_entry_t entry;
     while (fread(&entry, sizeof(balance_sheet_entry_t), 1, file) == 1) {
-        if (BalanceSheet_Insert(entry) < 0) {
+        if (BalanceSheet_InsertLocked(entry) < 0) {
             fclose(file);
             pthread_mutex_unlock(&g_sheetLock);
             return false;
