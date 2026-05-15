@@ -229,5 +229,6 @@ target_compile_options(node PRIVATE
 target_compile_definitions(node PRIVATE
     CHAIN_DATA_DIR="${CMAKE_BINARY_DIR}/chain_data"
     $<$<BOOL:${SKALACOIN_AUTOLYKOS2_REF_AVAILABLE}>:SKALACOIN_AUTOLYKOS2_REF_AVAILABLE>
+    $<$<BOOL:1>:_POSIX_C_SOURCE=200809L>
 )
 set_target_properties(node PROPERTIES OUTPUT_NAME "skalacoin_node")

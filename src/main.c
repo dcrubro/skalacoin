@@ -830,7 +830,7 @@ int main(int argc, char* argv[]) {
                 // Poll for completions or timeouts
                 if (inFlight == 0) {
                     // nothing in flight; small sleep to avoid busy-loop
-                    usleep(100 * 1000);
+                    sleep_for_milliseconds(100);
                     continue;
                 }
 
@@ -945,7 +945,7 @@ int main(int argc, char* argv[]) {
                             // retry with exponential backoff
                             retryCount[i]++;
                             uint64_t backoff = SYNC_BACKOFF_BASE_MS * (1ULL << (retryCount[i] - 1));
-                            usleep((useconds_t)(backoff * 1000ULL));
+                            sleep_for_milliseconds(backoff);
 
                             uint64_t req = requestedHeights[i];
                             if (Node_SendPacket(node, peerConn, PACKET_TYPE_FETCH_BLOCK, &req, sizeof(req)) != 0) {
@@ -964,7 +964,7 @@ int main(int argc, char* argv[]) {
 
                 if (!progressed) {
                     // small sleep to avoid spinning
-                    usleep(50 * 1000);
+                    sleep_for_milliseconds(50);
                 }
             }
 

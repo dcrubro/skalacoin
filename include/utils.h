@@ -36,6 +36,19 @@ static inline uint64_t get_current_time_ms(void) {
     return (spec.tv_sec * 1000) + (spec.tv_nsec / 1000000);
 }
 
+static inline void sleep_for_microseconds(uint64_t microseconds) {
+    struct timespec req;
+    req.tv_sec = (time_t)(microseconds / 1000000ULL);
+    req.tv_nsec = (long)((microseconds % 1000000ULL) * 1000ULL);
+    while (nanosleep(&req, &req) == -1) {
+        continue;
+    }
+}
+
+static inline void sleep_for_milliseconds(uint64_t milliseconds) {
+    sleep_for_microseconds(milliseconds * 1000ULL);
+}
+
 static inline void AddressToHexString(const uint8_t address[32], char out[65]) {
     if (!address || !out) {
         return;

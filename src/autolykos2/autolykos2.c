@@ -254,7 +254,7 @@ static bool Autolykos2_HashCore(
         DWORD ms = (DWORD)((autolykos2_sleepBetweenHashOperationsMicroseconds + 999) / 1000);
         Sleep(ms);
 #else
-        usleep((useconds_t)autolykos2_sleepBetweenHashOperationsMicroseconds);
+        sleep_for_microseconds(autolykos2_sleepBetweenHashOperationsMicroseconds);
 #endif
     }
 

@@ -40,7 +40,7 @@ static void* Node_MaintenanceThread(void* arg) {
                 BalanceSheet_SaveToFile(chainDataDir);
             }
         }
-        usleep((useconds_t)(n->maintenanceIntervalMs * 1000));
+        sleep_for_milliseconds((uint64_t)n->maintenanceIntervalMs);
     }
     return NULL;
 }
