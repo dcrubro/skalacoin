@@ -84,8 +84,65 @@ size_t OrphanPool_AttemptAttach(blockchain_t* chain) {
                 }
 
                 if (!parentMatches) {
-                    // Parent exists but does not match this orphan's prevHash; skip attaching now.
-                    continue;
+                        // Parent exists but does not match this orphan's prevHash.
+                        // Attempt to detect a longer alternate chain in the orphan pool starting at this height.
+                        // Build a consecutive sequence of orphans from this height upward.
+                        DynArr* seq = DYNARR_CREATE(block_t*, 8);
+                        size_t h = e->height;
+                        while (1) {
+                            bool found = false;
+                            size_t gn = DynArr_size(g_orphans);
+                            for (size_t gi = 0; gi < gn; ++gi) {
+                                orphan_entry_t* oe = (orphan_entry_t*)DynArr_at(g_orphans, gi);
+                                if (!oe || !oe->block) continue;
+                                if (oe->height == h) {
+                                    (void)DynArr_push_back(seq, &oe->block);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) break;
+                            h++;
+                        }
+
+                        size_t seqCount = DynArr_size(seq);
+                        if (seqCount > 0) {
+                            size_t seqTopHeight = e->height + seqCount - 1;
+                            if (seqTopHeight >= Chain_Size(chain)) {
+                                // Found a candidate longer branch. Perform rollback to fork height and attach sequence.
+                                if (Chain_RollbackToHeight(chain, (size_t)e->height)) {
+                                    // Attach in-order
+                                    for (size_t si = 0; si < seqCount; ++si) {
+                                        block_t* bptr = *(block_t**)DynArr_at(seq, si);
+                                        if (!Chain_AddBlock(chain, bptr)) {
+                                            // failed to add; stop attempting further
+                                            break;
+                                        }
+                                        // Remove the attached orphan from pool but keep the block object to preserve transactions in-memory (consistent with existing behavior)
+                                        // Find and remove corresponding orphan entry
+                                        size_t gn2 = DynArr_size(g_orphans);
+                                        for (size_t gi2 = 0; gi2 < gn2; ++gi2) {
+                                            orphan_entry_t* oe2 = (orphan_entry_t*)DynArr_at(g_orphans, gi2);
+                                            if (oe2 && oe2->block == bptr) {
+                                                DynArr_remove(g_orphans, gi2);
+                                                gn2 = DynArr_size(g_orphans);
+                                                gi2 = (size_t)-1; // restart search if needed
+                                            }
+                                        }
+                                    }
+                                    attached += seqCount;
+                                    madeProgress = true;
+                                    DynArr_destroy(seq);
+                                    // reset outer loop
+                                    n = DynArr_size(g_orphans);
+                                    i = (size_t)-1;
+                                    break;
+                                }
+                            }
+                        }
+                        DynArr_destroy(seq);
+                        // If we didn't perform a reorg/attach, skip for now.
+                        continue;
                 }
 
                 // Try to add to chain
