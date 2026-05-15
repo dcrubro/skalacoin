@@ -413,14 +413,40 @@ void Node_Server_OnData(tcp_connection_t* client) {
 
             // Find the block (deep-copy it for safe access)
             block_t* block = NULL;
+            bool loadedFromDisk = false;
             if (!Chain_GetBlockCopy(currentChain, (size_t)requestedHeight, &block) || !block) {
-                // Try loading from disk
+                // Try loading from disk directly
                 if (!Chain_LoadBlockFromFile(chainDataDir, requestedHeight, true, &block, NULL) || !block) {
                     printf("Requested block height %" PRIu64 " not found, ignoring\n", requestedHeight);
                     const char* msg = "Requested block not found!";
                     Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
                     return;
                 }
+                loadedFromDisk = true;
+            } else if (!block->transactions) {
+                // In-memory chain may be compacted to headers only after persistence.
+                block_t* fullBlock = NULL;
+                if (Chain_LoadBlockFromFile(chainDataDir, requestedHeight, true, &fullBlock, NULL) && fullBlock) {
+                    Block_Destroy(block);
+                    block = fullBlock;
+                    loadedFromDisk = true;
+                }
+            }
+
+            if (!block || !block->transactions) {
+                printf("Requested block height %" PRIu64 " has no transaction data available\n", requestedHeight);
+                const char* msg = "Requested block missing transactions!";
+                Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
+                if (block) {
+                    Block_Destroy(block);
+                }
+                return;
+            }
+
+            if (loadedFromDisk) {
+                printf("Serving block %" PRIu64 " from disk with %zu transaction(s)\n",
+                    requestedHeight,
+                    DynArr_size(block->transactions));
             }
 
             // Serialize into a BLOCK_DATA packet [block header][tx count - 8 bytes][transactions...]
