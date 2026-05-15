@@ -761,10 +761,11 @@ int main(int argc, char* argv[]) {
 
             uint64_t localHeight = (uint64_t)Chain_Size(chain);
 
-            // Determine if this is an initial sync. If so, do not apply penalty.
-            bool isInitialSync = (localHeight == 0);
+            // Only penalize small near-tip gaps. Large gaps are treated as normal catch-up,
+            // because a much taller peer on the same chain is not evidence of a reorg. TODO: Maybe look at this again some other day.
+            bool isInitialSync = (localHeight == 0) || ((peerHeight > localHeight) && ((peerHeight - localHeight) > INITIAL_SYNC_HEIGHT_DIFF));
 
-            // Compute penalty and adjusted peer height (skip penalty for initial sync)
+            // Compute penalty and adjusted peer height.
             uint64_t delay = (peerHeight > localHeight) ? (peerHeight - localHeight) : 0ULL;
             uint64_t penalty = isInitialSync ? 0ULL : FetchScheduler_ComputeReorgPenaltyBlocks(delay);
             uint64_t adjustedPeerHeight = (peerHeight > penalty) ? (peerHeight - penalty) : 0ULL;

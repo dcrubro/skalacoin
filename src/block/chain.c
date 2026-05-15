@@ -230,6 +230,9 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
     pthread_mutex_unlock(&balanceSheetLock);
     pthread_rwlock_unlock(&chainLock);
 
+    printf("Added new block to chain:\n");
+    Block_ShortPrint(block);
+
     return ok;
 }
 

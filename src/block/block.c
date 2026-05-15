@@ -286,6 +286,20 @@ void Block_Print(const block_t* block) {
     }
 }
 
+void Block_ShortPrint(const block_t* block) {
+    if (!block) return;
+
+    printf("Block #%llu: Timestamp %llu, Nonce %llu, DiffTarget 0x%08x, Version %u, PrevHash %02x%02x...%02x%02x, MerkleRoot %02x%02x...%02x%02x, TxCount %zu\n",
+        (unsigned long long)block->header.blockNumber,
+        (unsigned long long)block->header.timestamp,
+        (unsigned long long)block->header.nonce,
+        block->header.difficultyTarget,
+        block->header.version,
+        block->header.prevHash[0], block->header.prevHash[1], block->header.prevHash[30], block->header.prevHash[31],
+        block->header.merkleRoot[0], block->header.merkleRoot[1], block->header.merkleRoot[30], block->header.merkleRoot[31],
+        block->transactions ? DynArr_size(block->transactions) : 0);
+}
+
 block_t* Block_Copy(const block_t* src) {
     if (!src) return NULL;
     block_t* dst = (block_t*)malloc(sizeof(block_t));
