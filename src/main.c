@@ -651,6 +651,11 @@ int main(int argc, char* argv[]) {
 
                 free(block); // Chain stores block by value and owns copied transaction array.
 
+                // Broadcast newly mined block to outbound peers
+                if (node) {
+                    Node_BroadcastChainRange(node, Chain_Size(chain) - 1, NULL);
+                }
+
                 if (i % 50 == 0) {
                     // Mid-mine flush
                     (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
@@ -733,6 +738,9 @@ int main(int argc, char* argv[]) {
             FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
 
             free(block);
+            if (node) {
+                Node_BroadcastChainRange(node, Chain_Size(chain) - 1, NULL);
+            }
             printf("send committed in mined block\n");
             continue;
         }
@@ -744,24 +752,14 @@ int main(int argc, char* argv[]) {
             }
 
             // Choose the best outbound peer by advertised height
-            int bestIdx = -1;
-            uint64_t bestHeight = 0;
-            for (size_t i = 0; i < MAX_CONS; ++i) {
-                if (node->outboundClients[i].connection) {
-                    if (node->outboundClients[i].peerBlockHeight > bestHeight) {
-                        bestHeight = node->outboundClients[i].peerBlockHeight;
-                        bestIdx = (int)i;
-                    }
-                }
-            }
-
-            if (bestIdx < 0) {
+            tcp_connection_t* peerConn = NULL;
+            uint64_t peerHeight = 0;
+            if (Node_GetBestOutboundPeer(node, &peerConn, &peerHeight) != 0 || !peerConn) {
                 printf("no outbound peers to sync from\n");
                 continue;
             }
 
             uint64_t localHeight = (uint64_t)Chain_Size(chain);
-            uint64_t peerHeight = node->outboundClients[bestIdx].peerBlockHeight;
 
             // Determine if this is an initial sync. If so, do not apply penalty.
             bool isInitialSync = (localHeight == 0);
@@ -776,10 +774,8 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            printf("syncing from peer %d: peerHeight=%" PRIu64 " adjusted=%" PRIu64 " local=%" PRIu64 " penalty=%" PRIu64 "\n",
-                bestIdx, peerHeight, adjustedPeerHeight, localHeight, penalty);
-
-            tcp_connection_t* peerConn = node->outboundClients[bestIdx].connection;
+            printf("syncing: peerHeight=%" PRIu64 " adjusted=%" PRIu64 " local=%" PRIu64 " penalty=%" PRIu64 "\n",
+                peerHeight, adjustedPeerHeight, localHeight, penalty);
 
             // Windowed parallel fetch
             uint64_t start = localHeight;

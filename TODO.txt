@@ -1,6 +1,4 @@
 TODO:
-Implement Horizen's "Reorg Penalty" system to make it harder for the young chain to be attacked by a powerful miner.
-
 Make transactions private. A bit more work, but it's a challenge worth taking on.
 I want to make an "optional privacy" system, where the TX can be public or private. Of course private TXs need more bytes, so the fees (although low) will be higher for them.
 I need to figure out a way to make the privacy work without a UTXO system, and instead, with a "Balance Sheet" approach.
@@ -9,6 +7,11 @@ Move the Networking Code to support win32 as well, as I'm just doing POSIX right
 Maybe move the node system to an async event loop instead of spawning threads.
 
 A potential race could occur if the P2P node receives a new block, or flushes a new block to disk while the user is running a full verify.
+
+Maybe think about how block broadcasting works. Instead of unsolicited broadcasting, maybe only advertise a new height and have peers request the block if they want it. This would reduce bandwidth usage, but it also means that blocks won't propagate as fast, which could lead to more orphaned blocks. It's a tradeoff.
+
+TO TEST:
+Implement Horizen's "Reorg Penalty" system to make it harder for the young chain to be attacked by a powerful miner.
 
 DONE:
 I want to move away from the Monero emission. I want to do something a bit radical for cryptocurrency, but I feel like it's necessary to make it more like money:

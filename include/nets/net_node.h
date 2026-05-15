@@ -14,6 +14,7 @@
 #include <stddef.h>
 
 #include <dynarr.h>
+#include <dynset.h>
 
 #include <pthread.h>
 
@@ -25,6 +26,12 @@ typedef struct {
     tcp_server_t* server;
     tcp_client_t outboundClients[MAX_CONS];
     size_t outboundCount;
+    // Dedup cache for recently seen block hashes (canonical 32-byte hash)
+    DynSet* seenBlocks;
+    // Protects seenBlocks
+    pthread_mutex_t seenLock;
+    // Protects outboundClients snapshots and peerBlockHeight writes
+    pthread_mutex_t outboundLock;
     void (*on_connect)(tcp_connection_t* conn, void* user);
     void (*on_data)(tcp_connection_t* conn, const unsigned char* data, size_t len, void* user);
     void (*on_disconnect)(tcp_connection_t* conn, void* user);
@@ -50,6 +57,10 @@ int Node_ConnectPeer(net_node_t* node, const char* ip, unsigned short port);
 int Node_ConnectStartupPeers(net_node_t* node, const char** ips, const unsigned short* ports, size_t peersCount);
 
 int Node_SendPacket(net_node_t* node, tcp_connection_t* conn, packet_type_t packetType, const void* payload, size_t payloadLen);
+
+// Helpers for outbound peer selection and block broadcast
+int Node_GetBestOutboundPeer(net_node_t* node, tcp_connection_t** outConn, uint64_t* outHeight);
+void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp_connection_t* sourceConn);
 
 // Callback logic
 void Node_Server_OnConnect(tcp_connection_t* client);
