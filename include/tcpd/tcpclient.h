@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include <constants.h>
 #include <tcpd/tcpconnection.h>
@@ -13,6 +14,7 @@ typedef struct {
     void (*on_data)(tcp_connection_t* conn);
     void (*on_disconnect)(tcp_connection_t* conn);
     void* owner;
+    uint64_t peerBlockHeight;
 } tcp_client_t;
 
 int TcpClient_Init(tcp_client_t* client);

@@ -10,6 +10,7 @@
 #include <time.h>
 #include <signal.h>
 #include <balance_sheet.h>
+#include <unistd.h>
 
 
 #include <constants.h>
@@ -692,6 +693,66 @@ int main(int argc, char* argv[]) {
 
             free(block);
             printf("send committed in mined block\n");
+            continue;
+        }
+
+        if (strcmp(cmd, "sync") == 0) {
+            // Pick outbound peer with highest advertised height
+            if (!node) {
+                printf("no node available\n");
+                continue;
+            }
+
+            int bestIdx = -1;
+            uint64_t bestHeight = 0;
+            for (size_t i = 0; i < MAX_CONS; ++i) {
+                if (node->outboundClients[i].connection) {
+                    if (node->outboundClients[i].peerBlockHeight > bestHeight) {
+                        bestHeight = node->outboundClients[i].peerBlockHeight;
+                        bestIdx = (int)i;
+                    }
+                }
+            }
+
+            if (bestIdx < 0) {
+                printf("no outbound peers to sync from\n");
+                continue;
+            }
+
+            uint64_t localHeight = (uint64_t)Chain_Size(chain);
+            if (bestHeight <= localHeight) {
+                printf("already synced (local=%" PRIu64 ", peer=%" PRIu64 ")\n", localHeight, bestHeight);
+                continue;
+            }
+
+            printf("syncing from peer %d: peerHeight=%" PRIu64 " local=%" PRIu64 "\n", bestIdx, bestHeight, localHeight);
+
+            tcp_connection_t* peerConn = node->outboundClients[bestIdx].connection;
+            for (uint64_t h = localHeight; h < bestHeight; ++h) {
+                uint64_t req = h;
+                if (Node_SendPacket(node, peerConn, PACKET_TYPE_FETCH_BLOCK, &req, sizeof(req)) != 0) {
+                    printf("failed to send FETCH_BLOCK for %" PRIu64 "\n", req);
+                    break;
+                }
+
+                // Wait up to 5 seconds for the block to be applied (Chain_Size to increase)
+                const int timeoutMs = 5000;
+                const int pollIntervalMs = 100;
+                int waited = 0;
+                uint64_t startSize = (uint64_t)Chain_Size(chain);
+                while ((uint64_t)Chain_Size(chain) == startSize && waited < timeoutMs) {
+                    usleep(pollIntervalMs * 1000);
+                    waited += pollIntervalMs;
+                }
+
+                if ((uint64_t)Chain_Size(chain) == startSize) {
+                    printf("timed out waiting for block %" PRIu64 "\n", req);
+                    break;
+                }
+                printf("fetched block %" PRIu64 "\n", req);
+            }
+
+            printf("sync complete: localHeight=%zu\n", Chain_Size(chain));
             continue;
         }
 

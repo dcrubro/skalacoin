@@ -51,6 +51,7 @@ int TcpClient_Init(tcp_client_t* client) {
 
     memset(client, 0, sizeof(*client));
     client->connection = NULL;
+    client->peerBlockHeight = 0;
     return 0;
 }
 
