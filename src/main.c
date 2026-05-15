@@ -828,33 +828,8 @@ int main(int argc, char* argv[]) {
                         break;
                     }
 
-
-                uint64_t newLocal = (uint64_t)Chain_Size(chain);
-                if (newLocal > localHeight) madeProgressOverall = true;
-
-                printf("sync complete: localHeight=%" PRIu64 "\n", newLocal);
-
-                // If we've caught up to the peer, stop. Otherwise refresh peerHeight and loop again.
-                if (newLocal >= peerHeight) break;
-
-                // Refresh advertised peer height for this connection (it may have been updated during fetch)
-                pthread_mutex_lock(&node->outboundLock);
-                for (size_t i = 0; i < MAX_CONS; ++i) {
-                    if (node->outboundClients[i].connection == peerConn) {
-                        peerHeight = node->outboundClients[i].peerBlockHeight;
-                        break;
-                    }
-                }
-                pthread_mutex_unlock(&node->outboundLock);
-
-                // If no progress was made in this iteration, stop to avoid tight loop
-                if (!madeProgressOverall) {
-                    break;
-                }
-
-                // Re-evaluate loop condition: continue while local < peerHeight
-                if ((uint64_t)Chain_Size(chain) >= peerHeight) break;
-            }
+                    requestedHeights[inFlight] = req;
+                    retryCount[inFlight] = 0;
                     sentAtMs[inFlight] = get_current_time_ms();
                     inFlight++;
                     nextReq++;
@@ -1001,7 +976,31 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            printf("sync complete: localHeight=%zu\n", Chain_Size(chain));
+            // After the window completes, check progress and possibly refresh peer height
+            uint64_t newLocal = (uint64_t)Chain_Size(chain);
+            if (newLocal > localHeight) madeProgressOverall = true;
+            printf("sync complete: localHeight=%" PRIu64 "\n", newLocal);
+
+            // If we've caught up to the peer, stop. Otherwise refresh peerHeight and loop again.
+            if (newLocal >= peerHeight) break;
+
+            // Refresh advertised peer height for this connection (it may have been updated during fetch)
+            pthread_mutex_lock(&node->outboundLock);
+            for (size_t i = 0; i < MAX_CONS; ++i) {
+                if (node->outboundClients[i].connection == peerConn) {
+                    peerHeight = node->outboundClients[i].peerBlockHeight;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&node->outboundLock);
+
+            // If no progress was made in this iteration, stop to avoid tight loop
+            if (!madeProgressOverall) {
+                break;
+            }
+
+            // Re-evaluate loop condition: continue while local < peerHeight
+            if ((uint64_t)Chain_Size(chain) >= peerHeight) break;
             continue;
         }
 
@@ -1181,6 +1180,8 @@ int main(int argc, char* argv[]) {
         }
 
         printf("Unknown command. Available: mine, send, balance, connect, flushchain, fullverify, blockdetail, wipechain, genaddr, exit\n");
+    }
+
     }
 
     (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
