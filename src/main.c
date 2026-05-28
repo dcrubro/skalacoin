@@ -28,6 +28,9 @@
 
 blockchain_t* currentChain = NULL;
 const char* chainDataDir = CHAIN_DATA_DIR;
+unsigned short listenPort = LISTEN_PORT;
+bool echoPeersEnabled = ECHO_PEERS != 0;
+bool forceOrphanReorgEnabled = false;
 uint256_t currentSupply = {{0, 0, 0, 0}};
 uint64_t currentReward = 750000000000ULL;
 
@@ -40,6 +43,32 @@ void handle_sigint(int sig) {
     Block_ShutdownPowContext();
     BalanceSheet_Destroy();
     exit(0);
+}
+
+static void ApplyRuntimeConfigFromEnv(void) {
+    const char* dataDir = getenv("SKALACOIN_CHAIN_DATA_DIR");
+    if (dataDir && dataDir[0] != '\0') {
+        chainDataDir = dataDir;
+    }
+
+    const char* portStr = getenv("SKALACOIN_LISTEN_PORT");
+    if (portStr && portStr[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(portStr, &end, 10);
+        if (end != portStr && *end == '\0' && parsed > 0 && parsed <= 65535) {
+            listenPort = (unsigned short)parsed;
+        }
+    }
+
+    const char* echoStr = getenv("SKALACOIN_ECHO_PEERS");
+    if (echoStr && echoStr[0] != '\0') {
+        echoPeersEnabled = (strcmp(echoStr, "0") != 0);
+    }
+
+    const char* forceOrphanStr = getenv("SKALACOIN_FORCE_ORPHAN_REORG");
+    if (forceOrphanStr && forceOrphanStr[0] != '\0') {
+        forceOrphanReorgEnabled = (strcmp(forceOrphanStr, "0") != 0);
+    }
 }
 
 uint32_t difficultyTarget = INITIAL_DIFFICULTY;
@@ -295,6 +324,14 @@ static bool MineAndAppendBlock(blockchain_t* chain,
         return false;
     }
 
+    uint64_t coinbaseAmount = 0;
+    if (block->transactions && DynArr_size(block->transactions) > 0) {
+        signed_transaction_t* firstTx = (signed_transaction_t*)DynArr_at(block->transactions, 0);
+        if (firstTx && Address_IsCoinbase(firstTx->transaction.senderAddress)) {
+            coinbaseAmount = firstTx->transaction.amount1;
+        }
+    }
+
     // After successfully appending a block, attempt to attach any orphans.
     size_t attached = OrphanPool_AttemptAttach(chain);
     if (attached > 0) {
@@ -302,14 +339,6 @@ static bool MineAndAppendBlock(blockchain_t* chain,
         // Persist chain/sheet after attaching orphans
         Chain_SaveToFile(chain, chainDataDir, *currentSupply, *currentReward);
         BalanceSheet_SaveToFile(chainDataDir);
-    }
-
-    uint64_t coinbaseAmount = 0;
-    if (block->transactions && DynArr_size(block->transactions) > 0) {
-        signed_transaction_t* firstTx = (signed_transaction_t*)DynArr_at(block->transactions, 0);
-        if (firstTx && Address_IsCoinbase(firstTx->transaction.senderAddress)) {
-            coinbaseAmount = firstTx->transaction.amount1;
-        }
     }
 
     (void)uint256_add_u64(currentSupply, coinbaseAmount);
@@ -486,6 +515,16 @@ static bool VerifyChainFully(blockchain_t* chain) {
     return true;
 }
 
+// Use when error
+void KillEverythingAndExit(net_node_t* node, blockchain_t* chain) {
+    Node_Destroy(node);
+    currentChain = NULL;
+    Chain_Destroy(chain);
+    Block_ShutdownPowContext();
+    BalanceSheet_Destroy();
+    exit(1);
+}
+
 int main(int argc, char* argv[]) {
     //(void)argc;
     //(void)argv;
@@ -509,6 +548,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+
+    ApplyRuntimeConfigFromEnv();
 
     signal(SIGINT, handle_sigint);
     srand((unsigned int)time(NULL));
@@ -577,7 +618,77 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // TODO: Separate loading into its own header
+    // Load the wallet from disk or generate new random identity 
+    
     uint8_t minerAddress[32];
+    uint8_t minerPrivateKey[32];
+    uint8_t minerCompressedPubkey[33];
+    bool loadedWallet = false;
+
+    // Attempt load
+    char* path = "chain_data/wallet.data"; // TODO: Don't hardcode path
+    FILE* walletFile = fopen(path, "rb");
+    if (walletFile) {
+        size_t read = fread(minerPrivateKey, 1, 32, walletFile);
+        if (read != 32) {
+            fprintf(stderr, "failed to read wallet file\n");
+            fclose(walletFile);
+        }
+
+        read = fread(minerCompressedPubkey, 1, 33, walletFile);
+        if (read != 33) {
+            fprintf(stderr, "failed to read wallet file\n");
+            fclose(walletFile);
+        }
+
+        read = fread(minerAddress, 1, 32, walletFile);
+        if (read != 32) {
+            fprintf(stderr, "failed to read wallet file\n");
+            fclose(walletFile);
+        }
+
+        fclose(walletFile);
+        loadedWallet = true;
+    } else if (errno != ENOENT || errno != EISDIR || errno != EACCES || errno != EROFS || !loadedWallet) {
+        fprintf(stderr, "failed to open wallet file: %s\n generating new wallet...\n", strerror(errno));
+        if (!GenerateRandomTestAddress(minerAddress, minerPrivateKey, minerCompressedPubkey)) {
+            fprintf(stderr, "failed to generate test miner keypair\n");
+            KillEverythingAndExit(node, chain);
+        }
+
+        // Save the generated wallet to disk for future runs
+        walletFile = fopen(path, "wb");
+        if (!walletFile) {
+            fprintf(stderr, "failed to create wallet file: %s\n", strerror(errno));
+            KillEverythingAndExit(node, chain); 
+        }
+
+        size_t written = fwrite(minerPrivateKey, 1, 32, walletFile);
+        if (written != 32) {
+            fprintf(stderr, "failed to write wallet file\n");
+            fclose(walletFile);
+            KillEverythingAndExit(node, chain);
+        }
+
+        written = fwrite(minerCompressedPubkey, 1, 33, walletFile);
+        if (written != 33) {
+            fprintf(stderr, "failed to write wallet file\n");
+            fclose(walletFile);
+            KillEverythingAndExit(node, chain);
+        }
+
+        written = fwrite(minerAddress, 1, 32, walletFile);
+        if (written != 32) {
+            fprintf(stderr, "failed to write wallet file\n");
+            fclose(walletFile);
+            KillEverythingAndExit(node, chain);
+        }
+
+        fclose(walletFile);
+    }
+
+    /*uint8_t minerAddress[32];
     uint8_t minerPrivateKey[32];
     uint8_t minerCompressedPubkey[33];
     if (!GenerateTestMinerIdentity(minerPrivateKey, minerCompressedPubkey, minerAddress)) {
@@ -588,7 +699,7 @@ int main(int argc, char* argv[]) {
         Block_ShutdownPowContext();
         BalanceSheet_Destroy();
         return 1;
-    }
+    }*/
 
     char minerAddressHex[65];
     AddressToHexString(minerAddress, minerAddressHex);
@@ -1084,9 +1195,10 @@ int main(int argc, char* argv[]) {
 
         if (strcmp(cmd, "connect") == 0) {
             char* ipStr = strtok(NULL, " \t");
+            char* portStr = strtok(NULL, " \t");
             char* extra = strtok(NULL, " \t");
             if (!ipStr || extra) {
-                printf("usage: connect <ipv4>\n");
+                printf("usage: connect <ipv4> [port]\n");
                 continue;
             }
 
@@ -1095,16 +1207,31 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            if (Node_ConnectPeer(node, ipStr, LISTEN_PORT) != 0) {
+            unsigned short peerPort = listenPort;
+            if (portStr) {
+                char* end = NULL;
+                long parsedPort = strtol(portStr, &end, 10);
+                if (*portStr == '\0' || portStr[0] == '-' || (end && *end != '\0') || parsedPort <= 0 || parsedPort > 65535) {
+                    printf("invalid port\n");
+                    continue;
+                }
+                peerPort = (unsigned short)parsedPort;
+                if (strtok(NULL, " \t")) {
+                    printf("usage: connect <ipv4> [port]\n");
+                    continue;
+                }
+            }
+
+            if (Node_ConnectPeer(node, ipStr, peerPort) != 0) {
                 if (errno == ETIMEDOUT) {
-                    printf("failed to connect to %s:%u (timeout)\n", ipStr, (unsigned int)LISTEN_PORT);
+                    printf("failed to connect to %s:%u (timeout)\n", ipStr, (unsigned int)peerPort);
                 } else {
-                    printf("failed to connect to %s:%u\n", ipStr, (unsigned int)LISTEN_PORT);
+                    printf("failed to connect to %s:%u\n", ipStr, (unsigned int)peerPort);
                 }
                 continue;
             }
 
-            printf("connect requested to %s:%u\n", ipStr, (unsigned int)LISTEN_PORT);
+            printf("connect requested to %s:%u\n", ipStr, (unsigned int)peerPort);
             continue;
         }
 
@@ -1166,7 +1293,7 @@ int main(int argc, char* argv[]) {
 
         if (strcmp(cmd, "genaddr") == 0) {
             uint8_t testAddress[32];
-            if (!GenerateRandomTestAddress(testAddress)) {
+            if (!GenerateRandomTestAddress(testAddress, NULL, NULL)) {
                 printf("failed to generate address\n");
                 continue;
             }

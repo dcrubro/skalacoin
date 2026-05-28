@@ -122,6 +122,13 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         return NODE_BLOCK_REJECTED;
     }
 
+    // Temporary debug mode: force network-received blocks through the orphan pool to exercise reorg handling.
+    if (forceOrphanReorgEnabled && blk->header.blockNumber > 0) {
+        OrphanPool_Insert(blk, blockHeight);
+        printf("Forced orphan BLOCK_DATA at height %" PRIu64 "\n", blockHeight);
+        return NODE_BLOCK_ORPHAN_QUEUED;
+    }
+
     // If parent is missing, insert into orphan pool instead of rejecting immediately.
     uint64_t chainSize = Chain_Size(currentChain);
     if (blk->header.blockNumber > chainSize) {
@@ -232,7 +239,7 @@ net_node_t* Node_Create() {
     pthread_mutex_init(&node->outboundLock, NULL);
     node->seenBlocks = DynSet_Create(32); // 32-byte canonical hashes
 
-    TcpServer_Init(node->server, LISTEN_PORT, "0.0.0.0");
+    TcpServer_Init(node->server, listenPort, "0.0.0.0");
 
     node->server->owner = node;
     node->server->on_connect = Node_Server_OnConnect;
@@ -382,14 +389,13 @@ void Node_Server_OnConnect(tcp_connection_t* client) {
     Node_ForwardConnect(node, client);
     printf("Inbound node connected: %u\n", client ? client->connectionId : 0U);
 
-#if ECHO_PEERS
-    if (node && client) {
-        // Attempt to create an outbound connection back to the peer's IP on our LISTEN_PORT.
+    if (echoPeersEnabled && node && client) {
+        // Attempt to create an outbound connection back to the peer's IP on our configured port.
         // We avoid connecting if we already have an outbound to the same IP.
         char ipbuf[INET_ADDRSTRLEN];
         if (inet_ntop(AF_INET, &client->peerAddr.sin_addr, ipbuf, sizeof(ipbuf))) {
-            // Use LISTEN_PORT as target port for peer's listening service, not the ephemeral source port.
-            unsigned short targetPort = LISTEN_PORT;
+            // Use the configured port as the target port for the peer's listening service.
+            unsigned short targetPort = listenPort;
 
             int shouldConnect = 1;
             pthread_mutex_lock(&node->outboundLock);
@@ -410,7 +416,6 @@ void Node_Server_OnConnect(tcp_connection_t* client) {
             }
         }
     }
-#endif
 }
 
 void Node_Server_OnData(tcp_connection_t* client) {

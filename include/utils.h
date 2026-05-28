@@ -167,7 +167,7 @@ static inline bool GenerateTestMinerIdentity(uint8_t privateKey[32], uint8_t com
     return false;
 }
 
-static inline bool GenerateRandomTestAddress(uint8_t outAddress[32]) {
+static inline bool GenerateRandomTestAddress(uint8_t outAddress[32], uint8_t outPrivateKey[32], uint8_t outCompressedPubkey[33]) {
     if (!outAddress) {
         return false;
     }
@@ -200,11 +200,18 @@ static inline bool GenerateRandomTestAddress(uint8_t outAddress[32]) {
         }
 
         AddressFromCompressedPubkey(compressedPubkey, outAddress);
+        if (outPrivateKey) {
+            memcpy(outPrivateKey, privateKey, 32);
+        }
+        if (outCompressedPubkey) {
+            memcpy(outCompressedPubkey, compressedPubkey, 33);
+        }
         secp256k1_context_destroy(ctx);
         return true;
     }
 
     secp256k1_context_destroy(ctx);
+
     return false;
 }
 

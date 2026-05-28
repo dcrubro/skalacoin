@@ -38,6 +38,71 @@ void OrphanPool_Insert(block_t* block, uint64_t height) {
     (void)DynArr_push_back(g_orphans, &e);
 }
 
+static size_t OrphanPool_TryAdoptBranch(blockchain_t* chain, uint64_t forkHeight) {
+    if (!g_orphans || !chain) return 0;
+
+    DynArr* seq = DYNARR_CREATE(block_t*, 8);
+    if (!seq) return 0;
+
+    size_t cursor = forkHeight;
+    while (1) {
+        bool found = false;
+        size_t count = DynArr_size(g_orphans);
+        for (size_t i = 0; i < count; ++i) {
+            orphan_entry_t* entry = (orphan_entry_t*)DynArr_at(g_orphans, i);
+            if (!entry || !entry->block) continue;
+            if (entry->height == cursor) {
+                (void)DynArr_push_back(seq, &entry->block);
+                found = true;
+                break;
+            }
+        }
+        if (!found) break;
+        cursor++;
+    }
+
+    size_t seqCount = DynArr_size(seq);
+    if (seqCount == 0) {
+        DynArr_destroy(seq);
+        return 0;
+    }
+
+    size_t currentTipHeight = Chain_Size(chain) == 0 ? 0 : Chain_Size(chain) - 1;
+    size_t seqTopHeight = forkHeight + seqCount - 1;
+    if (seqTopHeight <= currentTipHeight) {
+        DynArr_destroy(seq);
+        return 0;
+    }
+
+    size_t rollbackHeight = (forkHeight == 0) ? 0 : (forkHeight - 1);
+    if (!Chain_RollbackToHeight(chain, rollbackHeight)) {
+        DynArr_destroy(seq);
+        return 0;
+    }
+
+    size_t attached = 0;
+    for (size_t i = 0; i < seqCount; ++i) {
+        block_t* bptr = *(block_t**)DynArr_at(seq, i);
+        if (!bptr || !Chain_AddBlock(chain, bptr)) {
+            break;
+        }
+
+        size_t count = DynArr_size(g_orphans);
+        for (size_t j = 0; j < count; ++j) {
+            orphan_entry_t* entry = (orphan_entry_t*)DynArr_at(g_orphans, j);
+            if (entry && entry->block == bptr) {
+                DynArr_remove(g_orphans, j);
+                break;
+            }
+        }
+
+        attached++;
+    }
+
+    DynArr_destroy(seq);
+    return attached;
+}
+
 size_t OrphanPool_AttemptAttach(blockchain_t* chain) {
     if (!g_orphans || !chain) return 0;
     size_t attached = 0;
@@ -67,6 +132,30 @@ size_t OrphanPool_AttemptAttach(blockchain_t* chain) {
             }
 
             if (parentExists) {
+                if (e->height < Chain_Size(chain)) {
+                    block_t* local = NULL;
+                    if (Chain_GetBlockCopy(chain, (size_t)e->height, &local) && local) {
+                        uint8_t localHash[32];
+                        uint8_t orphanHash[32];
+                        Block_CalculateHash(local, localHash);
+                        Block_CalculateHash(e->block, orphanHash);
+                        Block_Destroy(local);
+
+                        if (memcmp(localHash, orphanHash, 32) != 0) {
+                            size_t adopted = OrphanPool_TryAdoptBranch(chain, e->height);
+                            if (adopted > 0) {
+                                attached += adopted;
+                                madeProgress = true;
+                                n = DynArr_size(g_orphans);
+                                i = (size_t)-1;
+                                break;
+                            }
+                        }
+                    } else if (local) {
+                        Block_Destroy(local);
+                    }
+                }
+
                 // Verify that the parent's hash matches the orphan's prevHash before attaching.
                 bool parentMatches = false;
                 if (e->height == 0) {
@@ -84,65 +173,17 @@ size_t OrphanPool_AttemptAttach(blockchain_t* chain) {
                 }
 
                 if (!parentMatches) {
-                        // Parent exists but does not match this orphan's prevHash.
-                        // Attempt to detect a longer alternate chain in the orphan pool starting at this height.
-                        // Build a consecutive sequence of orphans from this height upward.
-                        DynArr* seq = DYNARR_CREATE(block_t*, 8);
-                        size_t h = e->height;
-                        while (1) {
-                            bool found = false;
-                            size_t gn = DynArr_size(g_orphans);
-                            for (size_t gi = 0; gi < gn; ++gi) {
-                                orphan_entry_t* oe = (orphan_entry_t*)DynArr_at(g_orphans, gi);
-                                if (!oe || !oe->block) continue;
-                                if (oe->height == h) {
-                                    (void)DynArr_push_back(seq, &oe->block);
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if (!found) break;
-                            h++;
-                        }
+                    // Parent exists but does not match this orphan's prevHash.
+                    size_t adopted = OrphanPool_TryAdoptBranch(chain, e->height);
+                    if (adopted > 0) {
+                        attached += adopted;
+                        madeProgress = true;
+                        n = DynArr_size(g_orphans);
+                        i = (size_t)-1;
+                        break;
+                    }
 
-                        size_t seqCount = DynArr_size(seq);
-                        if (seqCount > 0) {
-                            size_t seqTopHeight = e->height + seqCount - 1;
-                            if (seqTopHeight >= Chain_Size(chain)) {
-                                // Found a candidate longer branch. Perform rollback to fork height and attach sequence.
-                                if (Chain_RollbackToHeight(chain, (size_t)e->height)) {
-                                    // Attach in-order
-                                    for (size_t si = 0; si < seqCount; ++si) {
-                                        block_t* bptr = *(block_t**)DynArr_at(seq, si);
-                                        if (!Chain_AddBlock(chain, bptr)) {
-                                            // failed to add; stop attempting further
-                                            break;
-                                        }
-                                        // Remove the attached orphan from pool but keep the block object to preserve transactions in-memory (consistent with existing behavior)
-                                        // Find and remove corresponding orphan entry
-                                        size_t gn2 = DynArr_size(g_orphans);
-                                        for (size_t gi2 = 0; gi2 < gn2; ++gi2) {
-                                            orphan_entry_t* oe2 = (orphan_entry_t*)DynArr_at(g_orphans, gi2);
-                                            if (oe2 && oe2->block == bptr) {
-                                                DynArr_remove(g_orphans, gi2);
-                                                gn2 = DynArr_size(g_orphans);
-                                                gi2 = (size_t)-1; // restart search if needed
-                                            }
-                                        }
-                                    }
-                                    attached += seqCount;
-                                    madeProgress = true;
-                                    DynArr_destroy(seq);
-                                    // reset outer loop
-                                    n = DynArr_size(g_orphans);
-                                    i = (size_t)-1;
-                                    break;
-                                }
-                            }
-                        }
-                        DynArr_destroy(seq);
-                        // If we didn't perform a reorg/attach, skip for now.
-                        continue;
+                    continue;
                 }
 
                 // Try to add to chain
