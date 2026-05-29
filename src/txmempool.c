@@ -139,3 +139,21 @@ void TxMempool_Destroy() {
         g_txMempoolLockInitialized = false;
     }
 }
+
+bool TxMempool_Remove(const uint8_t* txHash) {
+    if (!txMempool || !txHash) { return false; }
+
+    pthread_mutex_lock(&g_txMempoolLock);
+    key32_t key;
+    memcpy(key.bytes, txHash, 32);
+
+    khiter_t k = kh_get(tx_mempool_map_m, txMempool, key);
+    if (k == kh_end(txMempool)) {
+        pthread_mutex_unlock(&g_txMempoolLock);
+        return false;
+    }
+
+    kh_del(tx_mempool_map_m, txMempool, k);
+    pthread_mutex_unlock(&g_txMempoolLock);
+    return true;
+}

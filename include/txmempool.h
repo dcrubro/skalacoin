@@ -15,6 +15,8 @@ int TxMempool_Insert(signed_transaction_t tx);
 bool TxMempool_Lookup(uint8_t* txHash, signed_transaction_t* out);
 bool TxMempool_Snapshot(signed_transaction_t** outTxs, size_t* outCount);
 void TxMempool_Print();
+// Remove a transaction from the mempool by its hash. Returns true if removed.
+bool TxMempool_Remove(const uint8_t* txHash);
 void TxMempool_Destroy();
 
 #endif

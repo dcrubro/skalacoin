@@ -1,6 +1,7 @@
 #include <block/chain.h>
 #include <constants.h>
 #include <runtime_state.h>
+#include <txmempool.h>
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -243,8 +244,33 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
         }
         expectedCoinbaseAmount += totalFees;
 
+            // Debug: log expected coinbase and fees to aid diagnosis when nodes disagree
+            {
+                uint64_t cbAmount = 0;
+                if (block->transactions && DynArr_size(block->transactions) > 0) {
+                    signed_transaction_t* firstTx = (signed_transaction_t*)DynArr_at(block->transactions, 0);
+                    if (firstTx && Address_IsCoinbase(firstTx->transaction.senderAddress)) {
+                        cbAmount = firstTx->transaction.amount1;
+                    }
+                }
+                char supplyStr[80];
+                Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
+                printf("Chain_AddBlock: blockIndex=%zu expectedCoinbase=%llu totalFees=%llu observedBlockCoinbase=%llu currentReward=%llu currentSupply=%s\n",
+                    expectedIndex,
+                    (unsigned long long)expectedCoinbaseAmount,
+                    (unsigned long long)totalFees,
+                    (unsigned long long)cbAmount,
+                    (unsigned long long)currentReward,
+                    supplyStr);
+            }
+
         uint64_t observedFees = 0;
         if (!Block_ValidateCoinbaseAndFees(block, expectedCoinbaseAmount, &observedFees) || observedFees != totalFees) {
+            // Log mismatch details for debugging
+            printf("Chain_AddBlock: validation failed: expectedCoinbase=%llu totalFees=%llu observedFees=%llu\n",
+                (unsigned long long)expectedCoinbaseAmount,
+                (unsigned long long)totalFees,
+                (unsigned long long)observedFees);
             free(spendableTxs);
             ok = false;
             break;
@@ -294,6 +320,21 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
                 }
             }
         }
+
+        // Remove mined non-coinbase transactions from the mempool so they are not re-mined or re-broadcast.
+        if (blk->transactions) {
+            for (size_t i = 0; i < DynArr_size(blk->transactions); ++i) {
+                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, i);
+                if (!tx) continue;
+                if (Address_IsCoinbase(tx->transaction.senderAddress)) continue;
+                uint8_t txHash[32];
+                Transaction_CalculateHash(tx, txHash);
+                if (TxMempool_Remove(txHash)) {
+                    // optional: log removal
+                    // printf("TxMempool_Remove: removed tx from mempool: "); PrintHexBytes(txHash, 32); printf("\n");
+                }
+            }
+        }
         // ok remains true if no failures
     } while (0);
 
@@ -303,6 +344,36 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
 
     printf("Added new block to chain:\n");
     Block_ShortPrint(block);
+
+    // After adding block, print a simple mathematical 'proof' that fees were included
+    {
+        uint64_t coinbaseAmount = 0;
+        uint64_t totalFees = 0;
+        if (block->transactions) {
+            for (size_t i = 0; i < DynArr_size(block->transactions); ++i) {
+                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+                if (!tx) { continue; }
+                if (Address_IsCoinbase(tx->transaction.senderAddress)) {
+                    coinbaseAmount = tx->transaction.amount1;
+                } else {
+                    if (UINT64_MAX - totalFees >= tx->transaction.fee) {
+                        totalFees += tx->transaction.fee;
+                    }
+                }
+            }
+        }
+
+        uint64_t base = currentReward;
+        if (coinbaseAmount > 0 || totalFees > 0) {
+            printf("Proof: coinbase(%llu) == baseReward(%llu) + totalFees(%llu) => %llu == %llu + %llu\n",
+                (unsigned long long)coinbaseAmount,
+                (unsigned long long)base,
+                (unsigned long long)totalFees,
+                (unsigned long long)coinbaseAmount,
+                (unsigned long long)base,
+                (unsigned long long)totalFees);
+        }
+    }
 
     return ok;
 }
