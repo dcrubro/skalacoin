@@ -28,6 +28,10 @@ void Chain_Wipe(blockchain_t* chain);
 // Returns true on success.
 bool Chain_RollbackToHeight(blockchain_t* chain, size_t height);
 
+// Recompute `currentSupply` and `currentReward` from the in-memory chain blocks.
+// Returns true on success and updates runtime state globals.
+bool Chain_RecomputeRuntimeState(blockchain_t* chain);
+
 // Retrieve a deep copy of the block at `index`. Caller must free with `Block_Destroy`.
 bool Chain_GetBlockCopy(blockchain_t* chain, size_t index, block_t** outCopy);
 

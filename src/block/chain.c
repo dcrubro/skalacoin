@@ -97,7 +97,7 @@ static bool DebitAddress(const uint8_t address[32], const uint256_t* amount) {
     return BalanceSheet_Insert(entry) >= 0;
 }
 
-static bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
+bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
     if (!chain) {
         return false;
     }

@@ -698,6 +698,11 @@ int main(int argc, char* argv[]) {
     uint8_t lastSavedHash[32] = {0};
     if (!Chain_LoadFromFile(chain, chainDataDir, &currentSupply, &difficultyTarget, &currentReward, lastSavedHash, false)) {
         printf("No existing chain loaded from %s\n", chainDataDir);
+    } else {
+        // Recompute runtime supply/reward from loaded blocks to avoid trusting stale meta values.
+        if (!Chain_RecomputeRuntimeState(chain)) {
+            fprintf(stderr, "Failed to recompute runtime state from loaded chain\n");
+        }
     }
 
     if (!BalanceSheet_LoadFromFile(chainDataDir)) {
