@@ -239,6 +239,7 @@ net_node_t* Node_Create() {
     pthread_mutex_init(&node->seenLock, NULL);
     pthread_mutex_init(&node->outboundLock, NULL);
     node->seenBlocks = DynSet_Create(32); // 32-byte canonical hashes
+    TxMempool_Init();
 
     TcpServer_Init(node->server, listenPort, "0.0.0.0");
 
@@ -284,6 +285,7 @@ void Node_Destroy(net_node_t* node) {
     }
 
     OrphanPool_Destroy();
+    TxMempool_Destroy();
 
     if (node->seenBlocks) {
         DynSet_Destroy(node->seenBlocks);
@@ -639,7 +641,7 @@ void Node_Server_OnData(tcp_connection_t* client) {
 
                 // Push to mempool if it's not already present
                 if (!TxMempool_Lookup(txHash, &tx)) {
-                    if (TxMempool_Insert(tx) > 0) {
+                    if (TxMempool_Insert(tx) >= 0) {
                         printf("Added transaction %s from node %u to mempool\n", txHashHex, client ? client->connectionId : 0U);
                         // Broadcast to other peers
                         net_node_t* node = Node_FromConnection(client);

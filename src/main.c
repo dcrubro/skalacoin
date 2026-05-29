@@ -858,7 +858,7 @@ int main(int argc, char* argv[]) {
             */
 
             // Insert into txmempool
-            if (!TxMempool_Insert(spendTx)) {
+            if (TxMempool_Insert(spendTx) < 0) {
                 printf("failed to add transaction to mempool, transaction rejected\n");
                 continue;
             }
