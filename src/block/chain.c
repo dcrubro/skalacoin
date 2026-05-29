@@ -345,35 +345,7 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
     printf("Added new block to chain:\n");
     Block_ShortPrint(block);
 
-    // After adding block, print a simple mathematical 'proof' that fees were included
-    {
-        uint64_t coinbaseAmount = 0;
-        uint64_t totalFees = 0;
-        if (block->transactions) {
-            for (size_t i = 0; i < DynArr_size(block->transactions); ++i) {
-                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
-                if (!tx) { continue; }
-                if (Address_IsCoinbase(tx->transaction.senderAddress)) {
-                    coinbaseAmount = tx->transaction.amount1;
-                } else {
-                    if (UINT64_MAX - totalFees >= tx->transaction.fee) {
-                        totalFees += tx->transaction.fee;
-                    }
-                }
-            }
-        }
-
-        uint64_t base = currentReward;
-        if (coinbaseAmount > 0 || totalFees > 0) {
-            printf("Proof: coinbase(%llu) == baseReward(%llu) + totalFees(%llu) => %llu == %llu + %llu\n",
-                (unsigned long long)coinbaseAmount,
-                (unsigned long long)base,
-                (unsigned long long)totalFees,
-                (unsigned long long)coinbaseAmount,
-                (unsigned long long)base,
-                (unsigned long long)totalFees);
-        }
-    }
+    /* Debug proof removed: coinbase == baseReward + totalFees was printed here during debugging. */
 
     return ok;
 }

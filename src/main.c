@@ -429,21 +429,7 @@ static bool MineAndAppendBlock(blockchain_t* chain,
         }
     }
 
-    // Print mathematical proof that fees are included in the coinbase payout for miner visibility.
-    {
-        uint64_t cb = 0;
-        uint64_t fees = 0;
-        if (Block_GetCoinbaseAndFeeTotals(block, &cb, &fees)) {
-            uint64_t base = *currentReward;
-            printf("Mined block proof: coinbase(%llu) == baseReward(%llu) + totalFees(%llu) => %llu == %llu + %llu\n",
-                (unsigned long long)cb,
-                (unsigned long long)base,
-                (unsigned long long)fees,
-                (unsigned long long)cb,
-                (unsigned long long)base,
-                (unsigned long long)fees);
-        }
-    }
+    /* Debug proof removed: miner printed proof that coinbase == baseReward + totalFees during debugging. */
 
     // After successfully appending a block, attempt to attach any orphans.
     size_t attached = OrphanPool_AttemptAttach(chain);
