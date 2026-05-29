@@ -11,6 +11,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <txmempool.h>
 
 static net_node_t* Node_FromConnection(tcp_connection_t* conn) {
     if (!conn) {
@@ -384,6 +385,32 @@ int Node_SendPacket(net_node_t* node, tcp_connection_t* conn, packet_type_t pack
     return rc;
 }
 
+int Node_BroadcastTransaction(net_node_t* node, signed_transaction_t* tx) {
+    if (!node || !tx) {
+        return -1;
+    }
+
+    // Serialize transaction into payload
+    size_t payloadLen = sizeof(signed_transaction_t);
+    unsigned char* payload = (unsigned char*)malloc(payloadLen);
+    if (!payload) {
+        return -1;
+    }
+    memcpy(payload, tx, sizeof(signed_transaction_t));
+
+    // Broadcast to all outbound peers
+    pthread_mutex_lock(&node->outboundLock);
+    for (size_t i = 0; i < MAX_CONS; ++i) {
+        if (node->outboundClients[i].connection) {
+            (void)Node_SendPacket(node, node->outboundClients[i].connection, PACKET_TYPE_BROADCAST_TX, payload, payloadLen);
+        }
+    }
+    pthread_mutex_unlock(&node->outboundLock);
+
+    free(payload);
+    return 0;
+}
+
 void Node_Server_OnConnect(tcp_connection_t* client) {
     net_node_t* node = Node_FromConnection(client);
     Node_ForwardConnect(node, client);
@@ -593,7 +620,48 @@ void Node_Server_OnData(tcp_connection_t* client) {
             break;
         }
         case PACKET_TYPE_ACK_BLOCK:
-        case PACKET_TYPE_BROADCAST_TX:
+        case PACKET_TYPE_BROADCAST_TX: {
+            // Decode the block or transaction data inside
+            if (payloadLen == sizeof(signed_transaction_t)) {
+                signed_transaction_t tx;
+                memcpy(&tx, payload, sizeof(tx));
+                uint8_t txHash[32];
+                char txHashHex[65];
+                Transaction_CalculateHash(&tx, txHash);
+                to_hex(txHash, txHashHex);
+                printf("Received packet type %u from node %u with transaction sending %llu pebble(s)\n",
+                    (unsigned int)packetType, client ? client->connectionId : 0U, (unsigned long long)tx.transaction.amount1);
+
+                if (!Transaction_Verify(&tx)) {
+                    printf("Received invalid transaction from node %u\n", client ? client->connectionId : 0U);
+                    return;
+                }
+
+                // Push to mempool if it's not already present
+                if (!TxMempool_Lookup(txHash, &tx)) {
+                    if (TxMempool_Insert(tx) > 0) {
+                        printf("Added transaction %s from node %u to mempool\n", txHashHex, client ? client->connectionId : 0U);
+                        // Broadcast to other peers
+                        net_node_t* node = Node_FromConnection(client);
+                        if (node) {
+                            Node_BroadcastTransaction(node, &tx);
+                        }
+                    } else {
+                        printf("Failed to add transaction %s from node %u to mempool\n", txHashHex, client ? client->connectionId : 0U);
+                    }
+                } else {
+                    printf("Transaction %s from node %u already seen!\n", txHashHex, client ? client->connectionId : 0U);
+                }
+
+            } else {
+                printf("Received packet type %u from node %u with invalid payload length %zu\n",
+                    (unsigned int)packetType, client ? client->connectionId : 0U, payloadLen);
+                
+                // TODO: Ignoring for now, might error node later if we want to be strict about malformed messages
+            }
+
+            break;
+        }
         case PACKET_TYPE_ACK_TX:
         case PACKET_TYPE_ERROR: {
             // Decode the message inside as text
@@ -765,7 +833,12 @@ void Node_Client_OnData(tcp_connection_t* client) {
             break;
         }
         case PACKET_TYPE_ACK_BLOCK:
-        case PACKET_TYPE_BROADCAST_TX:
+        case PACKET_TYPE_BROADCAST_TX: {
+            // Client can't receive these!
+            printf("Received unexpected packet type %u from node %u\n", (unsigned int)packetType, client ? client->connectionId : 0U);
+
+            break;
+        }
         case PACKET_TYPE_ACK_TX:
         case PACKET_TYPE_ERROR: {
             // Decode the message inside as text

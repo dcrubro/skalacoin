@@ -12,7 +12,7 @@
 #include <balance_sheet.h>
 #include <unistd.h>
 #include <errno.h>
-
+#include <txmempool.h>
 
 #include <constants.h>
 #include <runtime_state.h>
@@ -836,6 +836,7 @@ int main(int argc, char* argv[]) {
             memcpy(spendTx.transaction.compressedPublicKey, minerCompressedPubkey, sizeof(minerCompressedPubkey));
             Transaction_Sign(&spendTx, minerPrivateKey);
 
+            /*
             Block_AddTransaction(block, &spendTx);
             printf("Created transaction sending %llu pebble(s) to ", (unsigned long long)amount);
             char recipientHex[65];
@@ -854,6 +855,22 @@ int main(int argc, char* argv[]) {
                 Node_BroadcastChainRange(node, Chain_Size(chain) - 1, NULL);
             }
             printf("send committed in mined block\n");
+            */
+
+            // Insert into txmempool
+            if (!TxMempool_Insert(spendTx)) {
+                printf("failed to add transaction to mempool, transaction rejected\n");
+                continue;
+            }
+            
+            printf("transaction added to mempool, broadcasting...\n");
+
+            if (Node_BroadcastTransaction(node, &spendTx) == 0) {
+                printf("transaction broadcast to peers\n");
+            } else {
+                printf("failed to broadcast transaction to peers\n");
+            }
+
             continue;
         }
 
