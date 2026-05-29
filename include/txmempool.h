@@ -13,6 +13,7 @@ void TxMempool_Init();
 // Assumed that the transation was confirmed to be valid
 int TxMempool_Insert(signed_transaction_t tx);
 bool TxMempool_Lookup(uint8_t* txHash, signed_transaction_t* out);
+bool TxMempool_Snapshot(signed_transaction_t** outTxs, size_t* outCount);
 void TxMempool_Print();
 void TxMempool_Destroy();
 

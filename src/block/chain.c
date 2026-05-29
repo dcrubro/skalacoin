@@ -97,6 +97,37 @@ static bool DebitAddress(const uint8_t address[32], const uint256_t* amount) {
     return BalanceSheet_Insert(entry) >= 0;
 }
 
+static bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
+    if (!chain) {
+        return false;
+    }
+
+    uint256_t rebuiltSupply = uint256_from_u64(0);
+    for (size_t i = 0; i < chain->size; ++i) {
+        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
+        if (!blk || !blk->transactions) {
+            return false;
+        }
+
+        for (size_t j = 0; j < DynArr_size(blk->transactions); ++j) {
+            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, j);
+            if (!tx) {
+                return false;
+            }
+
+            if (Address_IsCoinbase(tx->transaction.senderAddress)) {
+                if (uint256_add_u64(&rebuiltSupply, tx->transaction.amount1)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    currentSupply = rebuiltSupply;
+    currentReward = CalculateBlockReward(currentSupply, chain);
+    return true;
+}
+
 static void Chain_ClearBlocks(blockchain_t* chain) {
     if (!chain || !chain->blocks) {
         return;
@@ -161,34 +192,65 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
     }
 
     do {
-        // First pass: ensure all non-coinbase senders can cover the full spend
-        // (amount1 + amount2 + fee) before mutating the chain or balance sheet.
         size_t txCount = DynArr_size(block->transactions);
+        signed_transaction_t* candidateTxs = (signed_transaction_t*)calloc(txCount, sizeof(signed_transaction_t));
+        if (!candidateTxs) {
+            ok = false;
+            break;
+        }
+
+        size_t nonCoinbaseCount = 0;
         for (size_t i = 0; i < txCount; ++i) {
             signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
             if (!tx) {
-                ok = false; break;
+                ok = false;
+                break;
             }
 
-            if (Address_IsCoinbase(tx->transaction.senderAddress)) {
-                continue;
-            }
-
-            uint256_t spend;
-            if (!BuildSpendAmount(tx, &spend)) { ok = false; break; }
-
-            balance_sheet_entry_t senderEntry;
-            if (!BalanceSheet_Lookup(tx->transaction.senderAddress, &senderEntry)) {
-                fprintf(stderr, "Error: Sender address not found in balance sheet during block addition. Bailing!\n");
-                ok = false; break;
-            }
-
-            if (uint256_cmp(&senderEntry.balance, &spend) < 0) {
-                fprintf(stderr, "Error: Sender balance insufficient for block transaction. Bailing!\n");
-                ok = false; break;
+            candidateTxs[i] = *tx;
+            if (!Address_IsCoinbase(tx->transaction.senderAddress)) {
+                ++nonCoinbaseCount;
             }
         }
-        if (!ok) break;
+
+        if (!ok) {
+            free(candidateTxs);
+            break;
+        }
+
+        signed_transaction_t* spendableTxs = NULL;
+        size_t spendableCount = 0;
+        uint64_t totalFees = 0;
+        if (!BalanceSheet_SelectSpendableTransactions(candidateTxs, txCount, &spendableTxs, &spendableCount, &totalFees)) {
+            free(candidateTxs);
+            ok = false;
+            break;
+        }
+
+        free(candidateTxs);
+
+        if (spendableCount != nonCoinbaseCount) {
+            free(spendableTxs);
+            ok = false;
+            break;
+        }
+
+        uint64_t expectedCoinbaseAmount = currentReward;
+        if (UINT64_MAX - expectedCoinbaseAmount < totalFees) {
+            free(spendableTxs);
+            ok = false;
+            break;
+        }
+        expectedCoinbaseAmount += totalFees;
+
+        uint64_t observedFees = 0;
+        if (!Block_ValidateCoinbaseAndFees(block, expectedCoinbaseAmount, &observedFees) || observedFees != totalFees) {
+            free(spendableTxs);
+            ok = false;
+            break;
+        }
+
+        free(spendableTxs);
 
         // Push the block only after validation succeeds.
         block_t* blk = (block_t*)DynArr_push_back(chain->blocks, block);
@@ -432,6 +494,12 @@ bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
             if (toProcess->transactions) DynArr_destroy(toProcess->transactions);
             free(toProcess);
         }
+    }
+
+    if (!Chain_RecomputeRuntimeState(chain)) {
+        pthread_mutex_unlock(&balanceSheetLock);
+        pthread_rwlock_unlock(&chainLock);
+        return false;
     }
 
     pthread_mutex_unlock(&balanceSheetLock);

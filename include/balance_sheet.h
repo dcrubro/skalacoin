@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <khash/khash.h>
 #include <crypto/crypto.h>
+#include <block/transaction.h>
 #include <string.h>
 #include <utils.h>
 #include <uint256.h>
@@ -28,5 +29,13 @@ bool BalanceSheet_SaveToFile(const char* outPath);
 bool BalanceSheet_LoadFromFile(const char* inPath); 
 void BalanceSheet_Print();
 void BalanceSheet_Destroy();
+
+bool BalanceSheet_SelectSpendableTransactions(
+    const signed_transaction_t* candidates,
+    size_t candidateCount,
+    signed_transaction_t** outAccepted,
+    size_t* outAcceptedCount,
+    uint64_t* outTotalFees
+);
 
 #endif

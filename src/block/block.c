@@ -214,21 +214,86 @@ bool Block_AllTransactionsValid(const block_t* block) {
 
     for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
         signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+        if (!Transaction_Verify(tx)) {
+            return false;
+        }
+
         if (tx && Address_IsCoinbase(tx->transaction.senderAddress)) {
             if (hasCoinbase) {
-                return false; // More than one coinbase transaction
+                return false;
             }
 
             hasCoinbase = true;
-            continue; // Coinbase transactions are valid since the miner has the right to create coins. Only rule is one per block.
-        }
-        
-        if (!Transaction_Verify(tx)) {
-            return false;
         }
     }
 
     return true && hasCoinbase && DynArr_size(block->transactions) > 0; // Every block must have at least one transaction (the coinbase)
+}
+
+bool Block_ValidateCoinbaseAndFees(const block_t* block, uint64_t expectedCoinbaseAmount, uint64_t* outTotalFees) {
+    if (!block || !block->transactions) {
+        return false;
+    }
+
+    bool hasCoinbase = false;
+    uint64_t totalFees = 0;
+    uint8_t zeroAddress[32] = {0};
+
+    for (size_t i = 0; i < DynArr_size(block->transactions); ++i) {
+        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+        if (!tx) {
+            return false;
+        }
+
+        if (Address_IsCoinbase(tx->transaction.senderAddress)) {
+            if (hasCoinbase) {
+                return false;
+            }
+
+            hasCoinbase = true;
+
+            if (!Transaction_Verify(tx)) {
+                return false;
+            }
+
+            if (tx->transaction.fee != 0 || tx->transaction.amount2 != 0) {
+                return false;
+            }
+
+            if (tx->transaction.amount1 != expectedCoinbaseAmount) {
+                return false;
+            }
+
+            if (Address_IsCoinbase(tx->transaction.recipientAddress1)) {
+                return false;
+            }
+
+            if (memcmp(tx->transaction.recipientAddress2, zeroAddress, sizeof(zeroAddress)) != 0) {
+                return false;
+            }
+
+            continue;
+        }
+
+        if (!Transaction_Verify(tx)) {
+            return false;
+        }
+
+        if (UINT64_MAX - totalFees < tx->transaction.fee) {
+            return false;
+        }
+        totalFees += tx->transaction.fee;
+    }
+
+    if (!hasCoinbase) {
+        return false;
+    }
+
+    if (outTotalFees) {
+        *outTotalFees = totalFees;
+    }
+
+    return true;
 }
 
 bool Block_IsFullyValid(const block_t* block) {

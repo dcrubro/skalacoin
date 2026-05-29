@@ -147,6 +147,63 @@ static void AddCoinbaseTransaction(block_t* block, const uint8_t minerAddress[32
     Block_AddTransaction(block, &coinbaseTx);
 }
 
+static int CompareTransactionPriority(const void* lhs, const void* rhs) {
+    const signed_transaction_t* left = (const signed_transaction_t*)lhs;
+    const signed_transaction_t* right = (const signed_transaction_t*)rhs;
+
+    if (left->transaction.fee > right->transaction.fee) {
+        return -1;
+    }
+    if (left->transaction.fee < right->transaction.fee) {
+        return 1;
+    }
+
+    uint8_t leftHash[32];
+    uint8_t rightHash[32];
+    Transaction_CalculateHash(left, leftHash);
+    Transaction_CalculateHash(right, rightHash);
+    return memcmp(leftHash, rightHash, sizeof(leftHash));
+}
+
+static bool BuildSpendableMempoolSelection(
+    signed_transaction_t** outAcceptedTxs,
+    size_t* outAcceptedCount,
+    uint64_t* outTotalFees
+) {
+    if (!outAcceptedTxs || !outAcceptedCount || !outTotalFees) {
+        return false;
+    }
+
+    *outAcceptedTxs = NULL;
+    *outAcceptedCount = 0;
+    *outTotalFees = 0;
+
+    signed_transaction_t* snapshot = NULL;
+    size_t snapshotCount = 0;
+    if (!TxMempool_Snapshot(&snapshot, &snapshotCount)) {
+        return false;
+    }
+
+    if (snapshot && snapshotCount > 1) {
+        qsort(snapshot, snapshotCount, sizeof(signed_transaction_t), CompareTransactionPriority);
+    }
+
+    signed_transaction_t* acceptedTxs = NULL;
+    size_t acceptedCount = 0;
+    uint64_t totalFees = 0;
+    bool ok = BalanceSheet_SelectSpendableTransactions(snapshot, snapshotCount, &acceptedTxs, &acceptedCount, &totalFees);
+    free(snapshot);
+    if (!ok) {
+        free(acceptedTxs);
+        return false;
+    }
+
+    *outAcceptedTxs = acceptedTxs;
+    *outAcceptedCount = acceptedCount;
+    *outTotalFees = totalFees;
+    return true;
+}
+
 static void PrintBlockDetail(const block_t* block, size_t txCount, const uint8_t canonicalHash[32], const uint8_t powHash[32]) {
     if (!block) {
         return;
@@ -301,6 +358,46 @@ static bool ComputeHistoricalAutolykosHashFromDisk(const char* chainDataDir, uin
     return ok;
 }
 
+static bool Block_GetCoinbaseAndFeeTotals(const block_t* block, uint64_t* outCoinbaseAmount, uint64_t* outTotalFees) {
+    if (!block || !block->transactions || !outCoinbaseAmount || !outTotalFees) {
+        return false;
+    }
+
+    bool hasCoinbase = false;
+    uint64_t coinbaseAmount = 0;
+    uint64_t totalFees = 0;
+
+    for (size_t i = 0; i < DynArr_size(block->transactions); ++i) {
+        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+        if (!tx) {
+            return false;
+        }
+
+        if (Address_IsCoinbase(tx->transaction.senderAddress)) {
+            if (hasCoinbase) {
+                return false;
+            }
+
+            hasCoinbase = true;
+            coinbaseAmount = tx->transaction.amount1;
+            continue;
+        }
+
+        if (UINT64_MAX - totalFees < tx->transaction.fee) {
+            return false;
+        }
+        totalFees += tx->transaction.fee;
+    }
+
+    if (!hasCoinbase) {
+        return false;
+    }
+
+    *outCoinbaseAmount = coinbaseAmount;
+    *outTotalFees = totalFees;
+    return true;
+}
+
 static bool MineAndAppendBlock(blockchain_t* chain,
                                block_t* block,
                                uint256_t* currentSupply,
@@ -404,6 +501,7 @@ static bool VerifyChainFully(blockchain_t* chain) {
     blockchain_t* prevChain = Chain_Create();
     if (!prevChain) { return false; }
 
+    uint256_t replaySupply = uint256_from_u64(0);
     uint32_t expectedDifficulty = INITIAL_DIFFICULTY;
     for (size_t i = 0; i < chainSize; ++i) {
         block_t* blk = NULL;
@@ -480,7 +578,26 @@ static bool VerifyChainFully(blockchain_t* chain) {
             return false;
         }
 
+        uint64_t expectedReward = 0;
+        uint64_t savedReward = currentReward;
+        expectedReward = CalculateBlockReward(replaySupply, prevChain);
+        currentReward = savedReward;
+
         if (!Block_AllTransactionsValid(blk)) {
+            Block_Destroy(blk);
+            Chain_Destroy(prevChain);
+            return false;
+        }
+
+        uint64_t coinbaseAmount = 0;
+        uint64_t totalFees = 0;
+        if (!Block_GetCoinbaseAndFeeTotals(blk, &coinbaseAmount, &totalFees)) {
+            Block_Destroy(blk);
+            Chain_Destroy(prevChain);
+            return false;
+        }
+
+        if (UINT64_MAX - expectedReward < totalFees || coinbaseAmount != (expectedReward + totalFees)) {
             Block_Destroy(blk);
             Chain_Destroy(prevChain);
             return false;
@@ -507,6 +624,8 @@ static bool VerifyChainFully(blockchain_t* chain) {
         headerOnly.header = blk->header;
         headerOnly.transactions = NULL;
         (void)DynArr_push_back(prevChain->blocks, &headerOnly);
+
+        (void)uint256_add_u64(&replaySupply, coinbaseAmount);
 
         Block_Destroy(blk);
     }
@@ -746,14 +865,38 @@ int main(int argc, char* argv[]) {
             printf("Mining %llu block(s)...\n", requested);
             bool minedAll = true;
             for (unsigned long long i = 0; i < requested; ++i) {
-                block_t* block = BuildNextBlock(chain, difficultyTarget);
-                if (!block) {
-                    fprintf(stderr, "failed to create block\n");
+                signed_transaction_t* acceptedTxs = NULL;
+                size_t acceptedTxCount = 0;
+                uint64_t totalFees = 0;
+                if (!BuildSpendableMempoolSelection(&acceptedTxs, &acceptedTxCount, &totalFees)) {
+                    fprintf(stderr, "failed to select spendable transactions from mempool\n");
                     minedAll = false;
                     break;
                 }
 
-                AddCoinbaseTransaction(block, minerAddress, currentReward);
+                block_t* block = BuildNextBlock(chain, difficultyTarget);
+                if (!block) {
+                    fprintf(stderr, "failed to create block\n");
+                    free(acceptedTxs);
+                    minedAll = false;
+                    break;
+                }
+
+                uint64_t coinbaseAmount = currentReward;
+                if (UINT64_MAX - coinbaseAmount < totalFees) {
+                    free(acceptedTxs);
+                    Block_Destroy(block);
+                    minedAll = false;
+                    break;
+                }
+                coinbaseAmount += totalFees;
+
+                AddCoinbaseTransaction(block, minerAddress, coinbaseAmount);
+
+                for (size_t txIndex = 0; txIndex < acceptedTxCount; ++txIndex) {
+                    Block_AddTransaction(block, &acceptedTxs[txIndex]);
+                }
+                free(acceptedTxs);
 
                 if (!MineAndAppendBlock(chain, block, &currentSupply, &currentReward, &difficultyTarget)) {
                     Block_Destroy(block);
@@ -822,7 +965,8 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            AddCoinbaseTransaction(block, minerAddress, currentReward);
+            uint64_t coinbaseAmount = currentReward;
+            AddCoinbaseTransaction(block, minerAddress, coinbaseAmount);
 
             signed_transaction_t spendTx;
             Transaction_Init(&spendTx);
@@ -865,7 +1009,7 @@ int main(int argc, char* argv[]) {
             
             printf("transaction added to mempool, broadcasting...\n");
 
-            if (Node_BroadcastTransaction(node, &spendTx) == 0) {
+            if (Node_BroadcastTransaction(node, &spendTx, NULL) == 0) {
                 printf("transaction broadcast to peers\n");
             } else {
                 printf("failed to broadcast transaction to peers\n");
@@ -1029,6 +1173,11 @@ int main(int argc, char* argv[]) {
                                     printf("Failed to rollback to height %zu during reorg handling\n", rollbackTo);
                                     inFlight = 0; // abort sync
                                     break;
+                                }
+
+                                size_t reattached = OrphanPool_AttemptAttach(chain);
+                                if (reattached > 0) {
+                                    printf("Reorg rollback attached %zu orphan(s)\n", reattached);
                                 }
 
                                 // Apply additional penalty by shrinking end and restart window from current Chain_Size

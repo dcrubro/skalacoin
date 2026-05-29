@@ -57,7 +57,7 @@ int Node_ConnectPeer(net_node_t* node, const char* ip, unsigned short port);
 int Node_ConnectStartupPeers(net_node_t* node, const char** ips, const unsigned short* ports, size_t peersCount);
 
 int Node_SendPacket(net_node_t* node, tcp_connection_t* conn, packet_type_t packetType, const void* payload, size_t payloadLen);
-int Node_BroadcastTransaction(net_node_t* node, signed_transaction_t* tx);
+int Node_BroadcastTransaction(net_node_t* node, signed_transaction_t* tx, tcp_connection_t* excludeNode);
 
 // Helpers for outbound peer selection and block broadcast
 int Node_GetBestOutboundPeer(net_node_t* node, tcp_connection_t** outConn, uint64_t* outHeight);

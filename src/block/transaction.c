@@ -42,7 +42,23 @@ bool Transaction_Verify(const signed_transaction_t* tx) {
     }
 
     if (Address_IsCoinbase(tx->transaction.senderAddress)) {
-        // Coinbase transactions are valid if the signature is correct for the block (handled in Block_Verify)
+        if (tx->transaction.amount1 == 0) {
+            return false;
+        }
+
+        if (tx->transaction.amount2 != 0) {
+            return false;
+        }
+
+        if (Address_IsCoinbase(tx->transaction.recipientAddress1) || Address_IsCoinbase(tx->transaction.recipientAddress2)) {
+            return false;
+        }
+
+        uint8_t zeroAddress[32] = {0};
+        if (memcmp(tx->transaction.recipientAddress2, zeroAddress, 32) != 0) {
+            return false;
+        }
+
         return true;
     }
 

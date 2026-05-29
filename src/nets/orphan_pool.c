@@ -197,13 +197,8 @@ size_t OrphanPool_AttemptAttach(blockchain_t* chain) {
                     i = (size_t)-1; // reset outer loop
                     break;
                 } else {
-                    // Chain_AddBlock rejected it (maybe invalid). Drop it.
-                    Block_Destroy(e->block);
-                    DynArr_remove(g_orphans, i);
-                    n = DynArr_size(g_orphans);
-                    i = (size_t)-1;
-                    madeProgress = true;
-                    break;
+                    // Keep the orphan around; rejection may be temporary while the local tip is being reorged.
+                    continue;
                 }
             }
         }

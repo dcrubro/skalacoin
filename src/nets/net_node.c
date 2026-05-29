@@ -177,6 +177,20 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         return NODE_BLOCK_REJECTED;
     }
 
+    uint64_t coinbaseAmount = 0;
+    if (blk->transactions) {
+        for (size_t i = 0; i < DynArr_size(blk->transactions); ++i) {
+            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, i);
+            if (tx && Address_IsCoinbase(tx->transaction.senderAddress)) {
+                coinbaseAmount = tx->transaction.amount1;
+                break;
+            }
+        }
+    }
+
+    (void)uint256_add_u64(&currentSupply, coinbaseAmount);
+    currentReward = CalculateBlockReward(currentSupply, currentChain);
+
     // Persist on accept if requested
     if (persist) {
         Chain_SaveToFile(currentChain, chainDataDir, currentSupply, currentReward);
@@ -387,7 +401,7 @@ int Node_SendPacket(net_node_t* node, tcp_connection_t* conn, packet_type_t pack
     return rc;
 }
 
-int Node_BroadcastTransaction(net_node_t* node, signed_transaction_t* tx) {
+int Node_BroadcastTransaction(net_node_t* node, signed_transaction_t* tx, tcp_connection_t* excludeNode) {
     if (!node || !tx) {
         return -1;
     }
@@ -403,8 +417,9 @@ int Node_BroadcastTransaction(net_node_t* node, signed_transaction_t* tx) {
     // Broadcast to all outbound peers
     pthread_mutex_lock(&node->outboundLock);
     for (size_t i = 0; i < MAX_CONS; ++i) {
-        if (node->outboundClients[i].connection) {
-            (void)Node_SendPacket(node, node->outboundClients[i].connection, PACKET_TYPE_BROADCAST_TX, payload, payloadLen);
+        tcp_connection_t* connection = node->outboundClients[i].connection;
+        if (connection && connection != excludeNode) {
+            (void)Node_SendPacket(node, connection, PACKET_TYPE_BROADCAST_TX, payload, payloadLen);
         }
     }
     pthread_mutex_unlock(&node->outboundLock);
@@ -646,7 +661,7 @@ void Node_Server_OnData(tcp_connection_t* client) {
                         // Broadcast to other peers
                         net_node_t* node = Node_FromConnection(client);
                         if (node) {
-                            Node_BroadcastTransaction(node, &tx);
+                            Node_BroadcastTransaction(node, &tx, client);
                         }
                     } else {
                         printf("Failed to add transaction %s from node %u to mempool\n", txHashHex, client ? client->connectionId : 0U);

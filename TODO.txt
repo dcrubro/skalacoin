@@ -17,6 +17,11 @@ A loophole in the reorg penalty system could potentially exist where someone bro
 TO TEST:
 Implement Horizen's "Reorg Penalty" system to make it harder for the young chain to be attacked by a powerful miner.
 
+NOTE:
+Because tx sizes are currently fixed, mining can use raw fee ordering for now. If tx sizes ever become dynamic, revisit selection to consider fee/byte instead.
+
+Mempool snapshotting for mining should hold the lock only long enough to copy pending txs, but if the mempool grows very large that copy may still be non-trivial.
+
 DONE:
 I want to move away from the Monero emission. I want to do something a bit radical for cryptocurrency, but I feel like it's necessary to make it more like money:
 a constant inflation rate of 1.5% per year. It's lower than fiat (USD is ~2.8% per year), and it additionally doesn't fluctuate during crisis. It's constant.

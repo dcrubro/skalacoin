@@ -36,6 +36,7 @@ void Block_AddTransaction(block_t* block, signed_transaction_t* tx);
 void Block_RemoveTransaction(block_t* block, uint8_t* txHash);
 bool Block_HasValidProofOfWork(const block_t* block);
 bool Block_AllTransactionsValid(const block_t* block);
+bool Block_ValidateCoinbaseAndFees(const block_t* block, uint64_t expectedCoinbaseAmount, uint64_t* outTotalFees);
 bool Block_IsFullyValid(const block_t* block);
 void Block_ShutdownPowContext(void);
 void Block_Destroy(block_t* block);
