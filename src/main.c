@@ -832,7 +832,7 @@ int main(int argc, char* argv[]) {
     char supplyStr[80];
     Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
     printf("Current chain has %zu blocks, total supply %s\n", Chain_Size(chain), supplyStr);
-    printf("Commands: mine <x>, send <address> <amount>, balance [address], connect <ipv4>, sync (requires nodes), flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
+    printf("Commands: mine <x>, send <address> <amount> [fee], balance [address], connect <ipv4>, sync (requires nodes), flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
 
     char line[1024];
     while (true) {
@@ -934,6 +934,7 @@ int main(int argc, char* argv[]) {
         if (strcmp(cmd, "send") == 0) {
             char* addressStr = strtok(NULL, " \t");
             char* amountStr = strtok(NULL, " \t");
+            char* feeStr = strtok(NULL, " \t");
             if (!addressStr || !amountStr) {
                 printf("usage: send <address> <amount>\n");
                 continue;
@@ -949,6 +950,21 @@ int main(int argc, char* argv[]) {
             unsigned long long amount = strtoull(amountStr, &endptr, 10);
             if (*amountStr == '\0' || amountStr[0] == '-' || (endptr && *endptr != '\0') || amount == 0) {
                 printf("invalid amount\n");
+                continue;
+            }
+
+            unsigned long long fee = 0;
+            if (feeStr) {
+                char* endptr2 = NULL;
+                fee = strtoull(feeStr, &endptr2, 10);
+                if (*feeStr == '\0' || feeStr[0] == '-' || (endptr2 && *endptr2 != '\0')) {
+                    printf("invalid fee\n");
+                    continue;
+                }
+            }
+
+            if (fee > UINT64_MAX - amount) {
+                printf("invalid fee: overflow\n");
                 continue;
             }
 
@@ -976,7 +992,7 @@ int main(int argc, char* argv[]) {
             signed_transaction_t spendTx;
             Transaction_Init(&spendTx);
             spendTx.transaction.version = 1;
-            spendTx.transaction.fee = 0;
+            spendTx.transaction.fee = (uint64_t)fee;
             spendTx.transaction.amount1 = (uint64_t)amount;
             spendTx.transaction.amount2 = 0;
             memcpy(spendTx.transaction.senderAddress, minerAddress, sizeof(minerAddress));
