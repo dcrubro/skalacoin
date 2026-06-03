@@ -14,6 +14,9 @@ Check if Block FullVerify is actually verifying fully (not missing any condition
 
 A loophole in the reorg penalty system could potentially exist where someone broadcasts blocks one-at-a-time. Determine a solution to this.
 
+IPv6 support for the P2P node. Come on guys, it's 2026. RFC 2460 was in 1998. It's about time.
+    Like if someone is behind NAT, fine, workable. CGNAT? Lmao good luck.
+
 TO TEST:
 Implement Horizen's "Reorg Penalty" system to make it harder for the young chain to be attacked by a powerful miner.
 

@@ -11,7 +11,12 @@
 typedef struct {
     int sockFd;
     struct sockaddr_in addr;
+#ifdef USE_IPV6
+    int sockFd6; // IPv6 support
+    struct sockaddr_in6 addr6; // IPv6 support
+#endif
     int opt;
+    int opt6; // IPv6 support
     int isRunning;
     void* owner;
 

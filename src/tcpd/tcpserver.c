@@ -172,6 +172,9 @@ tcp_server_t* TcpServer_Create() {
     svr->isRunning = 0;
     svr->maxClients = 0;
     svr->clientsArrPtr = NULL;
+#ifdef USE_IPV6
+    svr->sockFd6 = -1;
+#endif
 
     if (pthread_mutex_init(&svr->clientsMutex, NULL) != 0) {
         free(svr);
@@ -217,6 +220,28 @@ void TcpServer_Init(tcp_server_t* ptr, unsigned short port, const char* addr) {
         close(ptr->sockFd);
         ptr->sockFd = -1;
     }
+
+#ifdef USE_IPV6
+    // IPv6 support
+    ptr->sockFd6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (ptr->sockFd6 >= 0) {
+        ptr->opt6 = 1;
+        setsockopt(ptr->sockFd6, SOL_SOCKET, SO_REUSEADDR, &ptr->opt6, sizeof(int));
+        memset(&ptr->addr6, 0, sizeof(ptr->addr6));
+        ptr->addr6.sin6_family = AF_INET6;
+        ptr->addr6.sin6_port = htons(port);
+        inet_pton(AF_INET6, addr, &ptr->addr6.sin6_addr);
+        if (bind(ptr->sockFd6, (struct sockaddr*)&ptr->addr6, sizeof(ptr->addr6)) < 0) {
+            close(ptr->sockFd6);
+            ptr->sockFd6 = -1;
+        }
+    } else {
+        ptr->sockFd6 = -1; // IPv6 is optional, so if it isn't available, we just set it to -1
+    }
+#else
+    // Safety for my future "I forgot the ifdef guard" self
+    ptr->sockFd6 = -1; // IPv6 not supported in this build
+#endif
 }
 
 void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
@@ -227,6 +252,15 @@ void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
     if (listen(ptr->sockFd, maxcons) < 0) {
         return;
     }
+
+#ifdef USE_IPV6
+    if (ptr->sockFd6 >= 0) {
+        if (listen(ptr->sockFd6, maxcons) < 0) {
+            close(ptr->sockFd6);
+            ptr->sockFd6 = -1;
+        }
+    }
+#endif
 
     pthread_mutex_lock(&ptr->clientsMutex);
 
@@ -267,6 +301,14 @@ void TcpServer_Stop(tcp_server_t* ptr) {
         close(ptr->sockFd);
         ptr->sockFd = -1;
     }
+
+#ifdef USE_IPV6
+    if (ptr->sockFd6 >= 0) {
+        shutdown(ptr->sockFd6, SHUT_RDWR);
+        close(ptr->sockFd6);
+        ptr->sockFd6 = -1;
+    }
+#endif
 
     if (ptr->svrThread != 0 && !pthread_equal(ptr->svrThread, pthread_self())) {
         pthread_join(ptr->svrThread, NULL);
@@ -338,6 +380,12 @@ void TcpServer_KillClient(tcp_server_t* ptr, tcp_connection_t* cli) {
     so_linger.l_onoff = 1;
     so_linger.l_linger = 0;
     setsockopt(cli->sockFd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
+
+#ifdef USE_IPV6
+    if (cli->sockFd6 >= 0) {
+        setsockopt(cli->sockFd6, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
+    }
+#endif
 
     TcpServer_Disconnect(ptr, cli);
 }

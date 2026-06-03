@@ -214,10 +214,26 @@ int TcpConnection_SendFramed(tcp_connection_t* conn, const void* payload, size_t
 
     pthread_mutex_lock(&conn->sendLock);
 
+#ifdef USE_IPV6
+    int sock;
+    if (conn->sockFd6 >= 0) {
+        // IPv6 is available, attempt to send on it. If it fails, we'll fall back to IPv4 if available.
+        sock = conn->sockFd6;
+    } else {
+        // IPv4 fallback
+        sock = conn->sockFd;
+    }
+
+    int rc = TcpConnection_SendRaw(sock, &beLen, sizeof(beLen));
+    if (rc == 0 && payloadLen > 0) {
+        rc = TcpConnection_SendRaw(sock, payload, payloadLen);
+    }
+#else
     int rc = TcpConnection_SendRaw(conn->sockFd, &beLen, sizeof(beLen));
     if (rc == 0 && payloadLen > 0) {
         rc = TcpConnection_SendRaw(conn->sockFd, payload, payloadLen);
     }
+#endif
 
     pthread_mutex_unlock(&conn->sendLock);
 
@@ -235,6 +251,11 @@ void TcpConnection_RequestClose(tcp_connection_t* conn) {
         if (conn->sockFd >= 0) {
             shutdown(conn->sockFd, SHUT_RDWR);
         }
+#ifdef USE_IPV6
+        if (conn->sockFd6 >= 0) {
+            shutdown(conn->sockFd6, SHUT_RDWR);
+        }
+#endif
     }
     pthread_mutex_unlock(&conn->stateLock);
 }
