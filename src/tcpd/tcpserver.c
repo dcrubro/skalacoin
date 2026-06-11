@@ -3,12 +3,18 @@
 #include <tcpd/tcpserver.h>
 
 #include <errno.h>
+#include <netinet/in.h>
 #include <numgen.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+typedef struct {
+    tcp_server_t* serverPtr;
+    int listenFd;
+} tcpaccept_thread_args_t;
 
 static void TcpServer_RemoveClientByPtrUnlocked(tcp_server_t* svr, tcp_connection_t* cli) {
     if (!svr || !svr->clientsArrPtr || !cli) {
@@ -70,15 +76,20 @@ static void* TcpServer_clientthreadprocess(void* ptr) {
 }
 
 static void* TcpServer_threadprocess(void* ptr) {
-    tcp_server_t* svr = (tcp_server_t*)ptr;
-    if (!svr) {
+    tcpaccept_thread_args_t* args = (tcpaccept_thread_args_t*)ptr;
+    if (!args || !args->serverPtr) {
+        free(args);
         return NULL;
     }
 
+    tcp_server_t* svr = args->serverPtr;
+    int listenFd = args->listenFd;
+    free(args);
+
     while (svr->isRunning) {
-        struct sockaddr_in clientAddr;
+        struct sockaddr_storage clientAddr;
         socklen_t clientSize = sizeof(clientAddr);
-        int clientFd = accept(svr->sockFd, (struct sockaddr*)&clientAddr, &clientSize);
+        int clientFd = accept(listenFd, (struct sockaddr*)&clientAddr, &clientSize);
 
         if (clientFd < 0) {
             if (!svr->isRunning) {
@@ -168,13 +179,12 @@ tcp_server_t* TcpServer_Create() {
 
     memset(svr, 0, sizeof(*svr));
     svr->sockFd = -1;
+    svr->sockFdV4 = -1;
     svr->svrThread = 0;
+    svr->svrThreadV4 = 0;
     svr->isRunning = 0;
     svr->maxClients = 0;
     svr->clientsArrPtr = NULL;
-#ifdef USE_IPV6
-    svr->sockFd6 = -1;
-#endif
 
     if (pthread_mutex_init(&svr->clientsMutex, NULL) != 0) {
         free(svr);
@@ -203,64 +213,67 @@ void TcpServer_Init(tcp_server_t* ptr, unsigned short port, const char* addr) {
         return;
     }
 
-    ptr->sockFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (ptr->sockFd < 0) {
+    ptr->opt = 1;
+
+    // IPv6 (pure, not dual-stack — a dedicated IPv4 socket handles IPv4 clients)
+    int fd6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd6 >= 0) {
+        setsockopt(fd6, SOL_SOCKET, SO_REUSEADDR, &ptr->opt, sizeof(ptr->opt));
+        int v6only = 1;
+        setsockopt(fd6, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+
+        struct sockaddr_in6 a6;
+        memset(&a6, 0, sizeof(a6));
+        a6.sin6_family = AF_INET6;
+        a6.sin6_port = htons(port);
+        a6.sin6_addr = in6addr_any;
+
+        if (bind(fd6, (struct sockaddr*)&a6, sizeof(a6)) == 0) {
+            ptr->sockFd = fd6;
+        } else {
+            close(fd6);
+        }
+    }
+
+    // IPv4 (always attempted regardless of IPv6 result)
+    int fd4 = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd4 >= 0) {
+        setsockopt(fd4, SOL_SOCKET, SO_REUSEADDR, &ptr->opt, sizeof(ptr->opt));
+
+        struct sockaddr_in a4;
+        memset(&a4, 0, sizeof(a4));
+        a4.sin_family = AF_INET;
+        a4.sin_port = htons(port);
+        if (inet_pton(AF_INET, addr, &a4.sin_addr) <= 0) {
+            a4.sin_addr.s_addr = INADDR_ANY;
+        }
+
+        if (bind(fd4, (struct sockaddr*)&a4, sizeof(a4)) == 0) {
+            ptr->sockFdV4 = fd4;
+        } else {
+            close(fd4);
+        }
+    }
+}
+
+void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
+    if (!ptr || (ptr->sockFd < 0 && ptr->sockFdV4 < 0) || maxcons <= 0 || ptr->isRunning) {
         return;
     }
 
-    ptr->opt = 1;
-    setsockopt(ptr->sockFd, SOL_SOCKET, SO_REUSEADDR, &ptr->opt, sizeof(int));
-
-    memset(&ptr->addr, 0, sizeof(ptr->addr));
-    ptr->addr.sin_family = AF_INET;
-    ptr->addr.sin_port = htons(port);
-    inet_pton(AF_INET, addr, &ptr->addr.sin_addr);
-
-    if (bind(ptr->sockFd, (struct sockaddr*)&ptr->addr, sizeof(ptr->addr)) < 0) {
+    if (ptr->sockFd >= 0 && listen(ptr->sockFd, maxcons) < 0) {
         close(ptr->sockFd);
         ptr->sockFd = -1;
     }
 
-#ifdef USE_IPV6
-    // IPv6 support
-    ptr->sockFd6 = socket(AF_INET6, SOCK_STREAM, 0);
-    if (ptr->sockFd6 >= 0) {
-        ptr->opt6 = 1;
-        setsockopt(ptr->sockFd6, SOL_SOCKET, SO_REUSEADDR, &ptr->opt6, sizeof(int));
-        memset(&ptr->addr6, 0, sizeof(ptr->addr6));
-        ptr->addr6.sin6_family = AF_INET6;
-        ptr->addr6.sin6_port = htons(port);
-        inet_pton(AF_INET6, addr, &ptr->addr6.sin6_addr);
-        if (bind(ptr->sockFd6, (struct sockaddr*)&ptr->addr6, sizeof(ptr->addr6)) < 0) {
-            close(ptr->sockFd6);
-            ptr->sockFd6 = -1;
-        }
-    } else {
-        ptr->sockFd6 = -1; // IPv6 is optional, so if it isn't available, we just set it to -1
+    if (ptr->sockFdV4 >= 0 && listen(ptr->sockFdV4, maxcons) < 0) {
+        close(ptr->sockFdV4);
+        ptr->sockFdV4 = -1;
     }
-#else
-    // Safety for my future "I forgot the ifdef guard" self
-    ptr->sockFd6 = -1; // IPv6 not supported in this build
-#endif
-}
 
-void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
-    if (!ptr || ptr->sockFd < 0 || maxcons <= 0 || ptr->isRunning) {
+    if (ptr->sockFd < 0 && ptr->sockFdV4 < 0) {
         return;
     }
-
-    if (listen(ptr->sockFd, maxcons) < 0) {
-        return;
-    }
-
-#ifdef USE_IPV6
-    if (ptr->sockFd6 >= 0) {
-        if (listen(ptr->sockFd6, maxcons) < 0) {
-            close(ptr->sockFd6);
-            ptr->sockFd6 = -1;
-        }
-    }
-#endif
 
     pthread_mutex_lock(&ptr->clientsMutex);
 
@@ -279,7 +292,35 @@ void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
     ptr->isRunning = 1;
     pthread_mutex_unlock(&ptr->clientsMutex);
 
-    if (pthread_create(&ptr->svrThread, NULL, TcpServer_threadprocess, ptr) != 0) {
+    int anyThreadStarted = 0;
+
+    if (ptr->sockFd >= 0) {
+        tcpaccept_thread_args_t* args = (tcpaccept_thread_args_t*)malloc(sizeof(*args));
+        if (args) {
+            args->serverPtr = ptr;
+            args->listenFd = ptr->sockFd;
+            if (pthread_create(&ptr->svrThread, NULL, TcpServer_threadprocess, args) == 0) {
+                anyThreadStarted = 1;
+            } else {
+                free(args);
+            }
+        }
+    }
+
+    if (ptr->sockFdV4 >= 0) {
+        tcpaccept_thread_args_t* args = (tcpaccept_thread_args_t*)malloc(sizeof(*args));
+        if (args) {
+            args->serverPtr = ptr;
+            args->listenFd = ptr->sockFdV4;
+            if (pthread_create(&ptr->svrThreadV4, NULL, TcpServer_threadprocess, args) == 0) {
+                anyThreadStarted = 1;
+            } else {
+                free(args);
+            }
+        }
+    }
+
+    if (!anyThreadStarted) {
         pthread_mutex_lock(&ptr->clientsMutex);
         ptr->isRunning = 0;
         free(ptr->clientsArrPtr);
@@ -302,18 +343,21 @@ void TcpServer_Stop(tcp_server_t* ptr) {
         ptr->sockFd = -1;
     }
 
-#ifdef USE_IPV6
-    if (ptr->sockFd6 >= 0) {
-        shutdown(ptr->sockFd6, SHUT_RDWR);
-        close(ptr->sockFd6);
-        ptr->sockFd6 = -1;
+    if (ptr->sockFdV4 >= 0) {
+        shutdown(ptr->sockFdV4, SHUT_RDWR);
+        close(ptr->sockFdV4);
+        ptr->sockFdV4 = -1;
     }
-#endif
 
     if (ptr->svrThread != 0 && !pthread_equal(ptr->svrThread, pthread_self())) {
         pthread_join(ptr->svrThread, NULL);
     }
     ptr->svrThread = 0;
+
+    if (ptr->svrThreadV4 != 0 && !pthread_equal(ptr->svrThreadV4, pthread_self())) {
+        pthread_join(ptr->svrThreadV4, NULL);
+    }
+    ptr->svrThreadV4 = 0;
 
     pthread_mutex_lock(&ptr->clientsMutex);
     size_t maxClients = ptr->maxClients;
@@ -380,12 +424,6 @@ void TcpServer_KillClient(tcp_server_t* ptr, tcp_connection_t* cli) {
     so_linger.l_onoff = 1;
     so_linger.l_linger = 0;
     setsockopt(cli->sockFd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
-
-#ifdef USE_IPV6
-    if (cli->sockFd6 >= 0) {
-        setsockopt(cli->sockFd6, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
-    }
-#endif
 
     TcpServer_Disconnect(ptr, cli);
 }

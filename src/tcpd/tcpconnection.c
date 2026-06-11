@@ -9,7 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-int TcpConnection_Init(tcp_connection_t* conn, int sockFd, const struct sockaddr_in* peerAddr, tcp_connection_role_t role) {
+int TcpConnection_Init(tcp_connection_t* conn, int sockFd, const struct sockaddr_storage* peerAddr, tcp_connection_role_t role) {
     if (!conn || sockFd < 0 || !peerAddr) {
         return -1;
     }
@@ -17,6 +17,7 @@ int TcpConnection_Init(tcp_connection_t* conn, int sockFd, const struct sockaddr
     memset(conn, 0, sizeof(*conn));
     conn->sockFd = sockFd;
     conn->peerAddr = *peerAddr;
+    conn->addrFamily = peerAddr->ss_family;
     conn->role = role;
 
     if (pthread_mutex_init(&conn->sendLock, NULL) != 0) {
@@ -214,26 +215,10 @@ int TcpConnection_SendFramed(tcp_connection_t* conn, const void* payload, size_t
 
     pthread_mutex_lock(&conn->sendLock);
 
-#ifdef USE_IPV6
-    int sock;
-    if (conn->sockFd6 >= 0) {
-        // IPv6 is available, attempt to send on it. If it fails, we'll fall back to IPv4 if available.
-        sock = conn->sockFd6;
-    } else {
-        // IPv4 fallback
-        sock = conn->sockFd;
-    }
-
-    int rc = TcpConnection_SendRaw(sock, &beLen, sizeof(beLen));
-    if (rc == 0 && payloadLen > 0) {
-        rc = TcpConnection_SendRaw(sock, payload, payloadLen);
-    }
-#else
     int rc = TcpConnection_SendRaw(conn->sockFd, &beLen, sizeof(beLen));
     if (rc == 0 && payloadLen > 0) {
         rc = TcpConnection_SendRaw(conn->sockFd, payload, payloadLen);
     }
-#endif
 
     pthread_mutex_unlock(&conn->sendLock);
 
@@ -251,11 +236,6 @@ void TcpConnection_RequestClose(tcp_connection_t* conn) {
         if (conn->sockFd >= 0) {
             shutdown(conn->sockFd, SHUT_RDWR);
         }
-#ifdef USE_IPV6
-        if (conn->sockFd6 >= 0) {
-            shutdown(conn->sockFd6, SHUT_RDWR);
-        }
-#endif
     }
     pthread_mutex_unlock(&conn->stateLock);
 }
@@ -280,6 +260,60 @@ bool TcpConnection_IsDisconnectNotified(tcp_connection_t* conn) {
     pthread_mutex_unlock(&conn->stateLock);
 
     return notified;
+}
+
+static int extract_v4(const tcp_connection_t* conn, struct in_addr* v4out) {
+    if (conn->addrFamily == AF_INET6) {
+        const struct sockaddr_in6* a6 = (const struct sockaddr_in6*)&conn->peerAddr;
+        if (IN6_IS_ADDR_V4MAPPED(&a6->sin6_addr)) {
+            memcpy(v4out, &a6->sin6_addr.s6_addr[12], sizeof(*v4out));
+            return 1;
+        }
+        return 0;
+    }
+    *v4out = ((const struct sockaddr_in*)&conn->peerAddr)->sin_addr;
+    return 1;
+}
+
+const char* TcpConnection_GetPeerAddrStr(const tcp_connection_t* conn, char* buf, size_t bufLen) {
+    if (!conn || !buf || bufLen == 0) {
+        return NULL;
+    }
+
+    if (conn->addrFamily == AF_INET6) {
+        const struct sockaddr_in6* a6 = (const struct sockaddr_in6*)&conn->peerAddr;
+        if (IN6_IS_ADDR_V4MAPPED(&a6->sin6_addr)) {
+            struct in_addr v4;
+            memcpy(&v4, &a6->sin6_addr.s6_addr[12], sizeof(v4));
+            return inet_ntop(AF_INET, &v4, buf, (socklen_t)bufLen);
+        }
+        return inet_ntop(AF_INET6, &a6->sin6_addr, buf, (socklen_t)bufLen);
+    }
+
+    const struct sockaddr_in* a4 = (const struct sockaddr_in*)&conn->peerAddr;
+    return inet_ntop(AF_INET, &a4->sin_addr, buf, (socklen_t)bufLen);
+}
+
+int TcpConnection_PeerAddrEqual(const tcp_connection_t* a, const tcp_connection_t* b) {
+    if (!a || !b) {
+        return 0;
+    }
+
+    struct in_addr va, vb;
+    int a_is_v4 = extract_v4(a, &va);
+    int b_is_v4 = extract_v4(b, &vb);
+
+    if (a_is_v4 && b_is_v4) {
+        return va.s_addr == vb.s_addr;
+    }
+
+    if (!a_is_v4 && !b_is_v4) {
+        const struct in6_addr* aa6 = &((const struct sockaddr_in6*)&a->peerAddr)->sin6_addr;
+        const struct in6_addr* ab6 = &((const struct sockaddr_in6*)&b->peerAddr)->sin6_addr;
+        return memcmp(aa6, ab6, sizeof(*aa6)) == 0;
+    }
+
+    return 0;
 }
 
 #endif

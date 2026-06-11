@@ -3,6 +3,7 @@
 #include <tcpd/tcpclient.h>
 
 #include <errno.h>
+#include <netinet/in.h>
 #include <numgen.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,18 +83,34 @@ int TcpClient_Connect(
         return -1;
     }
 
-    int sockFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockFd < 0) {
+    // Detect address family from the IP string
+    struct sockaddr_in6 addr6;
+    struct sockaddr_in addr4;
+    struct sockaddr* pSockAddr;
+    socklen_t sockAddrLen;
+    int af;
+
+    memset(&addr6, 0, sizeof(addr6));
+    memset(&addr4, 0, sizeof(addr4));
+
+    if (inet_pton(AF_INET6, peerIp, &addr6.sin6_addr) == 1) {
+        af = AF_INET6;
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = htons(peerPort);
+        pSockAddr = (struct sockaddr*)&addr6;
+        sockAddrLen = sizeof(addr6);
+    } else if (inet_pton(AF_INET, peerIp, &addr4.sin_addr) == 1) {
+        af = AF_INET;
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons(peerPort);
+        pSockAddr = (struct sockaddr*)&addr4;
+        sockAddrLen = sizeof(addr4);
+    } else {
         return -1;
     }
 
-    struct sockaddr_in peerAddr;
-    memset(&peerAddr, 0, sizeof(peerAddr));
-    peerAddr.sin_family = AF_INET;
-    peerAddr.sin_port = htons(peerPort);
-
-    if (inet_pton(AF_INET, peerIp, &peerAddr.sin_addr) <= 0) {
-        close(sockFd);
+    int sockFd = socket(af, SOCK_STREAM, 0);
+    if (sockFd < 0) {
         return -1;
     }
 
@@ -102,7 +119,7 @@ int TcpClient_Connect(
     if (flags == -1) flags = 0;
     fcntl(sockFd, F_SETFL, flags | O_NONBLOCK);
 
-    int rc = connect(sockFd, (struct sockaddr*)&peerAddr, sizeof(peerAddr));
+    int rc = connect(sockFd, pSockAddr, sockAddrLen);
     if (rc < 0) {
         if (errno != EINPROGRESS) {
             close(sockFd);
@@ -143,13 +160,18 @@ int TcpClient_Connect(
     // Restore blocking mode
     fcntl(sockFd, F_SETFL, flags & ~O_NONBLOCK);
 
+    // Pack the address into sockaddr_storage for TcpConnection_Init
+    struct sockaddr_storage peerStorage;
+    memset(&peerStorage, 0, sizeof(peerStorage));
+    memcpy(&peerStorage, pSockAddr, sockAddrLen);
+
     tcp_connection_t* conn = (tcp_connection_t*)malloc(sizeof(*conn));
     if (!conn) {
         close(sockFd);
         return -1;
     }
 
-    if (TcpConnection_Init(conn, sockFd, &peerAddr, TCP_CONNECTION_ROLE_OUTBOUND) != 0) {
+    if (TcpConnection_Init(conn, sockFd, &peerStorage, TCP_CONNECTION_ROLE_OUTBOUND) != 0) {
         free(conn);
         close(sockFd);
         return -1;

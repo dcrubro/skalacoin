@@ -255,7 +255,7 @@ net_node_t* Node_Create() {
     node->seenBlocks = DynSet_Create(32); // 32-byte canonical hashes
     TxMempool_Init();
 
-    TcpServer_Init(node->server, listenPort, "0.0.0.0");
+    TcpServer_Init(node->server, listenPort, "::");
 
     node->server->owner = node;
     node->server->on_connect = Node_Server_OnConnect;
@@ -436,8 +436,8 @@ void Node_Server_OnConnect(tcp_connection_t* client) {
     if (echoPeersEnabled && node && client) {
         // Attempt to create an outbound connection back to the peer's IP on our configured port.
         // We avoid connecting if we already have an outbound to the same IP.
-        char ipbuf[INET_ADDRSTRLEN];
-        if (inet_ntop(AF_INET, &client->peerAddr.sin_addr, ipbuf, sizeof(ipbuf))) {
+        char ipbuf[INET6_ADDRSTRLEN];
+        if (TcpConnection_GetPeerAddrStr(client, ipbuf, sizeof(ipbuf))) {
             // Use the configured port as the target port for the peer's listening service.
             unsigned short targetPort = listenPort;
 
@@ -445,8 +445,7 @@ void Node_Server_OnConnect(tcp_connection_t* client) {
             pthread_mutex_lock(&node->outboundLock);
             for (size_t i = 0; i < MAX_CONS; ++i) {
                 if (node->outboundClients[i].connection) {
-                    struct in_addr otherAddr = node->outboundClients[i].connection->peerAddr.sin_addr;
-                    if (otherAddr.s_addr == client->peerAddr.sin_addr.s_addr) {
+                    if (TcpConnection_PeerAddrEqual(node->outboundClients[i].connection, client)) {
                         shouldConnect = 0;
                         break;
                     }
@@ -930,11 +929,6 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
     size_t chainSize = Chain_Size(currentChain);
     if (startHeightInclusive >= chainSize) return;
 
-    uint32_t sourceIp = 0;
-    if (sourceConn) {
-        sourceIp = sourceConn->peerAddr.sin_addr.s_addr;
-    }
-
     for (size_t h = startHeightInclusive; h < chainSize; ++h) {
         block_t* blk = NULL;
         if (!Chain_GetBlockCopy(currentChain, h, &blk) || !blk) {
@@ -997,7 +991,7 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
             tcp_connection_t* conn = node->outboundClients[i].connection;
             if (!conn) continue;
             if (conn == sourceConn) continue;
-            if (sourceIp != 0 && conn->peerAddr.sin_addr.s_addr == sourceIp) continue;
+            if (sourceConn && TcpConnection_PeerAddrEqual(conn, sourceConn)) continue;
             Node_SendPacket(node, conn, PACKET_TYPE_BROADCAST_BLOCK, payload, off);
         }
         pthread_mutex_unlock(&node->outboundLock);

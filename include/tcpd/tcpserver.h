@@ -9,14 +9,9 @@
 #include <tcpd/tcpconnection.h>
 
 typedef struct {
-    int sockFd;
-    struct sockaddr_in addr;
-#ifdef USE_IPV6
-    int sockFd6; // IPv6 support
-    struct sockaddr_in6 addr6; // IPv6 support
-#endif
+    int sockFd;    // IPv6 listening socket (-1 if IPv6 unavailable)
+    int sockFdV4;  // IPv4 listening socket (-1 on bind failure)
     int opt;
-    int opt6; // IPv6 support
     int isRunning;
     void* owner;
 
@@ -32,7 +27,8 @@ typedef struct {
     tcp_connection_t** clientsArrPtr;
     pthread_mutex_t clientsMutex;
 
-    pthread_t svrThread;
+    pthread_t svrThread;    // IPv6 accept thread
+    pthread_t svrThreadV4;  // IPv4 accept thread
 } tcp_server_t;
 
 struct tcpclient_thread_args {

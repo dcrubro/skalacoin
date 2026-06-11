@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 #define TCP_IO_BUFFER_SIZE 1500
 #define TCP_FRAME_HEADER_SIZE 4U
@@ -19,17 +20,9 @@ typedef enum {
 typedef struct tcp_connection_t tcp_connection_t;
 
 struct tcp_connection_t {
-    // TODO: We should make it so only ONE of this needs to be available. 
-    // Because of my temporary "I just need something that works" horseshit that I'm about to write, you'll need IPv4 and IPv6 is optional.
-    // Note to self: Don't pull an IETF and some "NAT exists, we're fine" bullshit, because if we end up with our eqvivalent of Teredo or CGNAT, I'm gonna be fucking pissed.
-    // And no, the solution isn't "eh, just bind to 0.0.0.0 and ignore it", because if we do that, we'll inevitably end up with a host that only has IPv6 and then we'll be fucked.
-    // Honestly, I'm proud of whoever runs IPv6-only. Brave soul.
     int sockFd;
-    struct sockaddr_in peerAddr;
-#ifdef USE_IPV6
-    int sockFd6; // For IPv6 support
-    struct sockaddr_in6 peerAddr6; // For IPv6 support
-#endif
+    sa_family_t addrFamily;
+    struct sockaddr_storage peerAddr;
     uint32_t connectionId;
     tcp_connection_role_t role;
 
@@ -55,7 +48,7 @@ struct tcp_connection_t {
     void* owner;
 };
 
-int TcpConnection_Init(tcp_connection_t* conn, int sockFd, const struct sockaddr_in* peerAddr, tcp_connection_role_t role);
+int TcpConnection_Init(tcp_connection_t* conn, int sockFd, const struct sockaddr_storage* peerAddr, tcp_connection_role_t role);
 void TcpConnection_Destroy(tcp_connection_t* conn);
 
 int TcpConnection_SetDataBuffer(tcp_connection_t* conn, const unsigned char* data, size_t len);
@@ -63,7 +56,14 @@ int TcpConnection_SetDataBuffer(tcp_connection_t* conn, const unsigned char* dat
 void TcpConnection_ResetFramingState(tcp_connection_t* conn);
 int TcpConnection_FeedFramedData(tcp_connection_t* conn, const unsigned char* input, size_t inputLen);
 
-// This just takes a socket ID, so it's independent from the v4/v6 stuff. It works for both.
+// Returns the peer's canonical IP string (strips ::ffff: IPv4-mapped prefix).
+// Writes at most bufLen bytes to buf. Returns buf on success, NULL on failure.
+const char* TcpConnection_GetPeerAddrStr(const tcp_connection_t* conn, char* buf, size_t bufLen);
+
+// Returns non-zero if both connections have the same peer IP address.
+// Handles AF_INET vs AF_INET6 mismatches via IPv4-mapped normalisation.
+int TcpConnection_PeerAddrEqual(const tcp_connection_t* a, const tcp_connection_t* b);
+
 int TcpConnection_SendRaw(int sockFd, const void* data, size_t len);
 int TcpConnection_SendFramed(tcp_connection_t* conn, const void* payload, size_t payloadLen);
 
