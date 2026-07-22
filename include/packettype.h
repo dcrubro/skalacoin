@@ -14,7 +14,9 @@ typedef enum {
     PACKET_TYPE_BROADCAST_TX = 7, // Here's a new transaction I want to share with the network
     PACKET_TYPE_ACK_TX = 8, // I have received your transaction, here's what I did with it (response to broadcast)
     PACKET_TYPE_ERROR = 9, // Something went wrong with the packet you sent me, here's an error message (can be response to any packet)
-    PACKET_TYPE_MAX = 10
+    PACKET_TYPE_GET_PEERS = 10, // Who are your peers? Send me a few of them so I can discover more of the network
+    PACKET_TYPE_PEERS = 11, // Here are some of my peers' listen endpoints (response to GET_PEERS)
+    PACKET_TYPE_MAX = 12
 } packet_type_t;
 
 static inline int PacketType_IsValid(uint8_t packetType) {

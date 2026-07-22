@@ -14,6 +14,8 @@ typedef struct {
     uint8_t bytes[32];
 } key32_t;
 
+#define PROTO_VERSION 1
+
 static inline uint32_t hash_key32(key32_t k) {
     uint32_t hash = 2166136261u;
     for (int i = 0; i < 32; i++) {

@@ -26,6 +26,10 @@ struct tcp_connection_t {
     uint32_t connectionId;
     tcp_connection_role_t role;
 
+    // Peer's advertised TCP/UDP listen port (learned from HELLO/ACK_HELLO). 0 until known.
+    // For OUTBOUND connections the peerAddr port already is the listen port; this matters for INBOUND peers.
+    uint16_t peerListenPort;
+
     pthread_t ioThread;
     pthread_mutex_t sendLock;
     pthread_mutex_t stateLock;

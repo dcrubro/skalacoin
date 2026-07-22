@@ -10,6 +10,10 @@
 
 #include <constants.h>
 #include <packettype.h>
+#include <udpd/udpnode.h>
+
+// Forward declaration - the discovery state is defined in nodediscovery.c (opaque here).
+typedef struct node_discovery node_discovery_t;
 
 #include <stddef.h>
 
@@ -40,6 +44,9 @@ typedef struct {
     pthread_t maintenanceThread;
     volatile int maintenanceRunning;
     int maintenanceIntervalMs;
+    // UDP ping/pong daemon (latency oracle) and peer discovery state
+    udp_node_t* udpNode;
+    node_discovery_t* discovery;
 } net_node_t;
 
 net_node_t* Node_Create();
@@ -70,5 +77,16 @@ void Node_Server_OnDisconnect(tcp_connection_t* client);
 void Node_Client_OnConnect(tcp_connection_t* client);
 void Node_Client_OnData(tcp_connection_t* client);
 void Node_Client_OnDisconnect(tcp_connection_t* client);
+
+void Node_GetClientList(net_node_t* node, tcp_connection_t** outClients, size_t* outCount);
+
+// Computes a connection's peer listen endpoint (IP + advertised/dialed listen port) into *out.
+// Outbound: the dialed peerAddr port already is the listen port. Inbound: uses peerListenPort.
+// Returns non-zero on success (usable endpoint with a known, non-zero port), zero otherwise.
+int Node_ConnListenEndpoint(const tcp_connection_t* conn, struct sockaddr_storage* out);
+
+// Fills outEndpoints with the listen endpoints of all current connections (inbound + outbound),
+// deduped by IP+port. Returns the number of endpoints written (<= maxOut).
+size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpoints, size_t maxOut);
 
 #endif

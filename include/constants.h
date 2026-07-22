@@ -13,6 +13,18 @@
 #define MAX_CONS 32 // Some baseline for now
 #define LISTEN_PORT 9393
 #define ECHO_PEERS 1 // If non-zero, automatically attempt to connect back to any inbound peers (helps form bidirectional peering)
+
+// Node discovery
+#define DISCOVERY_FANOUT 2 // "A couple" - how many peers to query per round, and how many new peers to accept per PEERS response (keeps the crawl spread out)
+#define DISCOVERY_MAX_HOPS 3 // How many hops away from us we keep crawling
+#define DISCOVERY_TARGET_CONNECTIONS 8 // Desired outbound connection count discovery tries to reach (bounded by MAX_CONS)
+#define DISCOVERY_MAX_KNOWN_PEERS 256 // Cap on the known-peer table size
+#define DISCOVERY_PEERS_RESPONSE_CAP 8 // Max endpoints we put in a single PEERS response
+#define DISCOVERY_MAX_PINGS_PER_TICK 8 // Cap on UDP pings sent per discovery tick
+#define DISCOVERY_PING_TIMEOUT_MS 5000ULL // Backstop: a PINGED peer with no pong for this long is marked unreachable
+#define DISCOVERY_PING_REFRESH_MS 60000ULL // Re-ping a reachable peer after this long to refresh its latency
+#define DISCOVERY_QUERY_INTERVAL_MS 15000ULL // Minimum interval between GET_PEERS to the same peer
+#define DISCOVERY_CONNECT_RETRY_MS 30000ULL // Minimum interval between connect attempts to the same discovered peer
 #define TCP_THREAD_STACK_SIZE (512 * 1024) // 512 KB. We could get away with like 128 KB since it's mostly just recv bufs, but it's good having some breathing room.
                                            // This is also for client threads. The server has the default (~8 MB on POSIX).
 

@@ -1,4 +1,5 @@
 #include <nets/net_node.h>
+#include <nets/nodediscovery.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <txmempool.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 static net_node_t* Node_FromConnection(tcp_connection_t* conn) {
     if (!conn) {
@@ -27,6 +30,125 @@ static uint64_t Node_GetCurrentBlockHeight(void) {
     }
 
     return currentBlockHeight;
+}
+
+// Compares two listen endpoints (family + IP + port).
+static int NetNode_EndpointEqual(const struct sockaddr_storage* a, const struct sockaddr_storage* b) {
+    if (a->ss_family != b->ss_family) return 0;
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in* x = (const struct sockaddr_in*)a;
+        const struct sockaddr_in* y = (const struct sockaddr_in*)b;
+        return x->sin_port == y->sin_port &&
+               memcmp(&x->sin_addr, &y->sin_addr, sizeof(struct in_addr)) == 0;
+    }
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6* x = (const struct sockaddr_in6*)a;
+        const struct sockaddr_in6* y = (const struct sockaddr_in6*)b;
+        return x->sin6_port == y->sin6_port &&
+               memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(struct in6_addr)) == 0;
+    }
+    return 0;
+}
+
+int Node_ConnListenEndpoint(const tcp_connection_t* conn, struct sockaddr_storage* out) {
+    if (!conn || !out) return 0;
+    memset(out, 0, sizeof(*out));
+
+    // Determine the peer's listen port. For an outbound connection the port we dialed already
+    // is the peer's listen port; for an inbound one it is the port advertised in HELLO.
+    unsigned short listenP;
+    if (conn->role == TCP_CONNECTION_ROLE_OUTBOUND) {
+        listenP = (conn->addrFamily == AF_INET6)
+            ? ntohs(((const struct sockaddr_in6*)&conn->peerAddr)->sin6_port)
+            : ntohs(((const struct sockaddr_in*)&conn->peerAddr)->sin_port);
+    } else {
+        listenP = conn->peerListenPort;
+    }
+    if (listenP == 0) return 0; // unknown listen port -> not a usable endpoint
+
+    if (conn->addrFamily == AF_INET) {
+        const struct sockaddr_in* a = (const struct sockaddr_in*)&conn->peerAddr;
+        struct sockaddr_in* o = (struct sockaddr_in*)out;
+        o->sin_family = AF_INET;
+        o->sin_addr = a->sin_addr;
+        o->sin_port = htons(listenP);
+        return 1;
+    }
+    if (conn->addrFamily == AF_INET6) {
+        const struct sockaddr_in6* a = (const struct sockaddr_in6*)&conn->peerAddr;
+        if (IN6_IS_ADDR_V4MAPPED(&a->sin6_addr)) {
+            // Normalise IPv4-mapped IPv6 to plain IPv4.
+            struct sockaddr_in* o = (struct sockaddr_in*)out;
+            o->sin_family = AF_INET;
+            memcpy(&o->sin_addr, ((const uint8_t*)&a->sin6_addr) + 12, sizeof(struct in_addr));
+            o->sin_port = htons(listenP);
+        } else {
+            struct sockaddr_in6* o = (struct sockaddr_in6*)out;
+            o->sin6_family = AF_INET6;
+            o->sin6_addr = a->sin6_addr;
+            o->sin6_port = htons(listenP);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpoints, size_t maxOut) {
+    if (!node || !outEndpoints || maxOut == 0) return 0;
+    size_t count = 0;
+
+    // Outbound connections
+    pthread_mutex_lock(&node->outboundLock);
+    for (size_t i = 0; i < MAX_CONS && count < maxOut; ++i) {
+        tcp_connection_t* c = node->outboundClients[i].connection;
+        if (!c) continue;
+        struct sockaddr_storage ep;
+        if (!Node_ConnListenEndpoint(c, &ep)) continue;
+        int dup = 0;
+        for (size_t k = 0; k < count; ++k) {
+            if (NetNode_EndpointEqual(&outEndpoints[k], &ep)) { dup = 1; break; }
+        }
+        if (!dup) outEndpoints[count++] = ep;
+    }
+    pthread_mutex_unlock(&node->outboundLock);
+
+    // Inbound connections
+    if (node->server) {
+        pthread_mutex_lock(&node->server->clientsMutex);
+        for (size_t i = 0; i < node->server->maxClients && count < maxOut; ++i) {
+            tcp_connection_t* c = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
+            if (!c) continue;
+            struct sockaddr_storage ep;
+            if (!Node_ConnListenEndpoint(c, &ep)) continue;
+            int dup = 0;
+            for (size_t k = 0; k < count; ++k) {
+                if (NetNode_EndpointEqual(&outEndpoints[k], &ep)) { dup = 1; break; }
+            }
+            if (!dup) outEndpoints[count++] = ep;
+        }
+        pthread_mutex_unlock(&node->server->clientsMutex);
+    }
+
+    return count;
+}
+
+// Thunks routing UDP ping/pong events into the discovery state.
+static void Node_OnPongThunk(udp_node_t* udp, const struct sockaddr_storage* from,
+                             uint64_t nonce, int protoVersion, uint64_t rttMs, void* user) {
+    (void)udp; (void)protoVersion;
+    net_node_t* node = (net_node_t*)user;
+    if (node && node->discovery) {
+        NodeDiscovery_OnPong(node->discovery, from, nonce, rttMs);
+    }
+}
+
+static void Node_OnPingTimeoutThunk(udp_node_t* udp, const struct sockaddr_storage* dest,
+                                    uint64_t nonce, void* user) {
+    (void)udp;
+    net_node_t* node = (net_node_t*)user;
+    if (node && node->discovery) {
+        NodeDiscovery_OnPingTimeout(node->discovery, dest, nonce);
+    }
 }
 
 typedef enum {
@@ -46,6 +168,10 @@ static void* Node_MaintenanceThread(void* arg) {
                 Chain_SaveToFile(currentChain, chainDataDir, currentSupply, currentReward);
                 BalanceSheet_SaveToFile(chainDataDir);
             }
+        }
+        // Peer discovery tick: ping/query connected peers and connect to the best-ping discoveries.
+        if (n->discovery) {
+            NodeDiscovery_Iterate(n->discovery);
         }
         sleep_for_milliseconds((uint64_t)n->maintenanceIntervalMs);
     }
@@ -266,6 +392,25 @@ net_node_t* Node_Create() {
 
     OrphanPool_Init();
 
+    // Start the UDP ping/pong daemon (latency oracle) and peer discovery. Non-fatal on failure;
+    // the node still works without discovery, it just won't crawl for new peers.
+    node->udpNode = (udp_node_t*)malloc(sizeof(udp_node_t));
+    if (node->udpNode) {
+        if (UdpNode_Init(node->udpNode, (uint16_t)listenPort) == 0) {
+            UdpNode_SetCallbacks(node->udpNode, Node_OnPongThunk, Node_OnPingTimeoutThunk, node);
+            if (UdpNode_Start(node->udpNode) == 0) {
+                node->discovery = NodeDiscovery_Create(node, node->udpNode);
+            } else {
+                UdpNode_Destroy(node->udpNode);
+                free(node->udpNode);
+                node->udpNode = NULL;
+            }
+        } else {
+            free(node->udpNode);
+            node->udpNode = NULL;
+        }
+    }
+
     // Start maintenance thread
     node->maintenanceRunning = 1;
     node->maintenanceIntervalMs = 1000; // 1s
@@ -292,10 +437,24 @@ void Node_Destroy(net_node_t* node) {
         TcpServer_Destroy(node->server);
     }
 
-    // Stop maintenance thread
+    // Stop maintenance thread (no more discovery ticks after this)
     if (node->maintenanceRunning) {
         node->maintenanceRunning = 0;
         pthread_join(node->maintenanceThread, NULL);
+    }
+
+    // Tear down UDP + discovery. Stop UDP first so no pong/timeout callback races the destroy.
+    if (node->udpNode) {
+        UdpNode_Stop(node->udpNode);
+    }
+    if (node->discovery) {
+        NodeDiscovery_Destroy(node->discovery);
+        node->discovery = NULL;
+    }
+    if (node->udpNode) {
+        UdpNode_Destroy(node->udpNode);
+        free(node->udpNode);
+        node->udpNode = NULL;
     }
 
     OrphanPool_Destroy();
@@ -482,11 +641,20 @@ void Node_Server_OnData(tcp_connection_t* client) {
             memcpy(&protoVersion, payload, sizeof(protoVersion));
             memcpy(&blockHeight, payload + sizeof(protoVersion), sizeof(blockHeight));
 
-            // TODO: Save these somewhere and maybe respond
-            printf("Received HELLO from node %u: protoVersion=%u, blockHeight=%" PRIu64 "\n",
-                client ? client->connectionId : 0U, protoVersion, blockHeight);
+            // Optional trailing listen port. This inbound peer's source port is ephemeral,
+            // so we record the port it actually listens on to make it discoverable/reachable.
+            // Length-guarded so older peers that omit it still work.
+            if (client && payloadLen >= sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint16_t)) {
+                uint16_t peerListenPort;
+                memcpy(&peerListenPort, payload + sizeof(protoVersion) + sizeof(blockHeight), sizeof(peerListenPort));
+                client->peerListenPort = peerListenPort;
+            }
 
-            // Craft and send ACK_HELLO
+            printf("Received HELLO from node %u: protoVersion=%u, blockHeight=%" PRIu64 ", listenPort=%u\n",
+                client ? client->connectionId : 0U, protoVersion, blockHeight,
+                client ? client->peerListenPort : 0U);
+
+            // Craft and send ACK_HELLO (echo protoVersion, our height, and our own listen port)
             uint8_t ackBuf[100];
             uint8_t* ackData = ackBuf;
             size_t ackOffset = 0;
@@ -495,6 +663,9 @@ void Node_Server_OnData(tcp_connection_t* client) {
             uint64_t currentHeight = Node_GetCurrentBlockHeight();
             memcpy(ackData + ackOffset, &currentHeight, sizeof(currentHeight));
             ackOffset += sizeof(currentHeight);
+            uint16_t myListenPort = (uint16_t)listenPort;
+            memcpy(ackData + ackOffset, &myListenPort, sizeof(myListenPort));
+            ackOffset += sizeof(myListenPort);
 
             Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ACK_HELLO, ackData, ackOffset);
 
@@ -690,12 +861,26 @@ void Node_Server_OnData(tcp_connection_t* client) {
             printf("Received packet type %u from node %u with message: %s\n",
                 (unsigned int)packetType, client ? client->connectionId : 0U, text);
             free(text);
-            
+
+            break;
+        }
+        case PACKET_TYPE_GET_PEERS: {
+            net_node_t* dnode = Node_FromConnection(client);
+            if (dnode && dnode->discovery) {
+                NodeDiscovery_OnGetPeers(dnode->discovery, client);
+            }
+            break;
+        }
+        case PACKET_TYPE_PEERS: {
+            net_node_t* dnode = Node_FromConnection(client);
+            if (dnode && dnode->discovery) {
+                NodeDiscovery_OnPeersReceived(dnode->discovery, client, payload, payloadLen);
+            }
             break;
         }
         default:
             return;
-    } 
+    }
 
     net_node_t* node = Node_FromConnection(client);
     Node_ForwardData(node, client, payload, payloadLen);
@@ -718,12 +903,16 @@ void Node_Client_OnConnect(tcp_connection_t* client) {
         uint8_t* data = buf;
         
         size_t offset = 0;
-        uint32_t protoVersion = 1; // little-endian
+        uint32_t protoVersion = PROTO_VERSION; // little-endian
         uint64_t blockHeight = Node_GetCurrentBlockHeight();
         memcpy((unsigned char*)data + offset, &protoVersion, sizeof(protoVersion)); // This is technically "unsafe", but I honestly just don't give a shit at this point
         offset += sizeof(protoVersion);
         memcpy((unsigned char*)data + offset, &blockHeight, sizeof(blockHeight));
         offset += sizeof(blockHeight);
+        // Advertise the port we listen on so the peer can share us with others (and reach us back)
+        uint16_t myListenPort = (uint16_t)listenPort;
+        memcpy((unsigned char*)data + offset, &myListenPort, sizeof(myListenPort));
+        offset += sizeof(myListenPort);
 
         Node_SendPacket(node, client, PACKET_TYPE_HELLO, data, offset);
     }
@@ -759,6 +948,14 @@ void Node_Client_OnData(tcp_connection_t* client) {
             uint64_t blockHeight;
             memcpy(&protoVersion, payload, sizeof(protoVersion));
             memcpy(&blockHeight, payload + sizeof(protoVersion), sizeof(blockHeight));
+
+            // Optional trailing listen port (for outbound peers the dialed port is already the
+            // listen port, but record the advertised one for consistency). Length-guarded.
+            if (client && payloadLen >= sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint16_t)) {
+                uint16_t peerListenPort;
+                memcpy(&peerListenPort, payload + sizeof(protoVersion) + sizeof(blockHeight), sizeof(peerListenPort));
+                client->peerListenPort = peerListenPort;
+            }
 
             printf("Received ACK_HELLO from node %u with protoVersion %u and blockHeight %" PRIu64 "\n", client ? client->connectionId : 0U, protoVersion, blockHeight);
 
@@ -867,7 +1064,21 @@ void Node_Client_OnData(tcp_connection_t* client) {
             printf("Received packet type %u from node %u with message: %s\n",
                 (unsigned int)packetType, client ? client->connectionId : 0U, text);
             free(text);
-            
+
+            break;
+        }
+        case PACKET_TYPE_GET_PEERS: {
+            net_node_t* dnode = Node_FromConnection(client);
+            if (dnode && dnode->discovery) {
+                NodeDiscovery_OnGetPeers(dnode->discovery, client);
+            }
+            break;
+        }
+        case PACKET_TYPE_PEERS: {
+            net_node_t* dnode = Node_FromConnection(client);
+            if (dnode && dnode->discovery) {
+                NodeDiscovery_OnPeersReceived(dnode->discovery, client, payload, payloadLen);
+            }
             break;
         }
         default:
@@ -999,4 +1210,19 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
         free(payload);
         Block_Destroy(blk);
     }
+}
+
+void Node_GetClientList(net_node_t* node, tcp_connection_t** outClients, size_t* outCount) {
+    if (!node || !outClients || !outCount) return;
+
+    pthread_mutex_lock(&node->outboundLock);
+    size_t count = 0;
+    for (size_t i = 0; i < MAX_CONS; ++i) {
+        if (node->outboundClients[i].connection) {
+            outClients[count++] = node->outboundClients[i].connection;
+        }
+    }
+    pthread_mutex_unlock(&node->outboundLock);
+
+    *outCount = count;
 }

@@ -19,6 +19,7 @@
 #include <autolykos2/autolykos2.h>
 
 #include <nets/net_node.h>
+#include <nets/nodediscovery.h>
 #include <nets/fetch_scheduler.h>
 #include <nets/orphan_pool.h>
 
@@ -1461,6 +1462,15 @@ int main(int argc, char* argv[]) {
             }
 
             printf("connect requested to %s:%u\n", ipStr, (unsigned int)peerPort);
+            continue;
+        }
+
+        if (strcmp(cmd, "peers") == 0) {
+            if (strtok(NULL, " \t")) {
+                printf("usage: peers\n");
+                continue;
+            }
+            NodeDiscovery_PrintPeers(node->discovery);
             continue;
         }
 
