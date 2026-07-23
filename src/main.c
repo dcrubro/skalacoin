@@ -674,6 +674,10 @@ int main(int argc, char* argv[]) {
     ApplyRuntimeConfigFromEnv();
 
     signal(SIGINT, handle_sigint);
+    // Ignore SIGPIPE so a write to a socket whose peer has already disconnected returns EPIPE
+    // (handled by the send paths) instead of terminating the whole process. Peers connecting and
+    // disconnecting is normal p2p behaviour and must never take the node down.
+    signal(SIGPIPE, SIG_IGN);
     srand((unsigned int)time(NULL));
 
     // Initialize runtime locks before any thread or helper can touch chain state.
