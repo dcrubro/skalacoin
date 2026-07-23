@@ -50,6 +50,75 @@ static int NetNode_EndpointEqual(const struct sockaddr_storage* a, const struct 
     return 0;
 }
 
+// Builds a listen endpoint from an IP string + port, normalising IPv4-mapped IPv6 to plain IPv4
+// so it compares equal to Node_ConnListenEndpoint output. Returns non-zero on success.
+static int NetNode_MakeEndpoint(const char* ip, unsigned short port, struct sockaddr_storage* out) {
+    if (!ip || !out) return 0;
+    memset(out, 0, sizeof(*out));
+
+    struct in_addr a4;
+    if (inet_pton(AF_INET, ip, &a4) == 1) {
+        struct sockaddr_in* o = (struct sockaddr_in*)out;
+        o->sin_family = AF_INET;
+        o->sin_addr = a4;
+        o->sin_port = htons(port);
+        return 1;
+    }
+
+    struct in6_addr a6;
+    if (inet_pton(AF_INET6, ip, &a6) == 1) {
+        if (IN6_IS_ADDR_V4MAPPED(&a6)) {
+            struct sockaddr_in* o = (struct sockaddr_in*)out;
+            o->sin_family = AF_INET;
+            memcpy(&o->sin_addr, ((const uint8_t*)&a6) + 12, sizeof(struct in_addr));
+            o->sin_port = htons(port);
+        } else {
+            struct sockaddr_in6* o = (struct sockaddr_in6*)out;
+            o->sin6_family = AF_INET6;
+            o->sin6_addr = a6;
+            o->sin6_port = htons(port);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// Returns non-zero if we already hold an outbound connection to the given listen endpoint.
+static int Node_HasOutboundTo(net_node_t* node, const struct sockaddr_storage* endpoint) {
+    int found = 0;
+    pthread_mutex_lock(&node->outboundLock);
+    for (size_t i = 0; i < MAX_CONS; ++i) {
+        tcp_connection_t* c = node->outboundClients[i].connection;
+        if (!c) continue;
+        struct sockaddr_storage ep;
+        if (Node_ConnListenEndpoint(c, &ep) && NetNode_EndpointEqual(&ep, endpoint)) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&node->outboundLock);
+    return found;
+}
+
+// Returns non-zero if some inbound connection OTHER than `self` already has the given listen
+// endpoint (used to reject a duplicate inbound once we learn the peer's advertised listen port).
+static int Node_HasOtherInboundFrom(net_node_t* node, const tcp_connection_t* self, const struct sockaddr_storage* endpoint) {
+    if (!node->server) return 0;
+    int found = 0;
+    pthread_mutex_lock(&node->server->clientsMutex);
+    for (size_t i = 0; i < node->server->maxClients; ++i) {
+        tcp_connection_t* other = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
+        if (!other || other == self) continue;
+        struct sockaddr_storage ep;
+        if (Node_ConnListenEndpoint(other, &ep) && NetNode_EndpointEqual(&ep, endpoint)) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&node->server->clientsMutex);
+    return found;
+}
+
 int Node_ConnListenEndpoint(const tcp_connection_t* conn, struct sockaddr_storage* out) {
     if (!conn || !out) return 0;
     memset(out, 0, sizeof(*out));
@@ -492,6 +561,14 @@ int Node_ConnectPeer(net_node_t* node, const char* ip, unsigned short port) {
         return -1;
     }
 
+    // Enforce a single outbound connection per endpoint: if we already have an outbound to this
+    // (ip, port), do not open a second one. (Inbound from the same endpoint is still allowed - that
+    // is the peer's own outbound to us.)
+    struct sockaddr_storage target;
+    if (NetNode_MakeEndpoint(ip, port, &target) && Node_HasOutboundTo(node, &target)) {
+        return 0; // already connected outbound to this endpoint
+    }
+
     for (size_t i = 0; i < MAX_CONS; ++i) {
         if (node->outboundClients[i].connection == NULL) {
             if (TcpClient_Connect(
@@ -653,6 +730,22 @@ void Node_Server_OnData(tcp_connection_t* client) {
             printf("Received HELLO from node %u: protoVersion=%u, blockHeight=%" PRIu64 ", listenPort=%u\n",
                 client ? client->connectionId : 0U, protoVersion, blockHeight,
                 client ? client->peerListenPort : 0U);
+
+            // Enforce a single inbound connection per endpoint. Now that we know this peer's listen
+            // port, drop this connection if another inbound from the same endpoint already exists
+            // (keep the established one). An outbound to the same endpoint is unaffected - that is
+            // this node's own connection to the peer.
+            if (client && client->peerListenPort != 0) {
+                net_node_t* dupNode = Node_FromConnection(client);
+                struct sockaddr_storage myEp;
+                if (dupNode && Node_ConnListenEndpoint(client, &myEp) &&
+                    Node_HasOtherInboundFrom(dupNode, client, &myEp)) {
+                    printf("Rejecting duplicate inbound connection %u (already have an inbound from this endpoint)\n",
+                        client->connectionId);
+                    TcpConnection_RequestClose(client);
+                    return;
+                }
+            }
 
             // Craft and send ACK_HELLO (echo protoVersion, our height, and our own listen port)
             uint8_t ackBuf[100];
