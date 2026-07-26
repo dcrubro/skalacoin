@@ -1308,6 +1308,9 @@ int main(int argc, char* argv[]) {
             if ((uint64_t)Chain_Size(chain) >= peerHeight) break;
             continue;
         }
+        // Sync loop finished with this peer; release the pin taken by Node_GetBestOutboundPeer so
+        // the reaper may reclaim the slot if the peer has since disconnected.
+        TcpConnection_Unpin(peerConn);
 
         if (strcmp(cmd, "txpooldetail") == 0) {
             char* hashStr = strtok(NULL, " \t");

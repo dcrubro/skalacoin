@@ -23,6 +23,10 @@ void NodeDiscovery_OnGetPeers(node_discovery_t* disc, tcp_connection_t* fromConn
 // Decode a received PEERS payload and fold a couple of its endpoints into the known-peer table.
 void NodeDiscovery_OnPeersReceived(node_discovery_t* disc, tcp_connection_t* fromConn, const unsigned char* payload, size_t payloadLen);
 
+// Strike a peer (by its listen endpoint) from the known-peer table. Called when a peer becomes
+// logically disconnected (no remaining connection to it).
+void NodeDiscovery_RemovePeer(node_discovery_t* disc, const struct sockaddr_storage* endpoint);
+
 // Dump the known-peer table to stdout (for the CLI `peers` command).
 void NodeDiscovery_PrintPeers(node_discovery_t* disc);
 

@@ -119,6 +119,47 @@ static int Node_HasOtherInboundFrom(net_node_t* node, const tcp_connection_t* se
     return found;
 }
 
+// Returns non-zero if a connection OTHER than `exclude` to `endpoint` is still live. A connection
+// that is itself mid-disconnect (disconnectedNotified) does not count as live - this is what lets
+// us decide a peer is fully gone even when both its inbound and outbound drop simultaneously.
+static int Node_HasLiveConnectionTo(net_node_t* node, const struct sockaddr_storage* endpoint, const tcp_connection_t* exclude) {
+    int found = 0;
+
+    pthread_mutex_lock(&node->outboundLock);
+    for (size_t i = 0; i < MAX_CONS && !found; ++i) {
+        tcp_connection_t* c = node->outboundClients[i].connection;
+        if (!c || c == exclude || TcpConnection_IsDisconnectNotified(c)) continue;
+        struct sockaddr_storage ep;
+        if (Node_ConnListenEndpoint(c, &ep) && NetNode_EndpointEqual(&ep, endpoint)) found = 1;
+    }
+    pthread_mutex_unlock(&node->outboundLock);
+    if (found) return 1;
+
+    if (node->server) {
+        pthread_mutex_lock(&node->server->clientsMutex);
+        for (size_t i = 0; i < node->server->maxClients && !found; ++i) {
+            tcp_connection_t* c = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
+            if (!c || c == exclude || TcpConnection_IsDisconnectNotified(c)) continue;
+            struct sockaddr_storage ep;
+            if (Node_ConnListenEndpoint(c, &ep) && NetNode_EndpointEqual(&ep, endpoint)) found = 1;
+        }
+        pthread_mutex_unlock(&node->server->clientsMutex);
+    }
+    return found;
+}
+
+// Called when a connection to a peer drops. Strikes the peer from the discovery table, but only
+// once it is logically disconnected - i.e. no other live connection (inbound or outbound) to the
+// same listen endpoint remains. Must be called from the disconnect callback while `conn` is still
+// valid and outside outboundLock/clientsMutex.
+static void Node_HandlePeerDisconnect(net_node_t* node, tcp_connection_t* conn) {
+    if (!node || !node->discovery || !conn) return;
+    struct sockaddr_storage ep;
+    if (!Node_ConnListenEndpoint(conn, &ep)) return;       // never advertised an endpoint -> not tracked
+    if (Node_HasLiveConnectionTo(node, &ep, conn)) return; // still reachable via another connection
+    NodeDiscovery_RemovePeer(node->discovery, &ep);
+}
+
 int Node_ConnListenEndpoint(const tcp_connection_t* conn, struct sockaddr_storage* out) {
     if (!conn || !out) return 0;
     memset(out, 0, sizeof(*out));
@@ -170,7 +211,7 @@ size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpo
     pthread_mutex_lock(&node->outboundLock);
     for (size_t i = 0; i < MAX_CONS && count < maxOut; ++i) {
         tcp_connection_t* c = node->outboundClients[i].connection;
-        if (!c) continue;
+        if (!c || TcpConnection_IsDisconnectNotified(c)) continue; // ignore connections that are tearing down
         struct sockaddr_storage ep;
         if (!Node_ConnListenEndpoint(c, &ep)) continue;
         int dup = 0;
@@ -186,7 +227,7 @@ size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpo
         pthread_mutex_lock(&node->server->clientsMutex);
         for (size_t i = 0; i < node->server->maxClients && count < maxOut; ++i) {
             tcp_connection_t* c = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
-            if (!c) continue;
+            if (!c || TcpConnection_IsDisconnectNotified(c)) continue; // ignore connections that are tearing down
             struct sockaddr_storage ep;
             if (!Node_ConnListenEndpoint(c, &ep)) continue;
             int dup = 0;
@@ -226,6 +267,41 @@ typedef enum {
     NODE_BLOCK_ACCEPTED = 2
 } node_block_accept_result_t;
 
+// Reclaims outbound slots whose peer has disconnected. Mirrors the inbound self-reclaim in
+// TcpServer_clientthreadprocess: detach dead connections from their slots under outboundLock, then
+// join their io threads and destroy/free them outside the lock. Pinned connections (a raw pointer
+// is still held elsewhere, e.g. by an in-progress sync) are skipped and retried on a later tick.
+static void Node_ReapDeadOutbound(net_node_t* node) {
+    if (!node) return;
+
+    tcp_connection_t* dead[MAX_CONS];
+    size_t deadCount = 0;
+
+    pthread_mutex_lock(&node->outboundLock);
+    for (size_t i = 0; i < MAX_CONS; ++i) {
+        tcp_connection_t* c = node->outboundClients[i].connection;
+        if (!c) continue;
+        if (!TcpConnection_IsDisconnectNotified(c)) continue;     // still live
+        if (atomic_load(&c->pinCount) != 0) continue;             // someone holds a raw pointer; retry later
+        // Detach the dead connection from its slot and reset the slot to a clean free state.
+        node->outboundClients[i].connection = NULL;
+        node->outboundClients[i].peerBlockHeight = 0;
+        dead[deadCount++] = c;
+    }
+    pthread_mutex_unlock(&node->outboundLock);
+
+    // Join + destroy outside the lock: the io thread's on_disconnect callback itself takes
+    // outboundLock, so joining under it would deadlock.
+    for (size_t i = 0; i < deadCount; ++i) {
+        tcp_connection_t* c = dead[i];
+        if (!pthread_equal(c->ioThread, pthread_self())) {
+            pthread_join(c->ioThread, NULL);
+        }
+        TcpConnection_Destroy(c);
+        free(c);
+    }
+}
+
 static void* Node_MaintenanceThread(void* arg) {
     net_node_t* n = (net_node_t*)arg;
     if (!n) return NULL;
@@ -238,6 +314,8 @@ static void* Node_MaintenanceThread(void* arg) {
                 BalanceSheet_SaveToFile(chainDataDir);
             }
         }
+        // Reclaim outbound slots whose peer has disconnected so they can be reused.
+        Node_ReapDeadOutbound(n);
         // Peer discovery tick: ping/query connected peers and connect to the best-ping discoveries.
         if (n->discovery) {
             NodeDiscovery_Iterate(n->discovery);
@@ -496,6 +574,14 @@ void Node_Destroy(net_node_t* node) {
         return;
     }
 
+    // Stop the maintenance thread first: it runs the outbound reaper (which touches outboundClients
+    // and outboundLock) and the discovery tick, so it must not run concurrently with the teardown
+    // below or against soon-to-be-destroyed state.
+    if (node->maintenanceRunning) {
+        node->maintenanceRunning = 0;
+        pthread_join(node->maintenanceThread, NULL);
+    }
+
     for (size_t i = 0; i < MAX_CONS; ++i) {
         TcpClient_Destroy(&node->outboundClients[i]);
     }
@@ -504,12 +590,6 @@ void Node_Destroy(net_node_t* node) {
     if (node->server) {
         TcpServer_Stop(node->server);
         TcpServer_Destroy(node->server);
-    }
-
-    // Stop maintenance thread (no more discovery ticks after this)
-    if (node->maintenanceRunning) {
-        node->maintenanceRunning = 0;
-        pthread_join(node->maintenanceThread, NULL);
     }
 
     // Tear down UDP + discovery. Stop UDP first so no pong/timeout callback races the destroy.
@@ -983,6 +1063,7 @@ void Node_Server_OnDisconnect(tcp_connection_t* client) {
     net_node_t* node = Node_FromConnection(client);
     Node_ForwardDisconnect(node, client);
     printf("Inbound node disconnected: %u\n", client ? client->connectionId : 0U);
+    Node_HandlePeerDisconnect(node, client);
 }
 
 void Node_Client_OnConnect(tcp_connection_t* client) {
@@ -1202,6 +1283,7 @@ void Node_Client_OnDisconnect(tcp_connection_t* client) {
 
     Node_ForwardDisconnect(node, client);
     printf("Outbound node disconnected: %u\n", client ? client->connectionId : 0U);
+    Node_HandlePeerDisconnect(node, client);
 }
 
 int Node_GetBestOutboundPeer(net_node_t* node, tcp_connection_t** outConn, uint64_t* outHeight) {
@@ -1212,13 +1294,16 @@ int Node_GetBestOutboundPeer(net_node_t* node, tcp_connection_t** outConn, uint6
 
     pthread_mutex_lock(&node->outboundLock);
     for (size_t i = 0; i < MAX_CONS; ++i) {
-        if (node->outboundClients[i].connection) {
-            if (node->outboundClients[i].peerBlockHeight > bestH || best == NULL) {
-                best = node->outboundClients[i].connection;
-                bestH = node->outboundClients[i].peerBlockHeight;
-            }
+        tcp_connection_t* c = node->outboundClients[i].connection;
+        if (!c || TcpConnection_IsDisconnectNotified(c)) continue; // don't hand out a dead peer
+        if (best == NULL || node->outboundClients[i].peerBlockHeight > bestH) {
+            best = c;
+            bestH = node->outboundClients[i].peerBlockHeight;
         }
     }
+    // Pin the winner while still holding outboundLock so the reaper cannot free it out from under
+    // the caller (which uses the raw pointer after this lock is released). Caller must Unpin.
+    if (best) TcpConnection_Pin(best);
     pthread_mutex_unlock(&node->outboundLock);
 
     if (!best) return -1;
@@ -1311,8 +1396,9 @@ void Node_GetClientList(net_node_t* node, tcp_connection_t** outClients, size_t*
     pthread_mutex_lock(&node->outboundLock);
     size_t count = 0;
     for (size_t i = 0; i < MAX_CONS; ++i) {
-        if (node->outboundClients[i].connection) {
-            outClients[count++] = node->outboundClients[i].connection;
+        tcp_connection_t* c = node->outboundClients[i].connection;
+        if (c && !TcpConnection_IsDisconnectNotified(c)) { // skip connections that are tearing down
+            outClients[count++] = c;
         }
     }
     pthread_mutex_unlock(&node->outboundLock);

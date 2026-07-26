@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -36,6 +37,11 @@ struct tcp_connection_t {
 
     bool closing;
     bool disconnectedNotified;
+
+    // Non-zero while another thread holds a raw pointer to this connection taken from a
+    // lock-protected snapshot and used after releasing the lock. The reaper must not free a
+    // pinned connection. See TcpConnection_Pin/Unpin.
+    atomic_int pinCount;
 
     unsigned char* dataBuf;
     size_t dataBufLen;
@@ -74,5 +80,10 @@ int TcpConnection_SendFramed(tcp_connection_t* conn, const void* payload, size_t
 void TcpConnection_RequestClose(tcp_connection_t* conn);
 void TcpConnection_MarkDisconnectNotified(tcp_connection_t* conn);
 bool TcpConnection_IsDisconnectNotified(tcp_connection_t* conn);
+
+// Pin/unpin a connection so a background reaper won't free it while a caller still holds a raw
+// pointer to it (e.g. across a blocking operation after releasing the collection lock).
+void TcpConnection_Pin(tcp_connection_t* conn);
+void TcpConnection_Unpin(tcp_connection_t* conn);
 
 #endif

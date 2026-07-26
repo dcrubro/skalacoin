@@ -274,6 +274,24 @@ void NodeDiscovery_OnPeersReceived(node_discovery_t* disc, tcp_connection_t* fro
     pthread_mutex_unlock(&disc->lock);
 }
 
+void NodeDiscovery_RemovePeer(node_discovery_t* disc, const struct sockaddr_storage* endpoint) {
+    if (!disc || !endpoint) return;
+    pthread_mutex_lock(&disc->lock);
+    size_t n = DynArr_size(disc->peers);
+    for (size_t i = 0; i < n; ++i) {
+        discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
+        if (Discovery_AddrEqual(&p->addr, endpoint)) {
+            char ip[INET6_ADDRSTRLEN] = {0};
+            unsigned short port = 0;
+            Discovery_AddrToIpPort(&p->addr, ip, sizeof(ip), &port);
+            printf("NodeDiscovery: struck disconnected peer %s:%u from peer list\n", ip, port);
+            DynArr_remove(disc->peers, i);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&disc->lock);
+}
+
 // ---- periodic tick -----------------------------------------------------------------------
 
 void NodeDiscovery_Iterate(node_discovery_t* disc) {

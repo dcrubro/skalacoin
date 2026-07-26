@@ -31,6 +31,7 @@ int TcpConnection_Init(tcp_connection_t* conn, int sockFd, const struct sockaddr
 
     conn->closing = false;
     conn->disconnectedNotified = false;
+    atomic_init(&conn->pinCount, 0);
     conn->dataBuf = NULL;
     conn->dataBufLen = 0;
     conn->dataBufCap = 0;
@@ -260,6 +261,20 @@ bool TcpConnection_IsDisconnectNotified(tcp_connection_t* conn) {
     pthread_mutex_unlock(&conn->stateLock);
 
     return notified;
+}
+
+void TcpConnection_Pin(tcp_connection_t* conn) {
+    if (!conn) {
+        return;
+    }
+    atomic_fetch_add(&conn->pinCount, 1);
+}
+
+void TcpConnection_Unpin(tcp_connection_t* conn) {
+    if (!conn) {
+        return;
+    }
+    atomic_fetch_sub(&conn->pinCount, 1);
 }
 
 static int extract_v4(const tcp_connection_t* conn, struct in_addr* v4out) {
