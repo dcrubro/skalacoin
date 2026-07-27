@@ -258,9 +258,14 @@ static inline bool IsValidIPv4(const char* ip) {
     struct addrinfo hints, *res;
     int status;
 
+    if (!ip || *ip == '\0') {
+        return false;
+    }
+
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET; // Only IPv4
-    hints.ai_socktype = AI_NUMERICHOST; // Only numeric addresses
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST; // Only numeric addresses, no DNS lookups
 
     status = getaddrinfo(ip, NULL, &hints, &res);
     if (status == 0) {
@@ -274,9 +279,14 @@ static inline bool IsValidIPv6(const char* ip) {
     struct addrinfo hints, *res;
     int status;
 
+    if (!ip || *ip == '\0') {
+        return false;
+    }
+
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET6; // Only IPv6
-    hints.ai_socktype = AI_NUMERICHOST; // Only numeric addresses
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST; // Only numeric addresses, no DNS lookups
 
     status = getaddrinfo(ip, NULL, &hints, &res);
     if (status == 0) {
