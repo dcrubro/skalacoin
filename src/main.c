@@ -148,7 +148,7 @@ static void AddCoinbaseTransaction(block_t* block, const uint8_t minerAddress[32
     coinbaseTx.transaction.amount2 = 0;
     memset(coinbaseTx.transaction.compressedPublicKey, 0, sizeof(coinbaseTx.transaction.compressedPublicKey));
     memset(coinbaseTx.transaction.senderAddress, 0xFF, sizeof(coinbaseTx.transaction.senderAddress));
-    coinbaseTx.transaction.timestamp = (uint64_t)time(NULL);
+    coinbaseTx.transaction.timestamp = get_current_time_ms();
     Block_AddTransaction(block, &coinbaseTx);
 }
 
@@ -1015,7 +1015,7 @@ int main(int argc, char* argv[]) {
             spendTx.transaction.fee = (uint64_t)fee;
             spendTx.transaction.amount1 = (uint64_t)amount;
             spendTx.transaction.amount2 = 0;
-            spendTx.transaction.timestamp = (uint64_t)time(NULL);
+            spendTx.transaction.timestamp = get_current_time_ms();
             memcpy(spendTx.transaction.senderAddress, minerAddress, sizeof(minerAddress));
             memcpy(spendTx.transaction.recipientAddress1, recipientAddress, sizeof(recipientAddress));
             memset(spendTx.transaction.recipientAddress2, 0, sizeof(spendTx.transaction.recipientAddress2));
