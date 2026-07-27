@@ -20,9 +20,10 @@ static inline bool Address_IsCoinbase(const uint8_t address[32]) {
     return true;
 }
 
-// 160 bytes total for v1
+// 168 bytes total for v1
 #pragma pack(push, 1) // Ensure no padding for consistent file storage
 typedef struct {
+    uint64_t timestamp; // Unix timestamp in seconds - not enforced, but used for uniqueness when everything else is the same.
     uint64_t fee; // Rewarded to the miner; can be zero, but the miner may choose to ignore transactions with very low fees
     uint64_t amount1;
     uint64_t amount2;
