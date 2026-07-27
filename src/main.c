@@ -839,7 +839,7 @@ int main(int argc, char* argv[]) {
     char supplyStr[80];
     Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
     printf("Current chain has %zu blocks, total supply %s\n", Chain_Size(chain), supplyStr);
-    printf("Commands: mine <x>, send <address> <amount> [fee], txpooldetail <txhash>, balance [address], connect <ipv4>, sync (requires nodes), flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
+    printf("Commands: mine <x>, send <address> <amount> [fee], txpooldetail <txhash>, balance [address], connect <ipv4> [port], peers, sync (requires nodes), flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
 
     char line[1024];
     while (true) {
@@ -1307,10 +1307,13 @@ int main(int argc, char* argv[]) {
             // Re-evaluate loop condition: continue while local < peerHeight
             if ((uint64_t)Chain_Size(chain) >= peerHeight) break;
             continue;
+            }
+
+            // Sync loop finished with this peer; release the pin taken by Node_GetBestOutboundPeer so
+            // the reaper may reclaim the slot if the peer has since disconnected.
+            TcpConnection_Unpin(peerConn);
+            continue;
         }
-        // Sync loop finished with this peer; release the pin taken by Node_GetBestOutboundPeer so
-        // the reaper may reclaim the slot if the peer has since disconnected.
-        TcpConnection_Unpin(peerConn);
 
         if (strcmp(cmd, "txpooldetail") == 0) {
             char* hashStr = strtok(NULL, " \t");
@@ -1350,8 +1353,6 @@ int main(int argc, char* argv[]) {
             printf("  Amount2: %llu\n", (unsigned long long)tx.transaction.amount2);
             printf("  Fee: %llu\n", (unsigned long long)tx.transaction.fee);
             continue;
-        }
-
         }
 
         if (strcmp(cmd, "blockdetail") == 0) {
@@ -1435,12 +1436,12 @@ int main(int argc, char* argv[]) {
             char* portStr = strtok(NULL, " \t");
             char* extra = strtok(NULL, " \t");
             if (!ipStr || extra) {
-                printf("usage: connect <ipv4> [port]\n");
+                printf("usage: connect <ipv4/ipv6> [port]\n");
                 continue;
             }
 
-            if (!IsValidIPv4(ipStr)) {
-                printf("invalid IPv4 address\n");
+            if (!IsValidIPv4(ipStr) && !IsValidIPv6(ipStr)) {
+                printf("invalid IPv4 or IPv6 address\n");
                 continue;
             }
 
@@ -1454,7 +1455,7 @@ int main(int argc, char* argv[]) {
                 }
                 peerPort = (unsigned short)parsedPort;
                 if (strtok(NULL, " \t")) {
-                    printf("usage: connect <ipv4> [port]\n");
+                    printf("usage: connect <ipv4/ipv6> [port]\n");
                     continue;
                 }
             }
@@ -1554,7 +1555,7 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        printf("Unknown command. Available: mine, send, balance, connect, flushchain, fullverify, blockdetail, wipechain, genaddr, exit\n");
+        printf("Unknown command. Available: mine, send, sync, txpooldetail, blockdetail, balance, connect, peers, flushchain, fullverify, wipechain, genaddr, exit\n");
     }
 
     (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);

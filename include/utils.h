@@ -301,6 +301,49 @@ static inline bool IsValidIPv4(const char* ip) {
     return octetCount == 4;
 }
 
+static inline bool IsValidIPv6(const char* ip) {
+    if (!ip || *ip == '\0') {
+        return false;
+    }
+
+    int colonCount = 0;
+    const char* p = ip;
+
+    while (*p != '\0') {
+        if (colonCount > 7) {
+            return false;
+        }
+
+        int hexDigits = 0;
+        while ((*p >= '0' && *p <= '9') ||
+               (*p >= 'a' && *p <= 'f') ||
+               (*p >= 'A' && *p <= 'F')) {
+            ++hexDigits;
+            if (hexDigits > 4) {
+                return false;
+            }
+            ++p;
+        }
+
+        if (hexDigits == 0) {
+            return false;
+        }
+
+        ++colonCount;
+        if (colonCount < 8) {
+            if (*p != ':') {
+                return false;
+            }
+            ++p;
+            if (*p == '\0') {
+                return false;
+            }
+        }
+    }
+
+    return colonCount == 8;
+}
+
 static inline void Uint256ToDecimal(const uint256_t* value, char* out, size_t outSize) {
     if (!value || !out || outSize == 0) {
         return;
