@@ -14,9 +14,6 @@ Check if Block FullVerify is actually verifying fully (not missing any condition
 
 A loophole in the reorg penalty system could potentially exist where someone broadcasts blocks one-at-a-time. Determine a solution to this.
 
-IPv6 support for the P2P node. Come on guys, it's 2026. RFC 2460 was in 1998. It's about time.
-    Like if someone is behind NAT, fine, workable. CGNAT? Lmao good luck.
-
 TO TEST:
 Implement Horizen's "Reorg Penalty" system to make it harder for the young chain to be attacked by a powerful miner.
 
@@ -31,3 +28,6 @@ a constant inflation rate of 1.5% per year. It's lower than fiat (USD is ~2.8% p
 
 Move to a GPU algo. RandomX is a good candidate, but CPU mining is not that attractive to anyone but people who actually want to support the project.
 Sadly, CPUs won't incentivize people who want to profit, which let's be fair, is the majority of miners.
+
+IPv6 support for the P2P node. Come on guys, it's 2026. RFC 2460 was in 1998. It's about time.
+    Like if someone is behind NAT, fine, workable. CGNAT? Lmao good luck.

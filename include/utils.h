@@ -9,6 +9,9 @@
 #include <crypto/crypto.h>
 #include <uint256.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
 
 typedef struct {
     uint8_t bytes[32];
@@ -252,96 +255,35 @@ static inline bool ParseHexAddress32(const char* in, uint8_t outAddress[32]) {
 }
 
 static inline bool IsValidIPv4(const char* ip) {
-    if (!ip || *ip == '\0') {
-        return false;
+    struct addrinfo hints, *res;
+    int status;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; // Only IPv4
+    hints.ai_socktype = AI_NUMERICHOST; // Only numeric addresses
+
+    status = getaddrinfo(ip, NULL, &hints, &res);
+    if (status == 0) {
+        freeaddrinfo(res);
+        return true;
     }
-
-    int octetCount = 0;
-    const char* p = ip;
-
-    while (*p != '\0') {
-        if (octetCount >= 4) {
-            return false;
-        }
-
-        if (*p < '0' || *p > '9') {
-            return false;
-        }
-
-        unsigned int value = 0;
-        int digits = 0;
-        while (*p >= '0' && *p <= '9') {
-            value = (value * 10u) + (unsigned int)(*p - '0');
-            if (value > 255u) {
-                return false;
-            }
-            ++digits;
-            if (digits > 3) {
-                return false;
-            }
-            ++p;
-        }
-
-        if (digits == 0) {
-            return false;
-        }
-
-        ++octetCount;
-        if (octetCount < 4) {
-            if (*p != '.') {
-                return false;
-            }
-            ++p;
-            if (*p == '\0') {
-                return false;
-            }
-        }
-    }
-
-    return octetCount == 4;
+    return false;
 }
 
 static inline bool IsValidIPv6(const char* ip) {
-    if (!ip || *ip == '\0') {
-        return false;
+    struct addrinfo hints, *res;
+    int status;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET6; // Only IPv6
+    hints.ai_socktype = AI_NUMERICHOST; // Only numeric addresses
+
+    status = getaddrinfo(ip, NULL, &hints, &res);
+    if (status == 0) {
+        freeaddrinfo(res);
+        return true;
     }
-
-    int colonCount = 0;
-    const char* p = ip;
-
-    while (*p != '\0') {
-        if (colonCount > 7) {
-            return false;
-        }
-
-        int hexDigits = 0;
-        while ((*p >= '0' && *p <= '9') ||
-               (*p >= 'a' && *p <= 'f') ||
-               (*p >= 'A' && *p <= 'F')) {
-            ++hexDigits;
-            if (hexDigits > 4) {
-                return false;
-            }
-            ++p;
-        }
-
-        if (hexDigits == 0) {
-            return false;
-        }
-
-        ++colonCount;
-        if (colonCount < 8) {
-            if (*p != ':') {
-                return false;
-            }
-            ++p;
-            if (*p == '\0') {
-                return false;
-            }
-        }
-    }
-
-    return colonCount == 8;
+    return false;
 }
 
 static inline void Uint256ToDecimal(const uint256_t* value, char* out, size_t outSize) {
