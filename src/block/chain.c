@@ -2,6 +2,7 @@
 #include <constants.h>
 #include <runtime_state.h>
 #include <txmempool.h>
+#include <nets/fetch_scheduler.h>
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -98,6 +99,51 @@ static bool DebitAddress(const uint8_t address[32], const uint256_t* amount) {
     return BalanceSheet_Insert(entry) >= 0;
 }
 
+/**
+ * Borrow the transaction list of the block at `index`.
+ *
+ * In-memory blocks are compacted to headers only once they have been persisted (Chain_SaveToFile)
+ * or loaded without transactions (Chain_LoadFromFile), so any full replay of the chain has to be
+ * able to fall back to the on-disk copy. On success `*outLoadedFromDisk` tells the caller whether
+ * the returned block is a temporary that must be released with Chain_ReturnBlockTransactions.
+ * Takes no locks; callers are expected to already hold `chainLock`.
+**/
+static bool Chain_BorrowBlockTransactions(blockchain_t* chain, size_t index, block_t** outBlock, bool* outLoadedFromDisk) {
+    if (!chain || !chain->blocks || !outBlock || !outLoadedFromDisk) {
+        return false;
+    }
+
+    *outBlock = NULL;
+    *outLoadedFromDisk = false;
+
+    block_t* blk = (block_t*)DynArr_at(chain->blocks, index);
+    if (blk && blk->transactions) {
+        *outBlock = blk;
+        return true;
+    }
+
+    block_t* loadedBlk = NULL;
+    size_t txCount = 0;
+    if (!Chain_LoadBlockFromFile(chainDataDir, (uint64_t)index, true, &loadedBlk, &txCount) || !loadedBlk) {
+        return false;
+    }
+
+    *outBlock = loadedBlk;
+    *outLoadedFromDisk = true;
+    return true;
+}
+
+static void Chain_ReturnBlockTransactions(block_t* blk, bool loadedFromDisk) {
+    if (!loadedFromDisk || !blk) {
+        return;
+    }
+
+    if (blk->transactions) {
+        DynArr_destroy(blk->transactions);
+    }
+    free(blk);
+}
+
 bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
     if (!chain) {
         return false;
@@ -105,23 +151,28 @@ bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
 
     uint256_t rebuiltSupply = uint256_from_u64(0);
     for (size_t i = 0; i < chain->size; ++i) {
-        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
-        if (!blk || !blk->transactions) {
+        block_t* blk = NULL;
+        bool loadedFromDisk = false;
+        if (!Chain_BorrowBlockTransactions(chain, i, &blk, &loadedFromDisk)) {
             return false;
         }
 
         for (size_t j = 0; j < DynArr_size(blk->transactions); ++j) {
             signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, j);
             if (!tx) {
+                Chain_ReturnBlockTransactions(blk, loadedFromDisk);
                 return false;
             }
 
             if (Address_IsCoinbase(tx->transaction.senderAddress)) {
                 if (uint256_add_u64(&rebuiltSupply, tx->transaction.amount1)) {
+                    Chain_ReturnBlockTransactions(blk, loadedFromDisk);
                     return false;
                 }
             }
         }
+
+        Chain_ReturnBlockTransactions(blk, loadedFromDisk);
     }
 
     currentSupply = rebuiltSupply;
@@ -168,28 +219,43 @@ void Chain_Destroy(blockchain_t* chain) {
     }
 }
 
-bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
+/**
+ * Append `block` to the tip.
+ *
+ * Caller MUST already hold `chainLock` (write) and `balanceSheetLock`, and MUST call
+ * Chain_OnTipAdvanced afterwards (outside the locks) if this returns true. Chain_AddBlock is the
+ * locked wrapper for single appends; Chain_ReplaceBranch drives this directly so that a whole
+ * branch swap happens under one lock acquisition.
+**/
+static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
     bool ok = true;
 
-    if (!chain || !block || !chain->blocks) {
+    if (!chain || !block || !chain->blocks || !block->transactions) {
         return false;
     }
-
-    if (!block->transactions) {
-        return false;
-    }
-
-    // Acquire global write locks to protect chain and balance sheet mutations.
-    pthread_rwlock_wrlock(&chainLock);
-    pthread_mutex_lock(&balanceSheetLock);
 
     // Ensure the incoming block's header.blockNumber matches the index it will be appended at.
     size_t expectedIndex = DynArr_size(chain->blocks);
     if (block->header.blockNumber != expectedIndex) {
         // Mismatched block number; reject to avoid duplicate indices or inconsistent headers.
-        pthread_mutex_unlock(&balanceSheetLock);
-        pthread_rwlock_unlock(&chainLock);
         return false;
+    }
+
+    // Ensure the block actually builds on our tip. Without this, a rollback-then-reapply path can
+    // splice blocks from two different forks into a chain that no longer links up.
+    if (expectedIndex > 0) {
+        block_t* parent = (block_t*)DynArr_at(chain->blocks, expectedIndex - 1);
+        if (!parent) {
+            return false;
+        }
+
+        uint8_t parentHash[32];
+        Block_CalculateHash(parent, parentHash);
+        if (memcmp(parentHash, block->header.prevHash, sizeof(parentHash)) != 0) {
+            printf("Chain_AddBlock: validation failed: blockIndex=%zu prevHash does not match current tip\n",
+                expectedIndex);
+            return false;
+        }
     }
 
     // Ensure the block was mined at the difficulty this chain requires at that height. Without this
@@ -201,8 +267,6 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
             expectedIndex,
             (unsigned int)expectedTarget,
             (unsigned int)block->header.difficultyTarget);
-        pthread_mutex_unlock(&balanceSheetLock);
-        pthread_rwlock_unlock(&chainLock);
         return false;
     }
 
@@ -349,10 +413,37 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
                 }
             }
         }
+
+        // Advance supply and reward here rather than in each caller. Callers used to do this
+        // themselves, which meant the orphan-attach and maintenance-thread paths never did it: the
+        // next block's coinbase was then validated against a stale currentReward and rejected
+        // forever. It also has to happen per block so that applying a whole branch works.
+        if (ok) {
+            (void)uint256_add_u64(&currentSupply, expectedCoinbaseAmount);
+            currentReward = CalculateBlockReward(currentSupply, chain);
+        }
         // ok remains true if no failures
     } while (0);
 
-    // Release locks
+    if (ok) {
+        printf("Added new block to chain:\n");
+        Block_ShortPrint(block);
+    }
+
+    return ok;
+}
+
+bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
+    if (!chain || !block || !chain->blocks || !block->transactions) {
+        return false;
+    }
+
+    // Acquire global write locks to protect chain and balance sheet mutations.
+    pthread_rwlock_wrlock(&chainLock);
+    pthread_mutex_lock(&balanceSheetLock);
+
+    bool ok = Chain_AddBlockLocked(chain, block);
+
     pthread_mutex_unlock(&balanceSheetLock);
     pthread_rwlock_unlock(&chainLock);
 
@@ -360,11 +451,6 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
         // Every path that appends comes through here, so this is where difficulty/DAG catch up.
         Chain_OnTipAdvanced(chain);
     }
-
-    printf("Added new block to chain:\n");
-    Block_ShortPrint(block);
-
-    /* Debug proof removed: coinbase == baseReward + totalFees was printed here during debugging. */
 
     return ok;
 }
@@ -439,16 +525,17 @@ bool Chain_IsValid(blockchain_t* chain) {
     return true;
 }
 
-bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
+/**
+ * Truncate the chain to `height` blocks and rebuild the balance sheet and supply from what remains.
+ *
+ * Caller MUST already hold `chainLock` (write) and `balanceSheetLock`, and MUST call
+ * Chain_OnTipAdvanced afterwards (outside the locks). Chain_RollbackToHeight is the locked wrapper.
+**/
+static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
     if (!chain || !chain->blocks) return false;
-
-    pthread_rwlock_wrlock(&chainLock);
-    pthread_mutex_lock(&balanceSheetLock);
 
     size_t cur = DynArr_size(chain->blocks);
     if (height >= cur) {
-        pthread_mutex_unlock(&balanceSheetLock);
-        pthread_rwlock_unlock(&chainLock);
         return true; // nothing to do
     }
 
@@ -470,23 +557,18 @@ bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
     BalanceSheet_Destroy();
     BalanceSheet_Init();
 
+    // Supply is accumulated in this same pass. Doing it here rather than in a second
+    // Chain_RecomputeRuntimeState pass is what lets rollback work at all: that function used to
+    // bail on any header-only block, which is every block once the chain has been saved or loaded.
+    uint256_t rebuiltSupply = uint256_from_u64(0);
+
     for (size_t i = 0; i < chain->size; ++i) {
-        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
-        block_t* toProcess = blk;
+        block_t* toProcess = NULL;
         bool loaded = false;
 
-        if (!blk || !blk->transactions) {
-            // Try to load from disk
-            block_t* loadedBlk = NULL;
-            size_t txCount = 0;
-            if (!Chain_LoadBlockFromFile(chainDataDir, (uint64_t)i, true, &loadedBlk, &txCount)) {
-                // Can't rebuild without transactions
-                pthread_mutex_unlock(&balanceSheetLock);
-                pthread_rwlock_unlock(&chainLock);
-                return false;
-            }
-            toProcess = loadedBlk;
-            loaded = true;
+        if (!Chain_BorrowBlockTransactions(chain, i, &toProcess, &loaded)) {
+            // Can't rebuild without transactions
+            return false;
         }
 
         // Apply transactions
@@ -498,6 +580,7 @@ bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
 
                 // Coinbase credit
                 if (Address_IsCoinbase(tx->transaction.senderAddress)) {
+                    (void)uint256_add_u64(&rebuiltSupply, tx->transaction.amount1);
                     balance_sheet_entry_t entry;
                     if (!BalanceSheet_Lookup(tx->transaction.recipientAddress1, &entry)) {
                         memset(&entry, 0, sizeof(entry));
@@ -552,17 +635,22 @@ bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
             }
         }
 
-        if (loaded && toProcess) {
-            if (toProcess->transactions) DynArr_destroy(toProcess->transactions);
-            free(toProcess);
-        }
+        Chain_ReturnBlockTransactions(toProcess, loaded);
     }
 
-    if (!Chain_RecomputeRuntimeState(chain)) {
-        pthread_mutex_unlock(&balanceSheetLock);
-        pthread_rwlock_unlock(&chainLock);
-        return false;
-    }
+    currentSupply = rebuiltSupply;
+    currentReward = CalculateBlockReward(currentSupply, chain);
+
+    return true;
+}
+
+bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
+    if (!chain || !chain->blocks) return false;
+
+    pthread_rwlock_wrlock(&chainLock);
+    pthread_mutex_lock(&balanceSheetLock);
+
+    bool ok = Chain_RollbackToHeightLocked(chain, height);
 
     pthread_mutex_unlock(&balanceSheetLock);
     pthread_rwlock_unlock(&chainLock);
@@ -570,7 +658,293 @@ bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
     // A reorg can move the tip back across an adjustment boundary, so the target must come down too.
     Chain_OnTipAdvanced(chain);
 
+    return ok;
+}
+
+static int Chain_CompareTimestamps(const void* lhs, const void* rhs) {
+    const uint64_t a = *(const uint64_t*)lhs;
+    const uint64_t b = *(const uint64_t*)rhs;
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+/**
+ * Median timestamp of the last MEDIAN_TIME_SPAN blocks. Caller must hold `chainLock`.
+**/
+static uint64_t Chain_MedianTimePastLocked(blockchain_t* chain) {
+    if (!chain || !chain->blocks) {
+        return 0ULL;
+    }
+
+    const size_t size = DynArr_size(chain->blocks);
+    if (size == 0) {
+        return 0ULL;
+    }
+
+    size_t span = size < MEDIAN_TIME_SPAN ? size : MEDIAN_TIME_SPAN;
+    uint64_t samples[MEDIAN_TIME_SPAN];
+    size_t taken = 0;
+    for (size_t i = 0; i < span; ++i) {
+        block_t* blk = (block_t*)DynArr_at(chain->blocks, size - 1 - i);
+        if (!blk) {
+            continue;
+        }
+        samples[taken++] = blk->header.timestamp;
+    }
+
+    if (taken == 0) {
+        return 0ULL;
+    }
+
+    qsort(samples, taken, sizeof(uint64_t), Chain_CompareTimestamps);
+    return samples[taken / 2];
+}
+
+bool Chain_IsInitialBlockDownload(blockchain_t* chain) {
+    if (!chain || !chain->blocks) {
+        return true;
+    }
+
+    if (DynArr_size(chain->blocks) == 0) {
+        return true;
+    }
+
+    const uint64_t medianTime = Chain_MedianTimePastLocked(chain);
+    const uint64_t now = get_current_time_ms();
+    if (medianTime == 0ULL || now <= medianTime) {
+        return false; // we are at (or ahead of) the current tip time
+    }
+
+    const uint64_t ageMs = now - medianTime;
+    const uint64_t thresholdMs = IBD_TIP_AGE_BLOCKS * (uint64_t)TARGET_BLOCK_TIME * 1000ULL;
+    return ageMs > thresholdMs;
+}
+
+/**
+ * Verify that a candidate branch is internally linked and attaches to the block below `forkHeight`.
+ * Caller must hold `chainLock`.
+**/
+static bool Chain_BranchIsLinkedLocked(blockchain_t* chain, size_t forkHeight, block_t** blocks, size_t count) {
+    if (!chain || !chain->blocks || !blocks || count == 0 || forkHeight == 0) {
+        return false;
+    }
+
+    block_t* parent = (block_t*)DynArr_at(chain->blocks, forkHeight - 1);
+    if (!parent) {
+        return false;
+    }
+
+    uint8_t expectedPrevHash[32];
+    Block_CalculateHash(parent, expectedPrevHash);
+
+    for (size_t i = 0; i < count; ++i) {
+        if (!blocks[i] || !blocks[i]->transactions) {
+            return false;
+        }
+        if (blocks[i]->header.blockNumber != (uint64_t)(forkHeight + i)) {
+            return false;
+        }
+        if (memcmp(blocks[i]->header.prevHash, expectedPrevHash, sizeof(expectedPrevHash)) != 0) {
+            return false;
+        }
+        Block_CalculateHash(blocks[i], expectedPrevHash);
+    }
+
     return true;
+}
+
+static void Chain_FreeBlockArray(block_t** blocks, size_t count, size_t consumedByChain) {
+    if (!blocks) {
+        return;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (!blocks[i]) {
+            continue;
+        }
+        if (i < consumedByChain) {
+            // Chain_AddBlockLocked shallow-copies the struct, so the chain owns the transactions
+            // now. Free only our wrapper -- Block_Destroy would take the chain's array with it.
+            free(blocks[i]);
+        } else {
+            Block_Destroy(blocks[i]);
+        }
+    }
+
+    free(blocks);
+}
+
+uint64_t Chain_ReorgPenaltyForDepth(uint64_t reorgDepth) {
+    return FetchScheduler_ComputeReorgPenaltyBlocks(reorgDepth);
+}
+
+bool Chain_ReplaceBranch(blockchain_t* chain,
+                         size_t forkHeight,
+                         block_t** newBlocks,
+                         size_t count,
+                         uint64_t observedAtTipHeight) {
+    if (!chain || !chain->blocks || !newBlocks || count == 0 || forkHeight == 0) {
+        return false;
+    }
+
+    pthread_rwlock_wrlock(&chainLock);
+    pthread_mutex_lock(&balanceSheetLock);
+
+    bool ok = false;
+    block_t** snapshot = NULL;      // deep copies of the blocks we are replacing
+    size_t snapshotCount = 0;
+    size_t snapshotConsumed = 0;
+    block_t** candidate = NULL;     // deep copies of the branch we are applying
+    size_t candidateConsumed = 0;
+
+    do {
+        const size_t tipCount = DynArr_size(chain->blocks);
+        if (forkHeight > tipCount) {
+            break; // fork point is beyond our chain; nothing to replace
+        }
+
+        if (!Chain_BranchIsLinkedLocked(chain, forkHeight, newBlocks, count)) {
+            printf("Chain_ReplaceBranch: candidate branch at height %zu is not linked; refusing\n", forkHeight);
+            break;
+        }
+
+        // Horizen-style delayed block submission penalty. A branch that forks `depth` blocks below
+        // our tip is held until our own chain has advanced `penalty(depth)` blocks, so a rented-
+        // hashrate attacker cannot win by dumping a privately mined branch in one go. The depth is
+        // measured at FIRST OBSERVATION and never recomputed: if it were re-derived from the moving
+        // tip, depth and elapsed would both grow by one per block while penalty(depth) grows
+        // faster, and a penalized branch could never be adopted at all.
+        // The initial-block-download exemption is decided here from local state only, never handed
+        // in by a caller: a peer claiming a huge height must not be able to switch the penalty off.
+        const bool inInitialBlockDownload = Chain_IsInitialBlockDownload(chain);
+        const uint64_t tipHeight = tipCount > 0 ? (uint64_t)(tipCount - 1) : 0ULL;
+        if (!inInitialBlockDownload && tipCount > forkHeight) {
+            const uint64_t observedTip = observedAtTipHeight > tipHeight ? tipHeight : observedAtTipHeight;
+            const uint64_t depth = observedTip >= (uint64_t)forkHeight
+                ? (observedTip - (uint64_t)forkHeight + 1ULL)
+                : 1ULL;
+            const uint64_t penalty = FetchScheduler_ComputeReorgPenaltyBlocks(depth);
+            const uint64_t elapsed = tipHeight >= observedTip ? (tipHeight - observedTip) : 0ULL;
+
+            if (elapsed < penalty) {
+                printf("Chain_ReplaceBranch: deferring reorg at height %zu: depth=%" PRIu64
+                       " penalty=%" PRIu64 " elapsed=%" PRIu64 "\n",
+                    forkHeight, depth, penalty, elapsed);
+                break;
+            }
+        }
+
+        // Most cumulative work wins, not most blocks. Difficulty varies, so a long low-difficulty
+        // branch must not beat a short high-difficulty one. Strictly greater, so tied tips do not
+        // cause the two nodes to keep swapping.
+        uint256_t incumbentWork;
+        uint256_t candidateWork;
+        if (!Chain_ComputeWorkRange(chain, forkHeight, tipCount, &incumbentWork) ||
+            !Chain_ComputeBranchWork(newBlocks, count, &candidateWork)) {
+            break;
+        }
+        if (uint256_cmp(&candidateWork, &incumbentWork) <= 0) {
+            break; // not heavier; keep what we have
+        }
+
+        // Snapshot what we are about to discard so a failed apply can be undone. The in-memory
+        // blocks are freed by the rollback and the on-disk copy is overwritten by the next save,
+        // so without this a partial apply would be unrecoverable.
+        snapshotCount = tipCount - forkHeight;
+        if (snapshotCount > 0) {
+            snapshot = (block_t**)calloc(snapshotCount, sizeof(block_t*));
+            if (!snapshot) {
+                break;
+            }
+
+            bool snapshotOk = true;
+            for (size_t i = 0; i < snapshotCount; ++i) {
+                block_t* src = NULL;
+                bool loadedFromDisk = false;
+                if (!Chain_BorrowBlockTransactions(chain, forkHeight + i, &src, &loadedFromDisk)) {
+                    snapshotOk = false;
+                    break;
+                }
+                snapshot[i] = Block_Copy(src);
+                Chain_ReturnBlockTransactions(src, loadedFromDisk);
+                if (!snapshot[i]) {
+                    snapshotOk = false;
+                    break;
+                }
+            }
+            if (!snapshotOk) {
+                break;
+            }
+        }
+
+        // Apply copies so the caller's blocks are never aliased by the chain nor destroyed by a
+        // rollback -- the caller keeps ownership of what it passed in, whatever happens here.
+        candidate = (block_t**)calloc(count, sizeof(block_t*));
+        if (!candidate) {
+            break;
+        }
+        bool copiedAll = true;
+        for (size_t i = 0; i < count; ++i) {
+            candidate[i] = Block_Copy(newBlocks[i]);
+            if (!candidate[i]) {
+                copiedAll = false;
+                break;
+            }
+        }
+        if (!copiedAll) {
+            break;
+        }
+
+        if (!Chain_RollbackToHeightLocked(chain, forkHeight)) {
+            printf("Chain_ReplaceBranch: rollback to height %zu failed; chain unchanged\n", forkHeight);
+            break;
+        }
+
+        bool applied = true;
+        for (size_t i = 0; i < count; ++i) {
+            if (!Chain_AddBlockLocked(chain, candidate[i])) {
+                applied = false;
+                break;
+            }
+            candidateConsumed++;
+        }
+
+        if (applied) {
+            ok = true;
+            break;
+        }
+
+        // Undo: drop whatever of the candidate branch made it in and put the original blocks back.
+        printf("Chain_ReplaceBranch: candidate branch failed to apply at height %zu; restoring previous chain\n",
+            forkHeight + candidateConsumed);
+
+        if (!Chain_RollbackToHeightLocked(chain, forkHeight)) {
+            fprintf(stderr, "Chain_ReplaceBranch: FAILED to roll back after a failed apply; chain is truncated to %zu\n",
+                forkHeight);
+            break;
+        }
+        candidateConsumed = 0; // the rollback freed the copies' transactions
+
+        for (size_t i = 0; i < snapshotCount; ++i) {
+            if (!Chain_AddBlockLocked(chain, snapshot[i])) {
+                fprintf(stderr, "Chain_ReplaceBranch: FAILED to restore original block %zu; chain is truncated to %zu\n",
+                    forkHeight + i, forkHeight + i);
+                break;
+            }
+            snapshotConsumed++;
+        }
+    } while (0);
+
+    Chain_FreeBlockArray(snapshot, snapshotCount, snapshotConsumed);
+    Chain_FreeBlockArray(candidate, candidate ? count : 0, candidateConsumed);
+
+    pthread_mutex_unlock(&balanceSheetLock);
+    pthread_rwlock_unlock(&chainLock);
+
+    Chain_OnTipAdvanced(chain);
+
+    return ok;
 }
 
 void Chain_Wipe(blockchain_t* chain) {
@@ -1149,13 +1523,16 @@ uint32_t Chain_ComputeTargetAtHeight(blockchain_t* chain, uint64_t height, uint3
     }
 
     const uint64_t targetTime = (uint64_t)TARGET_BLOCK_TIME * 1000ULL * (uint64_t)DIFFICULTY_ADJUSTMENT_INTERVAL;
-    double timeRatio = (double)actualTime / (double)targetTime;
 
-    // Clamp per-epoch target movement: at most x2 easier or x2 harder. TODO: Check if the clamp should be more aggressive or looser
-    if (timeRatio > 2.0) {
-        timeRatio = 2.0;
-    } else if (timeRatio < 0.5) {
-        timeRatio = 0.5;
+    // Clamp per-epoch target movement: at most x2 easier or x2 harder. Clamping the measured span
+    // is equivalent to clamping the ratio, but stays in integers.
+    // Everything below is deliberately integer-only: the retarget is consensus-critical, and any
+    // floating-point rounding difference between nodes would make them disagree on the target.
+    uint64_t clampedTime = actualTime;
+    if (clampedTime > targetTime * 2ULL) {
+        clampedTime = targetTime * 2ULL;
+    } else if (clampedTime < targetTime / 2ULL) {
+        clampedTime = targetTime / 2ULL;
     }
 
     uint32_t exponent = currentTarget >> 24;
@@ -1164,15 +1541,18 @@ uint32_t Chain_ComputeTargetAtHeight(blockchain_t* chain, uint64_t height, uint3
         return INITIAL_DIFFICULTY;
     }
 
-    double newMantissa = (double)mantissa * timeRatio;
+    // newMantissa = mantissa * clampedTime / targetTime. The mantissa is at most 23 bits and
+    // clampedTime at most 2 * targetTime (~30 bits at the configured block time), so the product
+    // cannot overflow 64 bits.
+    uint64_t newMantissa = ((uint64_t)mantissa * clampedTime) / targetTime;
 
     // Normalize to compact format range.
-    while (newMantissa > 8388607.0) { // 0x007fffff
-        newMantissa /= 256.0;
+    while (newMantissa > 0x007fffffULL) {
+        newMantissa /= 256ULL;
         exponent++;
     }
-    while (newMantissa > 0.0 && newMantissa < 32768.0 && exponent > 3) { // Keep coefficient in normal range
-        newMantissa *= 256.0;
+    while (newMantissa > 0ULL && newMantissa < 32768ULL && exponent > 3) { // Keep coefficient in normal range
+        newMantissa *= 256ULL;
         exponent--;
     }
 
@@ -1204,6 +1584,93 @@ uint32_t Chain_GetTargetForHeight(blockchain_t* chain, uint64_t height) {
     }
 
     return target;
+}
+
+bool Chain_ComputeBlockWork(uint32_t difficultyTargetBits, uint256_t* outWork) {
+    if (!outWork) {
+        return false;
+    }
+
+    uint8_t targetBytes[32];
+    if (!DecodeCompactTarget(difficultyTargetBits, targetBytes)) {
+        return false;
+    }
+
+    const uint256_t target = uint256_from_be_bytes(targetBytes);
+
+    // work = 2^256 / (target + 1). 2^256 is not representable, but since 2^256 >= target + 1 it
+    // equals (~target / (target + 1)) + 1, which is: all integer, no approximation.
+    uint256_t denominator = target;
+    if (uint256_add_u64(&denominator, 1ULL) || uint256_is_zero(&denominator)) {
+        return false; // target was the maximum representable value
+    }
+
+    uint256_t numerator = target;
+    uint256_bitwise_not(&numerator);
+
+    uint256_t work;
+    if (!uint256_divide(&numerator, &denominator, &work)) {
+        return false;
+    }
+    if (uint256_add_u64(&work, 1ULL)) {
+        return false;
+    }
+
+    *outWork = work;
+    return true;
+}
+
+bool Chain_ComputeWorkRange(blockchain_t* chain, size_t from, size_t to, uint256_t* outWork) {
+    if (!chain || !chain->blocks || !outWork || from > to) {
+        return false;
+    }
+
+    if (to > DynArr_size(chain->blocks)) {
+        return false;
+    }
+
+    uint256_t total = uint256_from_u64(0);
+    for (size_t i = from; i < to; ++i) {
+        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
+        if (!blk) {
+            return false;
+        }
+
+        uint256_t work;
+        if (!Chain_ComputeBlockWork(blk->header.difficultyTarget, &work)) {
+            return false;
+        }
+        if (uint256_add(&total, &work)) {
+            return false; // 256-bit overflow; not reachable for any real chain
+        }
+    }
+
+    *outWork = total;
+    return true;
+}
+
+bool Chain_ComputeBranchWork(block_t** blocks, size_t count, uint256_t* outWork) {
+    if (!blocks || !outWork) {
+        return false;
+    }
+
+    uint256_t total = uint256_from_u64(0);
+    for (size_t i = 0; i < count; ++i) {
+        if (!blocks[i]) {
+            return false;
+        }
+
+        uint256_t work;
+        if (!Chain_ComputeBlockWork(blocks[i]->header.difficultyTarget, &work)) {
+            return false;
+        }
+        if (uint256_add(&total, &work)) {
+            return false;
+        }
+    }
+
+    *outWork = total;
+    return true;
 }
 
 void Chain_OnTipAdvanced(blockchain_t* chain) {

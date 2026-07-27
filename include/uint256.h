@@ -114,6 +114,72 @@ static inline int uint256_cmp(const uint256_t* a, const uint256_t* b) {
     return 0;
 }
 
+static inline bool uint256_is_zero(const uint256_t* a) {
+    return a && a->limbs[0] == 0 && a->limbs[1] == 0 && a->limbs[2] == 0 && a->limbs[3] == 0;
+}
+
+/**
+ * Builds a uint256 from 32 big-endian bytes, the layout used by hashes and by decoded
+ * difficulty targets (see DecodeCompactTarget).
+**/
+static inline uint256_t uint256_from_be_bytes(const uint8_t bytes[32]) {
+    uint256_t res = {{0, 0, 0, 0}};
+    if (!bytes) {
+        return res;
+    }
+
+    for (int limb = 0; limb < 4; ++limb) {
+        // limbs[0] is the least significant, so it holds the LAST eight bytes.
+        const uint8_t* src = bytes + (3 - limb) * 8;
+        uint64_t value = 0;
+        for (int b = 0; b < 8; ++b) {
+            value = (value << 8) | (uint64_t)src[b];
+        }
+        res.limbs[limb] = value;
+    }
+
+    return res;
+}
+
+static inline void uint256_bitwise_not(uint256_t* a) {
+    if (!a) {
+        return;
+    }
+    for (int i = 0; i < 4; ++i) {
+        a->limbs[i] = ~a->limbs[i];
+    }
+}
+
+/**
+ * Unsigned 256-bit division by restoring binary long division.
+ * Returns false (leaving *outQuotient untouched) when dividing by zero.
+**/
+static inline bool uint256_divide(const uint256_t* numerator, const uint256_t* denominator, uint256_t* outQuotient) {
+    if (!numerator || !denominator || !outQuotient || uint256_is_zero(denominator)) {
+        return false;
+    }
+
+    uint256_t quotient = uint256_from_u64(0);
+    uint256_t remainder = uint256_from_u64(0);
+
+    for (int bit = 255; bit >= 0; --bit) {
+        // remainder = (remainder << 1) | bit_of_numerator
+        for (int i = 3; i > 0; --i) {
+            remainder.limbs[i] = (remainder.limbs[i] << 1) | (remainder.limbs[i - 1] >> 63);
+        }
+        remainder.limbs[0] <<= 1;
+        remainder.limbs[0] |= (numerator->limbs[bit / 64] >> (bit % 64)) & 1ULL;
+
+        if (uint256_cmp(&remainder, denominator) >= 0) {
+            (void)uint256_subtract(&remainder, denominator);
+            quotient.limbs[bit / 64] |= (1ULL << (bit % 64));
+        }
+    }
+
+    *outQuotient = quotient;
+    return true;
+}
+
 static inline void uint256_serialize(const uint256_t* value, char* out) {
     if (!value || !out) {
         return;

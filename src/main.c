@@ -289,7 +289,7 @@ static bool ComputeEpochDagBytesForHeightFromChain(const blockchain_t* chain, ui
     int64_t growth = (int64_t)((int64_t)DAG_BASE_GROWTH * difficultyDelta);
 
     if (growth > 0) {
-        int64_t maxUp = (int64_t)((DAG_BASE_SIZE * 15ULL) / 100ULL);
+        int64_t maxUp = (int64_t)((DAG_BASE_SIZE * DAG_MAX_UP_SWING_PERCENT_NUM) / DAG_SWING_PERCENT_DEN);
         if (growth > maxUp) {
             growth = maxUp;
         }
@@ -297,7 +297,7 @@ static bool ComputeEpochDagBytesForHeightFromChain(const blockchain_t* chain, ui
             growth = (int64_t)DAG_MAX_UP_SWING_GB;
         }
     } else {
-        int64_t maxDown = (int64_t)((DAG_BASE_SIZE * 10ULL) / 100ULL);
+        int64_t maxDown = (int64_t)((DAG_BASE_SIZE * DAG_MAX_DOWN_SWING_PERCENT_NUM) / DAG_SWING_PERCENT_DEN);
         if (-growth > maxDown) {
             growth = -maxDown;
         }
@@ -403,6 +403,36 @@ static bool Block_GetCoinbaseAndFeeTotals(const block_t* block, uint64_t* outCoi
     return true;
 }
 
+/**
+ * Ask `peerConn` for its blocks in [topHeight - REORG_FETCH_DEPTH, topHeight], newest first.
+ *
+ * Replies arrive asynchronously as BLOCK_DATA and go through Node_ParseAndAcceptBlock, which routes
+ * blocks below our tip into the orphan pool rather than dropping them. The pool then locates the
+ * common ancestor by prevHash linkage and Chain_ReplaceBranch decides whether to adopt. FETCH_BLOCK
+ * already answers from the peer's own chain, so finding a fork needs no new packet type.
+**/
+static void RequestForkWindow(net_node_t* node, tcp_connection_t* peerConn, uint64_t topHeight) {
+    if (!node || !peerConn) {
+        return;
+    }
+
+    const uint64_t from = (topHeight > REORG_FETCH_DEPTH) ? (topHeight - REORG_FETCH_DEPTH) : 0ULL;
+    printf("Requesting peer blocks %" PRIu64 "..%" PRIu64 " to locate the fork point\n", from, topHeight);
+
+    for (uint64_t hh = topHeight + 1; hh-- > from; ) {
+        uint64_t req = hh;
+        if (Node_SendPacket(node, peerConn, PACKET_TYPE_FETCH_BLOCK, &req, sizeof(req)) != 0) {
+            break;
+        }
+        if (hh == 0) {
+            break;
+        }
+    }
+
+    // Give the asynchronous replies time to land in the pool.
+    sleep_for_milliseconds(SYNC_REQUEST_TIMEOUT_MS);
+}
+
 static bool MineAndAppendBlock(blockchain_t* chain,
                                block_t* block,
                                uint256_t* currentSupply,
@@ -444,8 +474,6 @@ static bool MineAndAppendBlock(blockchain_t* chain,
         BalanceSheet_SaveToFile(chainDataDir);
     }
 
-    (void)uint256_add_u64(currentSupply, coinbaseAmount);
-
     uint8_t canonicalHash[32];
     uint8_t powHash[32];
     Block_CalculateHash(block, canonicalHash);
@@ -462,10 +490,8 @@ static bool MineAndAppendBlock(blockchain_t* chain,
         powHash[0], powHash[1], powHash[2], powHash[3],
         canonicalHash[0], canonicalHash[1], canonicalHash[2], canonicalHash[3]);
 
-    *currentReward = CalculateBlockReward(*currentSupply, chain);
-
-    // The difficulty retarget and epoch DAG rebuild happen in Chain_AddBlock, so that blocks we
-    // receive from peers advance them exactly like blocks we mine ourselves.
+    // Supply, reward, the difficulty retarget and the epoch DAG rebuild all happen inside
+    // Chain_AddBlock, so that blocks we receive from peers advance them exactly like ones we mine.
 
     return true;
 }
@@ -1072,36 +1098,25 @@ int main(int argc, char* argv[]) {
 
             // Continue syncing in a loop until we've caught up to the peer or no progress is made.
             bool madeProgressOverall = false;
+            int forkProbes = 0;
             while (true) {
                 uint64_t localHeight = (uint64_t)Chain_Size(chain);
 
-            // Only penalize small near-tip gaps. Large gaps are treated as normal catch-up,
-            // because a much taller peer on the same chain is not evidence of a reorg. TODO: Maybe look at this again some other day.
-            bool isInitialSync = (localHeight == 0) || ((peerHeight > localHeight) && ((peerHeight - localHeight) > INITIAL_SYNC_HEIGHT_DIFF));
+            // Whether we are catching up rather than following the tip. Derived from our own chain
+            // only: this used to key off the peer's advertised height, which let any peer claiming
+            // localHeight + INITIAL_SYNC_HEIGHT_DIFF switch off reorg handling for the session.
+            bool isInitialSync = Chain_IsInitialBlockDownload(chain);
 
-            // Compute penalty and adjusted peer height.
-            uint64_t delay = (peerHeight > localHeight) ? (peerHeight - localHeight) : 0ULL;
-            uint64_t penalty = isInitialSync ? 0ULL : FetchScheduler_ComputeReorgPenaltyBlocks(delay);
-            uint64_t adjustedPeerHeight = (peerHeight > penalty) ? (peerHeight - penalty) : 0ULL;
-
-            // Ensure we always make forward progress: if the penalty would reduce the
-            // target below our current height, fetch at least the next block. This
-            // lets us apply penalties for near-tip reorg risk while still allowing
-            // normal syncing when the peer is ahead by a small amount.
-            if (adjustedPeerHeight <= localHeight) {
-                adjustedPeerHeight = localHeight + 1;
-            }
-
-            if (adjustedPeerHeight > peerHeight) {
-                adjustedPeerHeight = peerHeight;
-            }
-
-            printf("syncing: peerHeight=%" PRIu64 " adjusted=%" PRIu64 " local=%" PRIu64 " penalty=%" PRIu64 "\n",
-                peerHeight, adjustedPeerHeight, localHeight, penalty);
+            // The reorg penalty is NOT applied to the fetch window. It is a delay on adopting a
+            // competing branch (enforced in Chain_ReplaceBranch), not on catching up: penalizing
+            // the height gap to a peer only throttled honest sync, and for gaps of 4-50 it
+            // collapsed the window to a single block per pass.
+            printf("syncing: peerHeight=%" PRIu64 " local=%" PRIu64 " initialSync=%s\n",
+                peerHeight, localHeight, isInitialSync ? "yes" : "no");
 
                 // Windowed parallel fetch
                 uint64_t start = localHeight;
-                uint64_t end = adjustedPeerHeight; // exclusive target height
+                uint64_t end = peerHeight; // exclusive target height
             uint64_t nextReq = start;
 
             const int maxInFlight = MAX_PARALLEL_FETCHES;
@@ -1176,59 +1191,29 @@ int main(int argc, char* argv[]) {
 
                         // Check whether this block builds on our expected tip. If not, it's a reorg.
                         if (memcmp(fetched->header.prevHash, expectedPrevHash, sizeof(expectedPrevHash)) != 0) {
-                            // Find matching ancestor in our current chain (if any)
-                            ssize_t matchIndex = -1;
-                            size_t chainSz = Chain_Size(chain);
-                            uint8_t tmpHash[32];
-                            for (size_t bi = 0; bi < chainSz; ++bi) {
-                                block_t* b = NULL;
-                                if (!Chain_GetBlockCopy(chain, bi, &b) || !b) continue;
-                                Block_CalculateHash(b, tmpHash);
-                                if (memcmp(tmpHash, fetched->header.prevHash, sizeof(tmpHash)) == 0) {
-                                    matchIndex = (ssize_t)bi;
-                                    Block_Destroy(b);
-                                    break;
-                                }
-                                Block_Destroy(b);
-                            }
+                            // Ask the peer for a window of blocks below the divergence so the orphan
+                            // pool can assemble its branch and find the true common ancestor by
+                            // prevHash linkage. FETCH_BLOCK answers from the peer's own chain, and
+                            // Node_ParseAndAcceptBlock now routes sub-tip blocks into the pool
+                            // instead of dropping them, so no protocol change is needed.
+                            //
+                            // We deliberately do NOT roll back here. The swap happens in
+                            // Chain_ReplaceBranch, which compares cumulative work, enforces the
+                            // Horizen reorg penalty, and restores our chain if the branch fails to
+                            // apply. The old code rolled back to height 0 whenever it could not find
+                            // the parent -- a full chain wipe, genesis included, that any peer could
+                            // trigger with a single unlinked block.
+                            printf("Divergence at height %" PRIu64 "; probing for the fork point\n", h);
+                            RequestForkWindow(node, peerConn, h);
 
-                            uint64_t reorgDepth = 0ULL;
-                            if (matchIndex >= 0) {
-                                reorgDepth = (uint64_t)localHeight - ((uint64_t)matchIndex + 1ULL);
+                            size_t reattached = OrphanPool_AttemptAttach(chain);
+                            if (reattached > 0) {
+                                printf("Reorg attached %zu block(s) from the peer's branch\n", reattached);
                             } else {
-                                // No match found: treat as full reorg depth equal to localHeight
-                                reorgDepth = localHeight;
+                                printf("Reorg candidate not adopted (lighter branch, or still serving its reorg penalty)\n");
                             }
 
-                            if (!isInitialSync) {
-                                uint64_t reorgPenalty = FetchScheduler_ComputeReorgPenaltyBlocks(reorgDepth);
-                                printf("Reorg detected at height %" PRIu64 ": depth=%" PRIu64 " penalty=%" PRIu64 "\n",
-                                       h, reorgDepth, reorgPenalty);
-
-                                // Rollback our chain to the matching ancestor (or to 0 if none)
-                                size_t rollbackTo = (matchIndex >= 0) ? (size_t)(matchIndex + 1) : 0;
-                                if (!Chain_RollbackToHeight(chain, rollbackTo)) {
-                                    printf("Failed to rollback to height %zu during reorg handling\n", rollbackTo);
-                                    inFlight = 0; // abort sync
-                                    break;
-                                }
-
-                                size_t reattached = OrphanPool_AttemptAttach(chain);
-                                if (reattached > 0) {
-                                    printf("Reorg rollback attached %zu orphan(s)\n", reattached);
-                                }
-
-                                // Apply additional penalty by shrinking end and restart window from current Chain_Size
-                                if (peerHeight > reorgPenalty) {
-                                    end = peerHeight - reorgPenalty;
-                                } else {
-                                    end = start;
-                                }
-                            } else {
-                                printf("Initial sync: reorg-like divergence ignored (height=%" PRIu64 ")\n", h);
-                            }
-
-                            // Free fetched block and reset window to pick up new adjusted end and expectedPrevHash
+                            // Free fetched block and reset the window against whatever our tip is now
                             Block_Destroy(fetched);
                             nextReq = Chain_Size(chain);
                             inFlight = 0;
@@ -1291,9 +1276,12 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // After the window completes, check progress and possibly refresh peer height
+            // After the window completes, check progress and possibly refresh peer height.
+            // This flag tracks THIS iteration only: it used to be set once and never cleared, so
+            // after a single productive pass the "no progress -> stop" guard below could never fire
+            // again and the outer loop could spin forever holding the REPL.
             uint64_t newLocal = (uint64_t)Chain_Size(chain);
-            if (newLocal > localHeight) madeProgressOverall = true;
+            madeProgressOverall = (newLocal > localHeight);
             printf("sync complete: localHeight=%" PRIu64 "\n", newLocal);
 
             // If we've caught up to the peer, stop. Otherwise refresh peerHeight and loop again.
@@ -1309,8 +1297,26 @@ int main(int argc, char* argv[]) {
             }
             pthread_mutex_unlock(&node->outboundLock);
 
-            // If no progress was made in this iteration, stop to avoid tight loop
+            // If no progress was made in this iteration, stop to avoid a tight loop -- but first
+            // consider that the peer may be ahead on a branch that forks BELOW our tip. In that
+            // case every block we asked for is unappendable and lands in the orphan pool, so the
+            // window completes having achieved nothing. Probe downwards for the fork point before
+            // giving up; this is the only trigger that fires for a genuine sub-tip fork, because
+            // the divergence check above can only see blocks that made it into our chain.
             if (!madeProgressOverall) {
+                if (peerHeight > newLocal && forkProbes < MAX_FORK_PROBE_ROUNDS) {
+                    forkProbes++;
+                    printf("No progress but peer is ahead (%" PRIu64 " > %" PRIu64 "); probing for a fork point\n",
+                        peerHeight, newLocal);
+                    RequestForkWindow(node, peerConn, newLocal);
+
+                    size_t attached = OrphanPool_AttemptAttach(chain);
+                    if (attached > 0) {
+                        printf("Fork probe adopted %zu block(s) from the peer's branch\n", attached);
+                        continue;
+                    }
+                    printf("Fork probe found nothing adoptable (lighter branch, or still serving its reorg penalty)\n");
+                }
                 break;
             }
 

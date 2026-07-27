@@ -43,14 +43,44 @@ static const int MAX_SYNC_RETRIES = 4; // retry attempts per block fetch
 static const uint64_t SYNC_BACKOFF_BASE_MS = 200ULL; // base backoff in ms (exponential)
 // Parallelism
 static const int MAX_PARALLEL_FETCHES = 8; // concurrent block fetches during windowed sync
-// Heuristic: if peer is this many blocks ahead, treat as initial sync
-static const uint64_t INITIAL_SYNC_HEIGHT_DIFF = 50ULL;
+// How far below a detected divergence we ask a peer for blocks, so the orphan pool has enough of
+// the competing branch to locate the fork point by prevHash linkage.
+static const uint64_t REORG_FETCH_DEPTH = 128ULL;
+// How many times one `sync` will probe downwards for a fork point before giving up, so a peer on a
+// permanently incompatible chain cannot keep us looping.
+static const int MAX_FORK_PROBE_ROUNDS = 3;
 
-// Reorg penalty configuration (used to penalize peers reporting higher heights but with delayed work)
+// Reorg penalty configuration (Horizen-style delayed block submission penalty).
+// A branch forking B blocks below our tip is held for penalty(B) blocks of local chain growth
+// before it may be adopted, so a rented-hashrate attacker has to sustain the attack publicly
+// instead of winning by dumping a privately mined branch.
+//
+// penalty(B) = ceil(FACTOR_NUM/FACTOR_DEN * B^EXPONENT * TARGET_BLOCK_TIME / REF_BLOCK_TIME)
+//
+// Expressed as integer rationals on purpose: this feeds fork choice, so it must evaluate
+// identically on every node. Floating point is not acceptable here.
 static const uint64_t REORG_PENALTY_GRACE_BLOCKS = 3ULL; // allow small reorgs without penalty
-static const double REORG_PENALTY_FACTOR = 1.0; // base scaling factor (theta)
-static const double REORG_PENALTY_EXPONENT = 2.0; // exponent p in penalty ~ B^p
-static const double REORG_PENALTY_REF_BLOCK_TIME = 150.0; // reference block time in seconds used by original scheme
+static const uint64_t REORG_PENALTY_FACTOR_NUM = 1ULL; // base scaling factor (theta), numerator
+static const uint64_t REORG_PENALTY_FACTOR_DEN = 1ULL; // base scaling factor (theta), denominator
+static const uint32_t REORG_PENALTY_EXPONENT = 2U; // exponent p in penalty ~ B^p
+static const uint64_t REORG_PENALTY_REF_BLOCK_TIME = 150ULL; // reference block time in seconds used by original scheme
+// Beyond this depth the penalty saturates. At the configured parameters penalty(1000) is already
+// ~600k blocks (over a year), so this only exists to keep the arithmetic away from overflow.
+static const uint64_t REORG_PENALTY_MAX_DEPTH = 1000ULL;
+
+// Upper bound on pooled orphan blocks. Orphans are accepted before the chain-derived difficulty
+// check (that lives in Chain_AddBlock, which orphans only reach on attach), so without a cap a
+// peer can push blocks at an arbitrary height until the node runs out of memory.
+static const size_t MAX_ORPHAN_BLOCKS = 512U;
+
+// A node whose chain tip is older than this many target block times is catching up rather than
+// following the tip, and is exempt from the reorg penalty (Horizen does the same via
+// IsInitialBlockDownload). Determined purely from local state, so an unverified peer cannot
+// trigger the exemption by claiming a large height.
+static const uint64_t IBD_TIP_AGE_BLOCKS = 500ULL;
+// Number of trailing blocks whose median timestamp is used for the age test above. Using a median
+// rather than the tip alone means a single miner cannot backdate one block to fake being in IBD.
+static const size_t MEDIAN_TIME_SPAN = 11U;
 
 // Reward schedule acceleration: 1 means normal-speed progression.
 #define EMISSION_ACCELERATION_FACTOR 1ULL
@@ -70,9 +100,12 @@ static const double REORG_PENALTY_REF_BLOCK_TIME = 150.0; // reference block tim
 #define DAG_BASE_GROWTH (1ULL << 30) // 1 GB per epoch, adjusted by acceleration
 //#define DAG_BASE_SIZE (6ULL << 30) // 6 GB, adjusted per cycle based off DAG_BASE_GROWTH
 #define DAG_BASE_SIZE (1ULL << 30) // TEMPORARY FOR TESTING
-// Swings - calculated as MIN(percentage, absolute GB) to prevent absurd swings from low hashrate or very large DAG growth
-#define DAG_MAX_UP_SWING_PERCENTAGE 1.15 // 15%
-#define DAG_MAX_DOWN_SWING_PERCENTAGE 0.90 // 10%
+// Swings - calculated as MIN(percentage, absolute GB) to prevent absurd swings from low hashrate or very large DAG growth.
+// Percentages are integer numerator/denominator pairs, never float literals: DAG size feeds PoW
+// verification, so it has to evaluate identically on every node.
+#define DAG_MAX_UP_SWING_PERCENT_NUM 15ULL // +15%
+#define DAG_MAX_DOWN_SWING_PERCENT_NUM 10ULL // -10%
+#define DAG_SWING_PERCENT_DEN 100ULL
 #define DAG_MAX_UP_SWING_GB (2ULL << 30) // 2 GB
 #define DAG_MAX_DOWN_SWING_GB (1ULL << 30) // 1 GB
 #define DAG_GENESIS_SEED 0x00 // Genesis seed is zeroes, every epoch's seed is the hash of the previous block, therefore unpredictable until the block is mined
@@ -184,7 +217,6 @@ static inline uint64_t CalculateBlockReward(uint256_t currentSupply, blockchain_
 }
 
 // Hashing DAG
-#include <math.h>
 static inline size_t CalculateTargetDAGSize(blockchain_t* chain) {
     // Base size plus (base growth * difficulty factor), adjusted by acceleration
     if (!chain || !chain->blocks) { return 0; } // Invalid
@@ -213,12 +245,12 @@ static inline size_t CalculateTargetDAGSize(blockchain_t* chain) {
     // Clamp
     if (growth > 0) {
         // Difficulty increased -> Clamp the UPWARD swing
-        int64_t maxUp = (int64_t)((DAG_BASE_SIZE * 15) / 100); // 15%
+        int64_t maxUp = (int64_t)((DAG_BASE_SIZE * DAG_MAX_UP_SWING_PERCENT_NUM) / DAG_SWING_PERCENT_DEN);
         if (growth > maxUp) growth = maxUp;
         if (growth > (int64_t)DAG_MAX_UP_SWING_GB) growth = DAG_MAX_UP_SWING_GB;
     } else {
         // Difficulty decreased -> Clamp the DOWNWARD swing
-        int64_t maxDown = (int64_t)((DAG_BASE_SIZE * 10) / 100); // 10%
+        int64_t maxDown = (int64_t)((DAG_BASE_SIZE * DAG_MAX_DOWN_SWING_PERCENT_NUM) / DAG_SWING_PERCENT_DEN);
         if (-growth > maxDown) growth = -maxDown;
         if (-growth > (int64_t)DAG_MAX_DOWN_SWING_GB) growth = -(int64_t)DAG_MAX_DOWN_SWING_GB;
     }

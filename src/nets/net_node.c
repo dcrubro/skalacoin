@@ -477,33 +477,54 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         return NODE_BLOCK_REJECTED;
     }
 
+    // The orphan pool stamps the local tip height at first sight; that stamp drives the reorg
+    // penalty and must be taken now, not re-derived later from a moved tip.
+    uint64_t chainSize = Chain_Size(currentChain);
+    const uint64_t observedAtTipHeight = chainSize > 0 ? (chainSize - 1) : 0ULL;
+
     // Temporary debug mode: force network-received blocks through the orphan pool to exercise reorg handling.
     if (forceOrphanReorgEnabled && blk->header.blockNumber > 0) {
-        OrphanPool_Insert(blk, blockHeight);
+        OrphanPool_Insert(blk, blockHeight, observedAtTipHeight);
         printf("Forced orphan BLOCK_DATA at height %" PRIu64 "\n", blockHeight);
         return NODE_BLOCK_ORPHAN_QUEUED;
     }
 
     // If parent is missing, insert into orphan pool instead of rejecting immediately.
-    uint64_t chainSize = Chain_Size(currentChain);
     if (blk->header.blockNumber > chainSize) {
         // Parent(s) missing; queue as orphan
-        OrphanPool_Insert(blk, blockHeight);
+        OrphanPool_Insert(blk, blockHeight, observedAtTipHeight);
         printf("Queued orphan BLOCK_DATA at height %" PRIu64 "\n", blockHeight);
         return NODE_BLOCK_ORPHAN_QUEUED;
     } else if (blk->header.blockNumber < chainSize) {
-        // Older block than current chain tip: reject
-        printf("Rejected BLOCK_DATA at height %" PRIu64 ": older than current chain\n", blockHeight);
-        DynArr_destroy(blk->transactions);
-        free(blk);
-        return NODE_BLOCK_REJECTED;
+        // A block below our tip is either one we already have, or the lower half of a competing
+        // branch. Dropping both (as this used to) made any fork that diverges below the tip
+        // impossible to discover: the fork point itself was always thrown away.
+        block_t* local = NULL;
+        if (Chain_GetBlockCopy(currentChain, (size_t)blk->header.blockNumber, &local) && local) {
+            uint8_t localHash[32];
+            uint8_t incomingHash[32];
+            Block_CalculateHash(local, localHash);
+            Block_CalculateHash(blk, incomingHash);
+            Block_Destroy(local);
+
+            if (memcmp(localHash, incomingHash, 32) == 0) {
+                // Exactly the block we already have.
+                DynArr_destroy(blk->transactions);
+                free(blk);
+                return NODE_BLOCK_REJECTED;
+            }
+        }
+
+        OrphanPool_Insert(blk, blockHeight, observedAtTipHeight);
+        printf("Queued forked BLOCK_DATA at height %" PRIu64 " (below our tip) as orphan\n", blockHeight);
+        return NODE_BLOCK_ORPHAN_QUEUED;
     } else {
         // blk->header.blockNumber == chainSize -> candidate to append. Ensure prevHash matches current tip.
         if (chainSize > 0) {
             block_t* last = NULL;
             if (!Chain_GetBlockCopy(currentChain, (size_t)(chainSize - 1), &last) || !last) {
                 // Can't verify parent; queue as orphan conservatively
-                OrphanPool_Insert(blk, blockHeight);
+                OrphanPool_Insert(blk, blockHeight, observedAtTipHeight);
                 printf("Queued orphan BLOCK_DATA at height %" PRIu64 " (unable to verify parent)\n", blockHeight);
                 if (last) Block_Destroy(last);
                 return NODE_BLOCK_ORPHAN_QUEUED;
@@ -512,7 +533,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
             Block_CalculateHash(last, lastHash);
             if (memcmp(lastHash, blk->header.prevHash, 32) != 0) {
                 // Conflicting block at same height; queue as orphan until resolved by a subsequent extension.
-                OrphanPool_Insert(blk, blockHeight);
+                OrphanPool_Insert(blk, blockHeight, observedAtTipHeight);
                 Block_Destroy(last);
                 printf("Queued conflicting BLOCK_DATA at same height %" PRIu64 " as orphan\n", blockHeight);
                 return NODE_BLOCK_ORPHAN_QUEUED;
@@ -531,19 +552,8 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         return NODE_BLOCK_REJECTED;
     }
 
-    uint64_t coinbaseAmount = 0;
-    if (blk->transactions) {
-        for (size_t i = 0; i < DynArr_size(blk->transactions); ++i) {
-            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, i);
-            if (tx && Address_IsCoinbase(tx->transaction.senderAddress)) {
-                coinbaseAmount = tx->transaction.amount1;
-                break;
-            }
-        }
-    }
-
-    (void)uint256_add_u64(&currentSupply, coinbaseAmount);
-    currentReward = CalculateBlockReward(currentSupply, currentChain);
+    // currentSupply/currentReward are advanced inside Chain_AddBlock, so that every path that
+    // appends (mining, this one, orphan attach, reorg) keeps them consistent.
 
     // Persist on accept if requested
     if (persist) {
@@ -1492,13 +1502,13 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
         unsigned char hash[32];
         Block_CalculateHash(blk, hash);
 
-        // Dedupe using seenBlocks
+        // Dedupe using seenBlocks. The hash is only recorded once the block has actually gone out
+        // to at least one peer: marking it here unconditionally meant that a block relayed while no
+        // peer was connected (or while every peer was filtered out below) was never offered again.
         int seen = 0;
         pthread_mutex_lock(&node->seenLock);
         if (DynSet_Contains(node->seenBlocks, hash)) {
             seen = 1;
-        } else {
-            DynSet_Insert(node->seenBlocks, hash);
         }
         pthread_mutex_unlock(&node->seenLock);
 
@@ -1526,6 +1536,8 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
             memcpy(payload + off, tx, sizeof(signed_transaction_t)); off += sizeof(signed_transaction_t);
         }
 
+        size_t delivered = 0;
+
         // Snapshot outbound clients and send
         pthread_mutex_lock(&node->outboundLock);
         for (size_t i = 0; i < MAX_CONS; ++i) {
@@ -1533,9 +1545,34 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
             if (!conn) continue;
             if (conn == sourceConn) continue;
             if (sourceConn && TcpConnection_PeerAddrEqual(conn, sourceConn)) continue;
-            Node_SendPacket(node, conn, PACKET_TYPE_BROADCAST_BLOCK, payload, off);
+            if (Node_SendPacket(node, conn, PACKET_TYPE_BROADCAST_BLOCK, payload, off) == 0) {
+                delivered++;
+            }
         }
         pthread_mutex_unlock(&node->outboundLock);
+
+        // Relay to inbound peers as well. Broadcasting only to outbound connections meant that in a
+        // two-node setup the node that was dialled never pushed anything back, and the dialer only
+        // ever learned about new blocks through a manual `sync`.
+        if (node->server) {
+            pthread_mutex_lock(&node->server->clientsMutex);
+            for (size_t i = 0; i < node->server->maxClients; ++i) {
+                tcp_connection_t* conn = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
+                if (!conn || TcpConnection_IsDisconnectNotified(conn)) continue;
+                if (conn == sourceConn) continue;
+                if (sourceConn && TcpConnection_PeerAddrEqual(conn, sourceConn)) continue;
+                if (Node_SendPacket(node, conn, PACKET_TYPE_BROADCAST_BLOCK, payload, off) == 0) {
+                    delivered++;
+                }
+            }
+            pthread_mutex_unlock(&node->server->clientsMutex);
+        }
+
+        if (delivered > 0) {
+            pthread_mutex_lock(&node->seenLock);
+            DynSet_Insert(node->seenBlocks, hash);
+            pthread_mutex_unlock(&node->seenLock);
+        }
 
         free(payload);
         Block_Destroy(blk);

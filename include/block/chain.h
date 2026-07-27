@@ -28,6 +28,33 @@ void Chain_Wipe(blockchain_t* chain);
 // Returns true on success.
 bool Chain_RollbackToHeight(blockchain_t* chain, size_t height);
 
+/**
+ * Atomically replace the blocks at [forkHeight, tip] with `newBlocks` (ascending, `count` of them).
+ *
+ * The swap happens only if the candidate branch is properly linked, has strictly more cumulative
+ * work, and has served its Horizen delayed-submission penalty. `observedAtTipHeight` is the local
+ * tip height at which the branch was FIRST seen and must not be recomputed as the chain grows --
+ * see the comment in the implementation. The initial-block-download exemption is decided inside,
+ * from local state only, so no caller can switch the penalty off.
+ *
+ * On any failure the original chain, balance sheet, supply and reward are restored and false is
+ * returned. The caller keeps ownership of `newBlocks` in every case: the chain applies copies.
+**/
+bool Chain_ReplaceBranch(blockchain_t* chain,
+                         size_t forkHeight,
+                         block_t** newBlocks,
+                         size_t count,
+                         uint64_t observedAtTipHeight);
+
+// True when this node is catching up rather than following the tip (empty chain, or a median
+// block time far in the past). Used to exempt initial sync from the reorg penalty.
+bool Chain_IsInitialBlockDownload(blockchain_t* chain);
+
+// Penalty in blocks of local chain growth before a branch forking `reorgDepth` blocks back may be
+// adopted. Thin wrapper over FetchScheduler_ComputeReorgPenaltyBlocks, for callers that only
+// want to report it.
+uint64_t Chain_ReorgPenaltyForDepth(uint64_t reorgDepth);
+
 // Recompute `currentSupply` and `currentReward` from the in-memory chain blocks.
 // Returns true on success and updates runtime state globals.
 bool Chain_RecomputeRuntimeState(blockchain_t* chain);
@@ -52,5 +79,16 @@ uint32_t Chain_GetTargetForHeight(blockchain_t* chain, uint64_t height);
 // Refresh runtime state derived from the chain tip (difficulty target, epoch DAG).
 // Call after any change to the tip. Must NOT be called while holding `chainLock`.
 void Chain_OnTipAdvanced(blockchain_t* chain);
+
+// Work
+// Expected number of hashes to satisfy `difficultyTargetBits`, i.e. 2^256 / (target + 1).
+bool Chain_ComputeBlockWork(uint32_t difficultyTargetBits, uint256_t* outWork);
+
+// Summed work of the chain's blocks over the half-open range [from, to).
+// Takes no locks; safe to call while holding `chainLock`.
+bool Chain_ComputeWorkRange(blockchain_t* chain, size_t from, size_t to, uint256_t* outWork);
+
+// Summed work of a candidate branch that is not (yet) part of the chain.
+bool Chain_ComputeBranchWork(block_t** blocks, size_t count, uint256_t* outWork);
 
 #endif
