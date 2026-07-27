@@ -41,6 +41,16 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
 bool Chain_LoadBlockFromFile(const char* dirpath, uint64_t blockNumber, bool loadTransactions, block_t** outBlock, size_t* outTxCount);
 
 // Difficulty
-uint32_t Chain_ComputeNextTarget(blockchain_t* chain, uint32_t currentTarget);
+// Retarget for the block at `height`, measured over the window [height - INTERVAL, height - 1].
+// `chain` must hold blocks 0..height-1. Takes no locks; safe to call while holding `chainLock`.
+uint32_t Chain_ComputeTargetAtHeight(blockchain_t* chain, uint64_t height, uint32_t currentTarget);
+
+// The consensus-required difficultyTarget for the block at `height`, derived from the chain alone.
+// Takes no locks; safe to call while holding `chainLock`.
+uint32_t Chain_GetTargetForHeight(blockchain_t* chain, uint64_t height);
+
+// Refresh runtime state derived from the chain tip (difficulty target, epoch DAG).
+// Call after any change to the tip. Must NOT be called while holding `chainLock`.
+void Chain_OnTipAdvanced(blockchain_t* chain);
 
 #endif

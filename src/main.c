@@ -406,9 +406,8 @@ static bool Block_GetCoinbaseAndFeeTotals(const block_t* block, uint64_t* outCoi
 static bool MineAndAppendBlock(blockchain_t* chain,
                                block_t* block,
                                uint256_t* currentSupply,
-                               uint64_t* currentReward,
-                               uint32_t* difficultyTarget) {
-    if (!chain || !block || !currentSupply || !currentReward || !difficultyTarget) {
+                               uint64_t* currentReward) {
+    if (!chain || !block || !currentSupply || !currentReward) {
         return false;
     }
 
@@ -465,15 +464,8 @@ static bool MineAndAppendBlock(blockchain_t* chain,
 
     *currentReward = CalculateBlockReward(*currentSupply, chain);
 
-    if (Chain_Size(chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0) {
-        *difficultyTarget = Chain_ComputeNextTarget(chain, *difficultyTarget);
-    }
-
-    if (Chain_Size(chain) % EPOCH_LENGTH == 0 && Chain_Size(chain) > 0) {
-        uint8_t dagSeed[32];
-        GetNextDAGSeed(chain, dagSeed);
-        (void)Block_RebuildAutolykos2Dag(CalculateTargetDAGSize(chain), dagSeed);
-    }
+    // The difficulty retarget and epoch DAG rebuild happen in Chain_AddBlock, so that blocks we
+    // receive from peers advance them exactly like blocks we mine ourselves.
 
     return true;
 }
@@ -551,12 +543,12 @@ static bool VerifyChainFully(blockchain_t* chain) {
             Block_Destroy(prevBlk);
         }
 
-        // Determine expected difficulty for this block. TODO: Optimize to recompute at adjustment intervals only instead of every block.
+        // Determine expected difficulty for this block. The retarget window (i-INTERVAL..i-1) is
+        // already present in `chain`, so it reads from there rather than the replay copy.
         if (i < DIFFICULTY_ADJUSTMENT_INTERVAL) {
             expectedDifficulty = INITIAL_DIFFICULTY;
         } else if ((i % DIFFICULTY_ADJUSTMENT_INTERVAL) == 0) {
-            // Compute target using previous blocks only (0..i-1)
-            expectedDifficulty = Chain_ComputeNextTarget(prevChain, expectedDifficulty);
+            expectedDifficulty = Chain_ComputeTargetAtHeight(chain, (uint64_t)i, expectedDifficulty);
         }
 
         // Ensure the block's header difficulty matches the expected difficulty (can't cheat easier)
@@ -723,6 +715,10 @@ int main(int argc, char* argv[]) {
         if (!Chain_RecomputeRuntimeState(chain)) {
             fprintf(stderr, "Failed to recompute runtime state from loaded chain\n");
         }
+
+        // chain.meta stores the tip's own target, which is not the next block's target when the tip
+        // sits on an adjustment boundary. Derive it from the chain instead.
+        Chain_OnTipAdvanced(chain);
     }
 
     if (!BalanceSheet_LoadFromFile(chainDataDir)) {
@@ -899,7 +895,7 @@ int main(int argc, char* argv[]) {
                     break;
                 }
 
-                block_t* block = BuildNextBlock(chain, difficultyTarget);
+                block_t* block = BuildNextBlock(chain, Chain_GetTargetForHeight(chain, (uint64_t)Chain_Size(chain)));
                 if (!block) {
                     fprintf(stderr, "failed to create block\n");
                     free(acceptedTxs);
@@ -923,7 +919,7 @@ int main(int argc, char* argv[]) {
                 }
                 free(acceptedTxs);
 
-                if (!MineAndAppendBlock(chain, block, &currentSupply, &currentReward, &difficultyTarget)) {
+                if (!MineAndAppendBlock(chain, block, &currentSupply, &currentReward)) {
                     Block_Destroy(block);
                     minedAll = false;
                     break;
@@ -1000,7 +996,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            block_t* block = BuildNextBlock(chain, difficultyTarget);
+            block_t* block = BuildNextBlock(chain, Chain_GetTargetForHeight(chain, (uint64_t)Chain_Size(chain)));
             if (!block) {
                 fprintf(stderr, "failed to create block\n");
                 continue;
@@ -1029,7 +1025,7 @@ int main(int argc, char* argv[]) {
             AddressToHexString(recipientAddress, recipientHex);
             printf("%s\n\nMining block...\n", recipientHex);
             
-            if (!MineAndAppendBlock(chain, block, &currentSupply, &currentReward, &difficultyTarget)) {
+            if (!MineAndAppendBlock(chain, block, &currentSupply, &currentReward)) {
                 Block_Destroy(block);
                 continue;
             }

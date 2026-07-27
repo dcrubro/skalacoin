@@ -192,6 +192,20 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
         return false;
     }
 
+    // Ensure the block was mined at the difficulty this chain requires at that height. Without this
+    // a peer whose difficulty went stale (or a malicious one) can hand us a block mined at an
+    // easier target, which Block_HasValidProofOfWork accepts because it checks the header's own value.
+    uint32_t expectedTarget = Chain_GetTargetForHeight(chain, (uint64_t)expectedIndex);
+    if (block->header.difficultyTarget != expectedTarget) {
+        printf("Chain_AddBlock: validation failed: blockIndex=%zu expectedDifficulty=%#x observedDifficulty=%#x\n",
+            expectedIndex,
+            (unsigned int)expectedTarget,
+            (unsigned int)block->header.difficultyTarget);
+        pthread_mutex_unlock(&balanceSheetLock);
+        pthread_rwlock_unlock(&chainLock);
+        return false;
+    }
+
     do {
         size_t txCount = DynArr_size(block->transactions);
         signed_transaction_t* candidateTxs = (signed_transaction_t*)calloc(txCount, sizeof(signed_transaction_t));
@@ -341,6 +355,11 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
     // Release locks
     pthread_mutex_unlock(&balanceSheetLock);
     pthread_rwlock_unlock(&chainLock);
+
+    if (ok) {
+        // Every path that appends comes through here, so this is where difficulty/DAG catch up.
+        Chain_OnTipAdvanced(chain);
+    }
 
     printf("Added new block to chain:\n");
     Block_ShortPrint(block);
@@ -548,12 +567,16 @@ bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
     pthread_mutex_unlock(&balanceSheetLock);
     pthread_rwlock_unlock(&chainLock);
 
+    // A reorg can move the tip back across an adjustment boundary, so the target must come down too.
+    Chain_OnTipAdvanced(chain);
+
     return true;
 }
 
 void Chain_Wipe(blockchain_t* chain) {
     Chain_ClearBlocks(chain);
     currentBlockHeight = 0;
+    difficultyTarget = INITIAL_DIFFICULTY;
 }
 
 bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply, uint64_t currentReward) {
@@ -1093,20 +1116,23 @@ bool Chain_LoadBlockFromFile(const char* dirpath, uint64_t blockNumber, bool loa
     return true;
 }
 
-uint32_t Chain_ComputeNextTarget(blockchain_t* chain, uint32_t currentTarget) {
+uint32_t Chain_ComputeTargetAtHeight(blockchain_t* chain, uint64_t height, uint32_t currentTarget) {
     if (!chain || !chain->blocks) {
         return 0x00; // Impossible difficulty, only valid hash is all zeros (practically impossible)
     }
 
-    size_t chainSize = DynArr_size(chain->blocks);
-    if (chainSize < DIFFICULTY_ADJUSTMENT_INTERVAL) {
+    if (height < DIFFICULTY_ADJUSTMENT_INTERVAL) {
         // Baby-chain, return initial difficulty
         return INITIAL_DIFFICULTY;
     }
 
+    if (height > (uint64_t)DynArr_size(chain->blocks)) {
+        return 0x00; // Retarget window is not fully present in this chain
+    }
+
     // Assuming block validation validates timestamps, we can assume they're valid and can just read them
-    block_t* lastBlock = (block_t*)DynArr_at(chain->blocks, chainSize - 1);
-    block_t* adjustmentBlock = (block_t*)DynArr_at(chain->blocks, chainSize - DIFFICULTY_ADJUSTMENT_INTERVAL);
+    block_t* lastBlock = (block_t*)DynArr_at(chain->blocks, (size_t)(height - 1));
+    block_t* adjustmentBlock = (block_t*)DynArr_at(chain->blocks, (size_t)(height - DIFFICULTY_ADJUSTMENT_INTERVAL));
     if (!lastBlock || !adjustmentBlock) {
         return 0x00; // Impossible difficulty, only valid hash is all zeros (practically impossible)
     }
@@ -1167,4 +1193,33 @@ uint32_t Chain_ComputeNextTarget(blockchain_t* chain, uint32_t currentTarget) {
     }
 
     return (exponent << 24) | (newCoeff & 0x007fffff);
+}
+
+uint32_t Chain_GetTargetForHeight(blockchain_t* chain, uint64_t height) {
+    // The target is a pure function of the chain: replay every adjustment boundary at or below
+    // `height`, starting from the genesis difficulty. Never trust a cached or peer-supplied value.
+    uint32_t target = INITIAL_DIFFICULTY;
+    for (uint64_t h = DIFFICULTY_ADJUSTMENT_INTERVAL; h <= height; h += DIFFICULTY_ADJUSTMENT_INTERVAL) {
+        target = Chain_ComputeTargetAtHeight(chain, h, target);
+    }
+
+    return target;
+}
+
+void Chain_OnTipAdvanced(blockchain_t* chain) {
+    if (!chain || !chain->blocks) {
+        return;
+    }
+
+    size_t chainSize = Chain_Size(chain);
+
+    // Refresh the cached target for the block that comes next, so every path that moves the tip
+    // (mining, P2P accept, sync, orphan attach, reorg) stays on the same difficulty as its peers.
+    difficultyTarget = Chain_GetTargetForHeight(chain, (uint64_t)chainSize);
+
+    if (chainSize % EPOCH_LENGTH == 0 && chainSize > 0) {
+        uint8_t dagSeed[32];
+        GetNextDAGSeed(chain, dagSeed);
+        (void)Block_RebuildAutolykos2Dag(CalculateTargetDAGSize(chain), dagSeed);
+    }
 }
