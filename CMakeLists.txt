@@ -230,5 +230,8 @@ target_compile_definitions(node PRIVATE
     CHAIN_DATA_DIR="${CMAKE_BINARY_DIR}/chain_data"
     $<$<BOOL:${SKALACOIN_AUTOLYKOS2_REF_AVAILABLE}>:SKALACOIN_AUTOLYKOS2_REF_AVAILABLE>
     $<$<BOOL:1>:_POSIX_C_SOURCE=200809L>
+    # getifaddrs() (used to learn our own addresses) is a BSD extension, not POSIX; glibc hides it
+    # unless the default set is requested as well.
+    $<$<BOOL:1>:_DEFAULT_SOURCE>
 )
 set_target_properties(node PROPERTIES OUTPUT_NAME "skalacoin_node")

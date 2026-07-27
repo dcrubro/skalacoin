@@ -1,5 +1,8 @@
 #include <numgen.h>
 
+#include <stdio.h>
+#include <unistd.h>
+
 unsigned char random_byte(void) {
     return (unsigned char)(rand() % 256);
 }
@@ -38,4 +41,32 @@ uint64_t random_eight_byte(void) {
     memcpy(&x, bytes, sizeof(x));
 
     return x;
+}
+
+uint64_t random_secure_eight_byte(void) {
+    uint64_t x = 0;
+
+    FILE* urandom = fopen("/dev/urandom", "rb");
+    if (urandom) {
+        size_t got = fread(&x, 1, sizeof(x), urandom);
+        fclose(urandom);
+        if (got == sizeof(x) && x != 0) {
+            return x;
+        }
+    }
+
+    // Fallback: srand() is seeded from the wall clock in whole seconds, so two nodes launched
+    // together would draw identical values. Mix in the pid and the sub-second clock to separate them.
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        ts.tv_sec = 0;
+        ts.tv_nsec = 0;
+    }
+
+    x = random_eight_byte();
+    x ^= (uint64_t)ts.tv_nsec;
+    x ^= ((uint64_t)ts.tv_sec) << 16;
+    x ^= ((uint64_t)getpid()) << 40;
+
+    return x ? x : 1; // 0 means "no identity advertised" on the wire
 }

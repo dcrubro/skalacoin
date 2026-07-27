@@ -85,8 +85,12 @@ void Node_GetClientList(net_node_t* node, tcp_connection_t** outClients, size_t*
 // Returns non-zero on success (usable endpoint with a known, non-zero port), zero otherwise.
 int Node_ConnListenEndpoint(const tcp_connection_t* conn, struct sockaddr_storage* out);
 
+// Returns the node identity advertised by a connection's peer, or 0 if it is not known yet.
+uint64_t Node_ConnPeerNodeId(const tcp_connection_t* conn);
+
 // Fills outEndpoints with the listen endpoints of all current connections (inbound + outbound),
-// deduped by IP+port. Returns the number of endpoints written (<= maxOut).
-size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpoints, size_t maxOut);
+// deduped by IP+port, and outNodeIds (optional, may be NULL) with the matching peer identities.
+// Returns the number of endpoints written (<= maxOut).
+size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpoints, uint64_t* outNodeIds, size_t maxOut);
 
 #endif

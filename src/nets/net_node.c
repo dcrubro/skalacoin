@@ -102,13 +102,15 @@ static int Node_HasOutboundTo(net_node_t* node, const struct sockaddr_storage* e
 
 // Returns non-zero if some inbound connection OTHER than `self` already has the given listen
 // endpoint (used to reject a duplicate inbound once we learn the peer's advertised listen port).
+// Connections that are already tearing down do not count - otherwise a peer reconnecting from the
+// same endpoint gets its fresh inbound rejected by the corpse of the previous one.
 static int Node_HasOtherInboundFrom(net_node_t* node, const tcp_connection_t* self, const struct sockaddr_storage* endpoint) {
     if (!node->server) return 0;
     int found = 0;
     pthread_mutex_lock(&node->server->clientsMutex);
     for (size_t i = 0; i < node->server->maxClients; ++i) {
         tcp_connection_t* other = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
-        if (!other || other == self) continue;
+        if (!other || other == self || TcpConnection_IsDisconnectNotified(other)) continue;
         struct sockaddr_storage ep;
         if (Node_ConnListenEndpoint(other, &ep) && NetNode_EndpointEqual(&ep, endpoint)) {
             found = 1;
@@ -119,16 +121,47 @@ static int Node_HasOtherInboundFrom(net_node_t* node, const tcp_connection_t* se
     return found;
 }
 
-// Returns non-zero if a connection OTHER than `exclude` to `endpoint` is still live. A connection
-// that is itself mid-disconnect (disconnectedNotified) does not count as live - this is what lets
-// us decide a peer is fully gone even when both its inbound and outbound drop simultaneously.
-static int Node_HasLiveConnectionTo(net_node_t* node, const struct sockaddr_storage* endpoint, const tcp_connection_t* exclude) {
+// Returns non-zero if a live connection OTHER than `self` with the same role already belongs to the
+// node identified by nodeId. This is the endpoint-independent duplicate check: a multi-homed peer
+// reaches us from several addresses, so comparing endpoints alone lets the same node in twice.
+static int Node_HasOtherConnectionToNode(net_node_t* node, const tcp_connection_t* self, uint64_t nodeId) {
+    if (nodeId == 0) return 0;
+    int found = 0;
+
+    pthread_mutex_lock(&node->outboundLock);
+    for (size_t i = 0; i < MAX_CONS && !found; ++i) {
+        tcp_connection_t* c = node->outboundClients[i].connection;
+        if (!c || c == self || TcpConnection_IsDisconnectNotified(c)) continue;
+        if (c->role == self->role && c->peerNodeId == nodeId) found = 1;
+    }
+    pthread_mutex_unlock(&node->outboundLock);
+    if (found) return 1;
+
+    if (node->server) {
+        pthread_mutex_lock(&node->server->clientsMutex);
+        for (size_t i = 0; i < node->server->maxClients && !found; ++i) {
+            tcp_connection_t* c = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
+            if (!c || c == self || TcpConnection_IsDisconnectNotified(c)) continue;
+            if (c->role == self->role && c->peerNodeId == nodeId) found = 1;
+        }
+        pthread_mutex_unlock(&node->server->clientsMutex);
+    }
+    return found;
+}
+
+// Returns non-zero if a connection OTHER than `exclude` to the same peer is still live - matched
+// either on the listen endpoint or, when known, on the peer's identity (which also covers its other
+// addresses). A connection that is itself mid-disconnect (disconnectedNotified) does not count as
+// live - this is what lets us decide a peer is fully gone even when both its inbound and outbound
+// drop simultaneously.
+static int Node_HasLiveConnectionTo(net_node_t* node, const struct sockaddr_storage* endpoint, uint64_t nodeId, const tcp_connection_t* exclude) {
     int found = 0;
 
     pthread_mutex_lock(&node->outboundLock);
     for (size_t i = 0; i < MAX_CONS && !found; ++i) {
         tcp_connection_t* c = node->outboundClients[i].connection;
         if (!c || c == exclude || TcpConnection_IsDisconnectNotified(c)) continue;
+        if (nodeId != 0 && c->peerNodeId == nodeId) { found = 1; break; }
         struct sockaddr_storage ep;
         if (Node_ConnListenEndpoint(c, &ep) && NetNode_EndpointEqual(&ep, endpoint)) found = 1;
     }
@@ -140,6 +173,7 @@ static int Node_HasLiveConnectionTo(net_node_t* node, const struct sockaddr_stor
         for (size_t i = 0; i < node->server->maxClients && !found; ++i) {
             tcp_connection_t* c = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
             if (!c || c == exclude || TcpConnection_IsDisconnectNotified(c)) continue;
+            if (nodeId != 0 && c->peerNodeId == nodeId) { found = 1; break; }
             struct sockaddr_storage ep;
             if (Node_ConnListenEndpoint(c, &ep) && NetNode_EndpointEqual(&ep, endpoint)) found = 1;
         }
@@ -150,13 +184,14 @@ static int Node_HasLiveConnectionTo(net_node_t* node, const struct sockaddr_stor
 
 // Called when a connection to a peer drops. Strikes the peer from the discovery table, but only
 // once it is logically disconnected - i.e. no other live connection (inbound or outbound) to the
-// same listen endpoint remains. Must be called from the disconnect callback while `conn` is still
-// valid and outside outboundLock/clientsMutex.
+// same node remains. Must be called from the disconnect callback while `conn` is still valid and
+// outside outboundLock/clientsMutex.
 static void Node_HandlePeerDisconnect(net_node_t* node, tcp_connection_t* conn) {
     if (!node || !node->discovery || !conn) return;
     struct sockaddr_storage ep;
-    if (!Node_ConnListenEndpoint(conn, &ep)) return;       // never advertised an endpoint -> not tracked
-    if (Node_HasLiveConnectionTo(node, &ep, conn)) return; // still reachable via another connection
+    if (!Node_ConnListenEndpoint(conn, &ep)) return; // never advertised an endpoint -> not tracked
+    // Still reachable via another connection (possibly on one of its other addresses).
+    if (Node_HasLiveConnectionTo(node, &ep, conn->peerNodeId, conn)) return;
     NodeDiscovery_RemovePeer(node->discovery, &ep);
 }
 
@@ -203,7 +238,11 @@ int Node_ConnListenEndpoint(const tcp_connection_t* conn, struct sockaddr_storag
     return 0;
 }
 
-size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpoints, size_t maxOut) {
+uint64_t Node_ConnPeerNodeId(const tcp_connection_t* conn) {
+    return conn ? conn->peerNodeId : 0;
+}
+
+size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpoints, uint64_t* outNodeIds, size_t maxOut) {
     if (!node || !outEndpoints || maxOut == 0) return 0;
     size_t count = 0;
 
@@ -218,7 +257,9 @@ size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpo
         for (size_t k = 0; k < count; ++k) {
             if (NetNode_EndpointEqual(&outEndpoints[k], &ep)) { dup = 1; break; }
         }
-        if (!dup) outEndpoints[count++] = ep;
+        if (dup) continue;
+        if (outNodeIds) outNodeIds[count] = c->peerNodeId;
+        outEndpoints[count++] = ep;
     }
     pthread_mutex_unlock(&node->outboundLock);
 
@@ -234,12 +275,52 @@ size_t Node_GetPeerEndpoints(net_node_t* node, struct sockaddr_storage* outEndpo
             for (size_t k = 0; k < count; ++k) {
                 if (NetNode_EndpointEqual(&outEndpoints[k], &ep)) { dup = 1; break; }
             }
-            if (!dup) outEndpoints[count++] = ep;
+            if (dup) continue;
+            if (outNodeIds) outNodeIds[count] = c->peerNodeId;
+            outEndpoints[count++] = ep;
         }
         pthread_mutex_unlock(&node->server->clientsMutex);
     }
 
     return count;
+}
+
+// Outcome of the identity check run once a connection's HELLO/ACK_HELLO has been parsed.
+typedef enum {
+    NODE_IDENTITY_OK = 0,
+    NODE_IDENTITY_SELF,      // the peer is this very node, reached through one of its own addresses
+    NODE_IDENTITY_DUPLICATE  // we already hold a connection of this role to that node
+} node_identity_result_t;
+
+// Records the identity a peer advertised and decides whether the connection should survive.
+// `conn->peerNodeId` and `conn->peerListenPort` must already be set from the handshake.
+static node_identity_result_t Node_CheckPeerIdentity(net_node_t* node, tcp_connection_t* conn) {
+    if (!node || !conn || conn->peerNodeId == 0) return NODE_IDENTITY_OK; // peer too old to advertise one
+
+    struct sockaddr_storage ep;
+    int haveEp = Node_ConnListenEndpoint(conn, &ep);
+
+    if (conn->peerNodeId == localNodeId) {
+        // We dialled ourselves (or accepted our own dial). Remember the endpoint as our own so
+        // discovery stops offering it back to us, and drop the connection.
+        if (haveEp && node->discovery) {
+            NodeDiscovery_MarkSelfEndpoint(node->discovery, &ep);
+        }
+        return NODE_IDENTITY_SELF;
+    }
+
+    // Record the identity behind this endpoint even when the connection is about to be dropped as a
+    // duplicate: that is what lets discovery skip the peer's other addresses while we are connected
+    // to it, instead of dialling each of them in turn.
+    if (haveEp && node->discovery) {
+        NodeDiscovery_NoteIdentity(node->discovery, &ep, conn->peerNodeId);
+    }
+
+    if (Node_HasOtherConnectionToNode(node, conn, conn->peerNodeId)) {
+        return NODE_IDENTITY_DUPLICATE;
+    }
+
+    return NODE_IDENTITY_OK;
 }
 
 // Thunks routing UDP ping/pong events into the discovery state.
@@ -641,11 +722,18 @@ int Node_ConnectPeer(net_node_t* node, const char* ip, unsigned short port) {
         return -1;
     }
 
+    // Never dial ourselves. Without this an echo-back (or a gossiped copy of one of our own
+    // addresses) can chain into a self-connection per maintenance tick until the slots run out.
+    struct sockaddr_storage target;
+    int haveTarget = NetNode_MakeEndpoint(ip, port, &target);
+    if (haveTarget && node->discovery && NodeDiscovery_IsSelfEndpoint(node->discovery, &target)) {
+        return -1;
+    }
+
     // Enforce a single outbound connection per endpoint: if we already have an outbound to this
     // (ip, port), do not open a second one. (Inbound from the same endpoint is still allowed - that
     // is the peer's own outbound to us.)
-    struct sockaddr_storage target;
-    if (NetNode_MakeEndpoint(ip, port, &target) && Node_HasOutboundTo(node, &target)) {
+    if (haveTarget && Node_HasOutboundTo(node, &target)) {
         return 0; // already connected outbound to this endpoint
     }
 
@@ -807,27 +895,23 @@ void Node_Server_OnData(tcp_connection_t* client) {
                 client->peerListenPort = peerListenPort;
             }
 
-            printf("Received HELLO from node %u: protoVersion=%u, blockHeight=%" PRIu64 ", listenPort=%u\n",
-                client ? client->connectionId : 0U, protoVersion, blockHeight,
-                client ? client->peerListenPort : 0U);
-
-            // Enforce a single inbound connection per endpoint. Now that we know this peer's listen
-            // port, drop this connection if another inbound from the same endpoint already exists
-            // (keep the established one). An outbound to the same endpoint is unaffected - that is
-            // this node's own connection to the peer.
-            if (client && client->peerListenPort != 0) {
-                net_node_t* dupNode = Node_FromConnection(client);
-                struct sockaddr_storage myEp;
-                if (dupNode && Node_ConnListenEndpoint(client, &myEp) &&
-                    Node_HasOtherInboundFrom(dupNode, client, &myEp)) {
-                    printf("Rejecting duplicate inbound connection %u (already have an inbound from this endpoint)\n",
-                        client->connectionId);
-                    TcpConnection_RequestClose(client);
-                    return;
-                }
+            // Optional trailing node identity, same length-guarded deal.
+            if (client && payloadLen >= sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint16_t) + sizeof(uint64_t)) {
+                uint64_t peerNodeId;
+                memcpy(&peerNodeId, payload + sizeof(protoVersion) + sizeof(blockHeight) + sizeof(uint16_t), sizeof(peerNodeId));
+                client->peerNodeId = peerNodeId;
             }
 
-            // Craft and send ACK_HELLO (echo protoVersion, our height, and our own listen port)
+            printf("Received HELLO from node %u: protoVersion=%u, blockHeight=%" PRIu64 ", listenPort=%u, nodeId=%016" PRIx64 "\n",
+                client ? client->connectionId : 0U, protoVersion, blockHeight,
+                client ? client->peerListenPort : 0U, client ? client->peerNodeId : 0ULL);
+
+            // Craft and send ACK_HELLO (echo protoVersion, our height, our own listen port and our
+            // identity). This goes out before any decision to drop the connection: the ACK is what
+            // tells the dialer whose address it just reached, so an endpoint that turns out to be
+            // another address of a peer it already talks to (or one of its own) is recognised as
+            // such instead of being redialled forever. shutdown() flushes what is already queued,
+            // so the peer still receives this even though we close immediately after.
             uint8_t ackBuf[100];
             uint8_t* ackData = ackBuf;
             size_t ackOffset = 0;
@@ -839,8 +923,46 @@ void Node_Server_OnData(tcp_connection_t* client) {
             uint16_t myListenPort = (uint16_t)listenPort;
             memcpy(ackData + ackOffset, &myListenPort, sizeof(myListenPort));
             ackOffset += sizeof(myListenPort);
+            uint64_t myNodeId = localNodeId;
+            memcpy(ackData + ackOffset, &myNodeId, sizeof(myNodeId));
+            ackOffset += sizeof(myNodeId);
 
             Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ACK_HELLO, ackData, ackOffset);
+
+            // Enforce one connection per node, identified by the advertised nodeId rather than by
+            // the address it happens to reach us from.
+            if (client) {
+                net_node_t* idNode = Node_FromConnection(client);
+                node_identity_result_t identity = Node_CheckPeerIdentity(idNode, client);
+                if (identity == NODE_IDENTITY_SELF) {
+                    printf("Rejecting inbound connection %u: it is this node talking to itself\n",
+                        client->connectionId);
+                    TcpConnection_RequestClose(client);
+                    return;
+                }
+                if (identity == NODE_IDENTITY_DUPLICATE) {
+                    printf("Rejecting duplicate inbound connection %u (already connected to node %016" PRIx64 ")\n",
+                        client->connectionId, client->peerNodeId);
+                    TcpConnection_RequestClose(client);
+                    return;
+                }
+            }
+
+            // Endpoint-level fallback for peers that advertise no identity: drop this connection if
+            // another inbound from the same endpoint already exists (keep the established one). An
+            // outbound to the same endpoint is unaffected - that is this node's own connection to
+            // the peer.
+            if (client && client->peerNodeId == 0 && client->peerListenPort != 0) {
+                net_node_t* dupNode = Node_FromConnection(client);
+                struct sockaddr_storage myEp;
+                if (dupNode && Node_ConnListenEndpoint(client, &myEp) &&
+                    Node_HasOtherInboundFrom(dupNode, client, &myEp)) {
+                    printf("Rejecting duplicate inbound connection %u (already have an inbound from this endpoint)\n",
+                        client->connectionId);
+                    TcpConnection_RequestClose(client);
+                    return;
+                }
+            }
 
             break;
         }
@@ -1087,6 +1209,10 @@ void Node_Client_OnConnect(tcp_connection_t* client) {
         uint16_t myListenPort = (uint16_t)listenPort;
         memcpy((unsigned char*)data + offset, &myListenPort, sizeof(myListenPort));
         offset += sizeof(myListenPort);
+        // ...and who we are, so the peer can tell this connection apart from our other addresses
+        uint64_t myNodeId = localNodeId;
+        memcpy((unsigned char*)data + offset, &myNodeId, sizeof(myNodeId));
+        offset += sizeof(myNodeId);
 
         Node_SendPacket(node, client, PACKET_TYPE_HELLO, data, offset);
     }
@@ -1131,10 +1257,36 @@ void Node_Client_OnData(tcp_connection_t* client) {
                 client->peerListenPort = peerListenPort;
             }
 
-            printf("Received ACK_HELLO from node %u with protoVersion %u and blockHeight %" PRIu64 "\n", client ? client->connectionId : 0U, protoVersion, blockHeight);
+            // Optional trailing node identity, same length-guarded deal.
+            if (client && payloadLen >= sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint16_t) + sizeof(uint64_t)) {
+                uint64_t peerNodeId;
+                memcpy(&peerNodeId, payload + sizeof(protoVersion) + sizeof(blockHeight) + sizeof(uint16_t), sizeof(peerNodeId));
+                client->peerNodeId = peerNodeId;
+            }
+
+            printf("Received ACK_HELLO from node %u with protoVersion %u, blockHeight %" PRIu64 " and nodeId %016" PRIx64 "\n",
+                client ? client->connectionId : 0U, protoVersion, blockHeight, client ? client->peerNodeId : 0ULL);
 
             // Store peer-advertised height on matching outbound client
             net_node_t* node = Node_FromConnection(client);
+
+            // The dialed endpoint may well be one of our own addresses, or another address of a
+            // peer we already talk to - neither is worth a connection.
+            if (client) {
+                node_identity_result_t identity = Node_CheckPeerIdentity(node, client);
+                if (identity == NODE_IDENTITY_SELF) {
+                    printf("Closing outbound connection %u: it loops back to this node\n", client->connectionId);
+                    TcpConnection_RequestClose(client);
+                    return;
+                }
+                if (identity == NODE_IDENTITY_DUPLICATE) {
+                    printf("Closing outbound connection %u: already connected to node %016" PRIx64 " on another address\n",
+                        client->connectionId, client->peerNodeId);
+                    TcpConnection_RequestClose(client);
+                    return;
+                }
+            }
+
             if (node) {
                 pthread_mutex_lock(&node->outboundLock);
                 for (size_t i = 0; i < MAX_CONS; ++i) {

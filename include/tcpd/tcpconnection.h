@@ -31,6 +31,11 @@ struct tcp_connection_t {
     // For OUTBOUND connections the peerAddr port already is the listen port; this matters for INBOUND peers.
     uint16_t peerListenPort;
 
+    // Peer's advertised node identity (learned from HELLO/ACK_HELLO). 0 until known / peer too old
+    // to advertise one. Unlike the peer address, this is stable across all of a multi-homed peer's
+    // endpoints, so it is what identifies the node behind this connection.
+    uint64_t peerNodeId;
+
     pthread_t ioThread;
     pthread_mutex_t sendLock;
     pthread_mutex_t stateLock;

@@ -8,9 +8,12 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <ifaddrs.h>
+
 #include <constants.h>
 #include <dynarr.h>
 #include <numgen.h>
+#include <runtime_state.h>
 #include <utils.h>
 
 // Wire layout of a single peer endpoint inside a PEERS payload:
@@ -29,19 +32,29 @@ typedef enum {
 typedef struct {
     struct sockaddr_storage addr;  // listen endpoint (port already set to the peer's listen port)
     uint64_t pingMs;               // measured UDP RTT, UINT64_MAX if unknown
+    uint64_t nodeId;               // identity of the node behind this endpoint, 0 while unknown
     uint32_t hop;                  // distance from us (0 = directly connected)
     discovery_state_t state;
     int pingPending;               // 1 while a ping is outstanding (matched by address on pong/timeout).
                                    // The UDP layer generates its own nonce, so we can't match by nonce here.
     uint64_t lastPingMs;           // when we last sent a ping
     uint64_t lastQueryMs;          // when we last sent GET_PEERS to it
-    uint64_t lastConnectMs;        // when we last attempted a connect to it
 } discovered_peer_t;
+
+// When we last dialed an endpoint. Kept outside the peer table on purpose: a peer entry is struck
+// the moment its connection drops, and if the dial history went with it, an endpoint that hangs up
+// on us would be re-learned through gossip and redialed on every single tick.
+typedef struct {
+    struct sockaddr_storage addr;
+    uint64_t lastMs;
+} discovery_attempt_t;
 
 struct node_discovery {
     net_node_t* node;
     udp_node_t* udpNode;
     DynArr* peers;                 // of discovered_peer_t
+    DynArr* selfEndpoints;         // of struct sockaddr_storage - our own listen endpoints
+    DynArr* connectAttempts;       // of discovery_attempt_t
     pthread_mutex_t lock;
 };
 
@@ -64,6 +77,99 @@ static int Discovery_AddrEqual(const struct sockaddr_storage* a, const struct so
     return 0;
 }
 
+// Rejects endpoints that can never be dialed as written. IPv6 in particular hands us plenty of
+// these: link-local addresses are meaningless without the scope id (which the wire format does not
+// carry), and the unspecified/multicast ranges are never a peer. Loopback stays allowed so several
+// nodes can still be run on one machine on different ports.
+static int Discovery_IsUsableAddr(const struct sockaddr_storage* addr) {
+    if (addr->ss_family == AF_INET) {
+        const struct sockaddr_in* a = (const struct sockaddr_in*)addr;
+        if (a->sin_port == 0) return 0;
+        uint32_t host = ntohl(a->sin_addr.s_addr);
+        if (host == INADDR_ANY || host == INADDR_BROADCAST) return 0;
+        if ((host >> 28) == 0xE) return 0;          // 224.0.0.0/4 multicast
+        if ((host & 0xFFFF0000u) == 0xA9FE0000u) return 0; // 169.254.0.0/16 link-local
+        return 1;
+    }
+    if (addr->ss_family == AF_INET6) {
+        const struct sockaddr_in6* a = (const struct sockaddr_in6*)addr;
+        if (a->sin6_port == 0) return 0;
+        if (IN6_IS_ADDR_UNSPECIFIED(&a->sin6_addr)) return 0;
+        if (IN6_IS_ADDR_MULTICAST(&a->sin6_addr)) return 0;
+        if (IN6_IS_ADDR_LINKLOCAL(&a->sin6_addr)) return 0;  // unusable without a scope id
+        if (IN6_IS_ADDR_SITELOCAL(&a->sin6_addr)) return 0;  // deprecated fec0::/10
+        return 1;
+    }
+    return 0;
+}
+
+// Rewrites an IPv4-mapped IPv6 endpoint (::ffff:a.b.c.d) as plain IPv4, so the same host never
+// occupies two entries. Matches the normalisation Node_ConnListenEndpoint does.
+static void Discovery_NormaliseAddr(struct sockaddr_storage* addr) {
+    if (addr->ss_family != AF_INET6) return;
+    struct sockaddr_in6* a = (struct sockaddr_in6*)addr;
+    if (!IN6_IS_ADDR_V4MAPPED(&a->sin6_addr)) return;
+
+    struct in_addr v4;
+    memcpy(&v4, ((const uint8_t*)&a->sin6_addr) + 12, sizeof(v4));
+    uint16_t port = a->sin6_port;
+
+    memset(addr, 0, sizeof(*addr));
+    struct sockaddr_in* o = (struct sockaddr_in*)addr;
+    o->sin_family = AF_INET;
+    o->sin_addr = v4;
+    o->sin_port = port;
+}
+
+// Returns non-zero if addr is one of our own listen endpoints. Caller holds disc->lock.
+static int Discovery_IsSelfUnlocked(node_discovery_t* disc, const struct sockaddr_storage* addr) {
+    size_t n = DynArr_size(disc->selfEndpoints);
+    for (size_t i = 0; i < n; ++i) {
+        const struct sockaddr_storage* self = (const struct sockaddr_storage*)DynArr_at(disc->selfEndpoints, i);
+        if (Discovery_AddrEqual(self, addr)) return 1;
+    }
+    return 0;
+}
+
+// Adds addr to the self set if not already there. Caller holds disc->lock.
+static void Discovery_AddSelfUnlocked(node_discovery_t* disc, const struct sockaddr_storage* addr) {
+    if (Discovery_IsSelfUnlocked(disc, addr)) return;
+    DynArr_push_back(disc->selfEndpoints, (void*)addr);
+}
+
+// Seeds the self set with (local interface address, our listen port) for every address this host
+// carries. A multi-homed host - the normal case under IPv6, where a machine holds a global, a
+// temporary privacy and a link-local address at once - is otherwise unable to tell its own
+// endpoints from a peer's when they come back around through peer exchange.
+static void Discovery_SeedSelfEndpoints(node_discovery_t* disc) {
+    struct ifaddrs* ifa = NULL;
+    if (getifaddrs(&ifa) != 0 || !ifa) return;
+
+    for (struct ifaddrs* it = ifa; it; it = it->ifa_next) {
+        if (!it->ifa_addr) continue;
+
+        struct sockaddr_storage ep;
+        memset(&ep, 0, sizeof(ep));
+        if (it->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in* o = (struct sockaddr_in*)&ep;
+            memcpy(o, it->ifa_addr, sizeof(struct sockaddr_in));
+            o->sin_port = htons(listenPort);
+        } else if (it->ifa_addr->sa_family == AF_INET6) {
+            struct sockaddr_in6* o = (struct sockaddr_in6*)&ep;
+            memcpy(o, it->ifa_addr, sizeof(struct sockaddr_in6));
+            o->sin6_port = htons(listenPort);
+            o->sin6_scope_id = 0; // endpoints on the wire are scopeless; compare them the same way
+        } else {
+            continue;
+        }
+
+        Discovery_NormaliseAddr(&ep);
+        Discovery_AddSelfUnlocked(disc, &ep);
+    }
+
+    freeifaddrs(ifa);
+}
+
 static discovered_peer_t* Discovery_FindPtr(node_discovery_t* disc, const struct sockaddr_storage* addr) {
     size_t n = DynArr_size(disc->peers);
     for (size_t i = 0; i < n; ++i) {
@@ -73,9 +179,13 @@ static discovered_peer_t* Discovery_FindPtr(node_discovery_t* disc, const struct
     return NULL;
 }
 
-// Insert addr if not already present. Returns a pointer to the (existing or new) entry, or NULL
-// if the table is full. Note: the returned pointer is invalidated by any later push_back.
+// Insert addr if not already present. Returns a pointer to the (existing or new) entry, or NULL if
+// the address is unusable, is one of our own, or the table is full. Note: the returned pointer is
+// invalidated by any later push_back.
 static discovered_peer_t* Discovery_Upsert(node_discovery_t* disc, const struct sockaddr_storage* addr, uint32_t hop) {
+    if (!Discovery_IsUsableAddr(addr)) return NULL;
+    if (Discovery_IsSelfUnlocked(disc, addr)) return NULL; // never track, ping or dial ourselves
+
     discovered_peer_t* existing = Discovery_FindPtr(disc, addr);
     if (existing) {
         if (hop < existing->hop) existing->hop = hop; // keep the shortest known distance
@@ -87,10 +197,69 @@ static discovered_peer_t* Discovery_Upsert(node_discovery_t* disc, const struct 
     memset(&np, 0, sizeof(np));
     np.addr = *addr;
     np.pingMs = UINT64_MAX;
+    np.nodeId = 0;
     np.hop = hop;
     np.state = DISCOVERY_STATE_NEW;
     DynArr_push_back(disc->peers, &np);
     return (discovered_peer_t*)DynArr_at(disc->peers, DynArr_size(disc->peers) - 1);
+}
+
+// Returns non-zero if addr may be dialed again, i.e. we have not tried it within the retry window.
+// Caller holds disc->lock.
+static int Discovery_ConnectCooledDown(node_discovery_t* disc, const struct sockaddr_storage* addr, uint64_t now) {
+    size_t n = DynArr_size(disc->connectAttempts);
+    for (size_t i = 0; i < n; ++i) {
+        const discovery_attempt_t* a = (const discovery_attempt_t*)DynArr_at(disc->connectAttempts, i);
+        if (Discovery_AddrEqual(&a->addr, addr)) {
+            return (now - a->lastMs) >= DISCOVERY_CONNECT_RETRY_MS;
+        }
+    }
+    return 1; // never dialed
+}
+
+// Stamps a dial attempt against addr, evicting the stalest record once the table is full.
+// Caller holds disc->lock.
+static void Discovery_NoteConnectAttempt(node_discovery_t* disc, const struct sockaddr_storage* addr, uint64_t now) {
+    size_t n = DynArr_size(disc->connectAttempts);
+    size_t oldestIdx = 0;
+    uint64_t oldestMs = UINT64_MAX;
+
+    for (size_t i = 0; i < n; ++i) {
+        discovery_attempt_t* a = (discovery_attempt_t*)DynArr_at(disc->connectAttempts, i);
+        if (Discovery_AddrEqual(&a->addr, addr)) {
+            a->lastMs = now;
+            return;
+        }
+        if (a->lastMs < oldestMs) {
+            oldestMs = a->lastMs;
+            oldestIdx = i;
+        }
+    }
+
+    if (n >= DISCOVERY_MAX_KNOWN_PEERS) {
+        discovery_attempt_t* victim = (discovery_attempt_t*)DynArr_at(disc->connectAttempts, oldestIdx);
+        victim->addr = *addr;
+        victim->lastMs = now;
+        return;
+    }
+
+    discovery_attempt_t na;
+    memset(&na, 0, sizeof(na));
+    na.addr = *addr;
+    na.lastMs = now;
+    DynArr_push_back(disc->connectAttempts, &na);
+}
+
+// Drops the entry for addr, if any. Caller holds disc->lock.
+static void Discovery_RemoveUnlocked(node_discovery_t* disc, const struct sockaddr_storage* addr) {
+    size_t n = DynArr_size(disc->peers);
+    for (size_t i = 0; i < n; ++i) {
+        discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
+        if (Discovery_AddrEqual(&p->addr, addr)) {
+            DynArr_remove(disc->peers, i);
+            return;
+        }
+    }
 }
 
 static int Discovery_AddrToWire(const struct sockaddr_storage* addr, unsigned char out[DISCOVERY_WIRE_ENTRY_SIZE]) {
@@ -131,6 +300,7 @@ static int Discovery_WireToAddr(const unsigned char in[DISCOVERY_WIRE_ENTRY_SIZE
         a->sin6_family = AF_INET6;
         memcpy(&a->sin6_addr, in + 1, sizeof(struct in6_addr));
         a->sin6_port = htons(port);
+        Discovery_NormaliseAddr(out); // a v4-mapped sender must not become a second entry
         return port != 0;
     }
     return 0;
@@ -166,13 +336,31 @@ node_discovery_t* NodeDiscovery_Create(net_node_t* node, udp_node_t* udpNode) {
         free(disc);
         return NULL;
     }
+    disc->selfEndpoints = DYNARR_CREATE(struct sockaddr_storage, 8);
+    if (!disc->selfEndpoints) {
+        DynArr_destroy(disc->peers);
+        free(disc);
+        return NULL;
+    }
+    disc->connectAttempts = DYNARR_CREATE(discovery_attempt_t, 16);
+    if (!disc->connectAttempts) {
+        DynArr_destroy(disc->selfEndpoints);
+        DynArr_destroy(disc->peers);
+        free(disc);
+        return NULL;
+    }
     pthread_mutex_init(&disc->lock, NULL);
+
+    // Nothing else is running yet, so the self set can be seeded without taking the lock.
+    Discovery_SeedSelfEndpoints(disc);
     return disc;
 }
 
 void NodeDiscovery_Destroy(node_discovery_t* disc) {
     if (!disc) return;
     if (disc->peers) DynArr_destroy(disc->peers);
+    if (disc->selfEndpoints) DynArr_destroy(disc->selfEndpoints);
+    if (disc->connectAttempts) DynArr_destroy(disc->connectAttempts);
     pthread_mutex_destroy(&disc->lock);
     free(disc);
 }
@@ -211,12 +399,14 @@ void NodeDiscovery_OnPingTimeout(node_discovery_t* disc, const struct sockaddr_s
 void NodeDiscovery_OnGetPeers(node_discovery_t* disc, tcp_connection_t* fromConn) {
     if (!disc || !fromConn) return;
 
-    // Snapshot our current peers' listen endpoints (inbound + outbound).
+    // Snapshot our current peers' listen endpoints (inbound + outbound) and their identities.
     struct sockaddr_storage all[MAX_CONS * 2];
-    size_t total = Node_GetPeerEndpoints(disc->node, all, sizeof(all) / sizeof(all[0]));
+    uint64_t allIds[MAX_CONS * 2];
+    size_t total = Node_GetPeerEndpoints(disc->node, all, allIds, sizeof(all) / sizeof(all[0]));
 
     struct sockaddr_storage reqEndpoint;
     int haveReq = Node_ConnListenEndpoint(fromConn, &reqEndpoint);
+    uint64_t reqNodeId = Node_ConnPeerNodeId(fromConn);
 
     // Build the response payload: [uint16 count][entries...], capped and sampled for spread.
     unsigned char payload[sizeof(uint16_t) + DISCOVERY_PEERS_RESPONSE_CAP * DISCOVERY_WIRE_ENTRY_SIZE];
@@ -226,7 +416,11 @@ void NodeDiscovery_OnGetPeers(node_discovery_t* disc, tcp_connection_t* fromConn
     size_t startIdx = total ? (size_t)(random_four_byte() % total) : 0;
     for (size_t k = 0; k < total && count < DISCOVERY_PEERS_RESPONSE_CAP; ++k) {
         size_t idx = (startIdx + k) % total;
-        if (haveReq && Discovery_AddrEqual(&all[idx], &reqEndpoint)) continue; // don't tell them about themselves
+        // Don't tell them about themselves. Matching on identity as well as on the endpoint they
+        // reached us from matters: a multi-homed peer is known to us under several addresses, and
+        // handing one of its own back to it is what makes it discover, ping and dial itself.
+        if (haveReq && Discovery_AddrEqual(&all[idx], &reqEndpoint)) continue;
+        if (reqNodeId != 0 && allIds[idx] == reqNodeId) continue;
         unsigned char entry[DISCOVERY_WIRE_ENTRY_SIZE];
         if (!Discovery_AddrToWire(&all[idx], entry)) continue;
         memcpy(payload + offset, entry, DISCOVERY_WIRE_ENTRY_SIZE);
@@ -292,6 +486,40 @@ void NodeDiscovery_RemovePeer(node_discovery_t* disc, const struct sockaddr_stor
     pthread_mutex_unlock(&disc->lock);
 }
 
+void NodeDiscovery_NoteIdentity(node_discovery_t* disc, const struct sockaddr_storage* endpoint, uint64_t nodeId) {
+    if (!disc || !endpoint || nodeId == 0) return;
+
+    pthread_mutex_lock(&disc->lock);
+    if (nodeId == localNodeId) {
+        // The peer on the other end is us under one of our own addresses. Record it and drop it so
+        // discovery stops treating it as a peer.
+        Discovery_AddSelfUnlocked(disc, endpoint);
+        Discovery_RemoveUnlocked(disc, endpoint);
+    } else {
+        // Learn the endpoint if we did not already know it - a peer that dialled us is a perfectly
+        // good discovery candidate, and we now know both its listen endpoint and its identity.
+        discovered_peer_t* p = Discovery_Upsert(disc, endpoint, 0);
+        if (p) p->nodeId = nodeId;
+    }
+    pthread_mutex_unlock(&disc->lock);
+}
+
+void NodeDiscovery_MarkSelfEndpoint(node_discovery_t* disc, const struct sockaddr_storage* endpoint) {
+    if (!disc || !endpoint) return;
+    pthread_mutex_lock(&disc->lock);
+    Discovery_AddSelfUnlocked(disc, endpoint);
+    Discovery_RemoveUnlocked(disc, endpoint);
+    pthread_mutex_unlock(&disc->lock);
+}
+
+int NodeDiscovery_IsSelfEndpoint(node_discovery_t* disc, const struct sockaddr_storage* endpoint) {
+    if (!disc || !endpoint) return 0;
+    pthread_mutex_lock(&disc->lock);
+    int isSelf = Discovery_IsSelfUnlocked(disc, endpoint);
+    pthread_mutex_unlock(&disc->lock);
+    return isSelf;
+}
+
 // ---- periodic tick -----------------------------------------------------------------------
 
 void NodeDiscovery_Iterate(node_discovery_t* disc) {
@@ -305,10 +533,12 @@ void NodeDiscovery_Iterate(node_discovery_t* disc) {
     Node_GetClientList(disc->node, outConns, &outCount);
 
     struct sockaddr_storage outEndpoints[MAX_CONS];
+    uint64_t outNodeIds[MAX_CONS];
     size_t outEpCount = 0;
     for (size_t i = 0; i < outCount; ++i) {
         struct sockaddr_storage ep;
         if (Node_ConnListenEndpoint(outConns[i], &ep)) {
+            outNodeIds[outEpCount] = Node_ConnPeerNodeId(outConns[i]);
             outEndpoints[outEpCount++] = ep;
         }
     }
@@ -328,6 +558,7 @@ void NodeDiscovery_Iterate(node_discovery_t* disc) {
         if (p) {
             p->hop = 0;
             p->state = DISCOVERY_STATE_CONNECTED;
+            if (outNodeIds[i] != 0) p->nodeId = outNodeIds[i];
         }
     }
     // Demote entries still marked CONNECTED that are no longer in the outbound set.
@@ -426,17 +657,25 @@ void NodeDiscovery_Iterate(node_discovery_t* disc) {
             for (size_t i = 0; i < n; ++i) {
                 discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
                 if (p->state != DISCOVERY_STATE_REACHABLE) continue;
-                if (p->lastConnectMs != 0 && (now - p->lastConnectMs) < DISCOVERY_CONNECT_RETRY_MS) continue;
+                if (!Discovery_ConnectCooledDown(disc, &p->addr, now)) continue;
                 int already = 0;
                 for (size_t j = 0; j < outEpCount; ++j) {
                     if (Discovery_AddrEqual(&p->addr, &outEndpoints[j])) { already = 1; break; }
+                }
+                // Skip other addresses of a node we already have an outbound connection to. Only
+                // outbound counts: an inbound connection from a peer is its own dial, and we still
+                // want one of our own to it (broadcasts only travel outbound).
+                if (!already && p->nodeId != 0) {
+                    for (size_t j = 0; j < outEpCount; ++j) {
+                        if (outNodeIds[j] == p->nodeId) { already = 1; break; }
+                    }
                 }
                 if (already) continue;
                 if (!best || p->pingMs < best->pingMs) best = p;
             }
             if (!best) break;
 
-            best->lastConnectMs = now; // reserve so it isn't picked again this tick
+            Discovery_NoteConnectAttempt(disc, &best->addr, now); // reserve so it isn't picked again this tick
             char ip[INET6_ADDRSTRLEN];
             unsigned short port = 0;
             if (Discovery_AddrToIpPort(&best->addr, ip, sizeof(ip), &port) && port != 0) {
@@ -479,12 +718,28 @@ void NodeDiscovery_PrintPeers(node_discovery_t* disc) {
         unsigned short port = 0;
         Discovery_AddrToIpPort(&p->addr, ip, sizeof(ip), &port);
         const char* stateStr = (p->state <= DISCOVERY_STATE_UNREACHABLE) ? stateNames[p->state] : "?";
-        if (p->pingMs == UINT64_MAX) {
-            printf("  %-46s hop=%u state=%-11s ping=--\n", ip, p->hop, stateStr);
+        char idStr[19];
+        if (p->nodeId != 0) {
+            snprintf(idStr, sizeof(idStr), "%016" PRIx64, p->nodeId);
         } else {
-            printf("  %-46s hop=%u state=%-11s ping=%" PRIu64 "ms\n", ip, p->hop, stateStr, p->pingMs);
+            snprintf(idStr, sizeof(idStr), "%-16s", "?");
+        }
+        if (p->pingMs == UINT64_MAX) {
+            printf("  %-46s hop=%u state=%-11s id=%s ping=--\n", ip, p->hop, stateStr, idStr);
+        } else {
+            printf("  %-46s hop=%u state=%-11s id=%s ping=%" PRIu64 "ms\n", ip, p->hop, stateStr, idStr, p->pingMs);
         }
         (void)port; // port is part of ip endpoint identity; shown via connect logs
+    }
+
+    size_t selfCount = DynArr_size(disc->selfEndpoints);
+    printf("Own endpoints (%zu):\n", selfCount);
+    for (size_t i = 0; i < selfCount; ++i) {
+        const struct sockaddr_storage* self = (const struct sockaddr_storage*)DynArr_at(disc->selfEndpoints, i);
+        char ip[INET6_ADDRSTRLEN] = {0};
+        unsigned short port = 0;
+        Discovery_AddrToIpPort(self, ip, sizeof(ip), &port);
+        printf("  %-46s port=%u\n", ip, port);
     }
     pthread_mutex_unlock(&disc->lock);
 }

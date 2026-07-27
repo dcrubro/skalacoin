@@ -12,6 +12,8 @@
 #include <balance_sheet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <numgen.h>
 #include <txmempool.h>
 
 #include <constants.h>
@@ -34,6 +36,7 @@ bool echoPeersEnabled = ECHO_PEERS != 0;
 bool forceOrphanReorgEnabled = false;
 uint256_t currentSupply = {{0, 0, 0, 0}};
 uint64_t currentReward = 750000000000ULL;
+uint64_t localNodeId = 0; // Randomised in main() before the node comes up
 
 // Define the synchronization primitives declared in runtime_state.h
 pthread_rwlock_t chainLock;
@@ -678,7 +681,16 @@ int main(int argc, char* argv[]) {
     // (handled by the send paths) instead of terminating the whole process. Peers connecting and
     // disconnecting is normal p2p behaviour and must never take the node down.
     signal(SIGPIPE, SIG_IGN);
-    srand((unsigned int)time(NULL));
+    // Mix the pid into the seed: nodes launched within the same second would otherwise draw
+    // identical sequences, so every rand()-derived value (connection ids and the like) would
+    // collide across them.
+    srand((unsigned int)time(NULL) ^ ((unsigned int)getpid() << 16));
+
+    // Pick this run's node identity before the node (and with it the listener) comes up, so every
+    // handshake can carry it. Peers are identified by this nonce rather than by an (ip, port)
+    // endpoint, which a multi-homed host has several of.
+    localNodeId = random_secure_eight_byte();
+    printf("Node identity: %016" PRIx64 "\n", localNodeId);
 
     // Initialize runtime locks before any thread or helper can touch chain state.
     pthread_rwlock_init(&chainLock, NULL);

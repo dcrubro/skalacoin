@@ -27,6 +27,18 @@ void NodeDiscovery_OnPeersReceived(node_discovery_t* disc, tcp_connection_t* fro
 // logically disconnected (no remaining connection to it).
 void NodeDiscovery_RemovePeer(node_discovery_t* disc, const struct sockaddr_storage* endpoint);
 
+// Record the node identity behind an endpoint (learned from a completed HELLO/ACK_HELLO). Entries
+// carrying an identity we are already connected to are skipped by the connect picker, which is what
+// stops a multi-homed peer from being dialed once per address it is reachable on.
+void NodeDiscovery_NoteIdentity(node_discovery_t* disc, const struct sockaddr_storage* endpoint, uint64_t nodeId);
+
+// Mark an endpoint as one of our own, permanently. Self endpoints are never added to the known-peer
+// table, never pinged and never dialed. Seeded from the local interface addresses at creation and
+// extended whenever a handshake turns out to come from ourselves.
+void NodeDiscovery_MarkSelfEndpoint(node_discovery_t* disc, const struct sockaddr_storage* endpoint);
+// Returns non-zero if the endpoint is known to be one of our own.
+int NodeDiscovery_IsSelfEndpoint(node_discovery_t* disc, const struct sockaddr_storage* endpoint);
+
 // Dump the known-peer table to stdout (for the CLI `peers` command).
 void NodeDiscovery_PrintPeers(node_discovery_t* disc);
 
