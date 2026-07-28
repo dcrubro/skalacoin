@@ -674,10 +674,43 @@ void Node_Destroy(net_node_t* node) {
         pthread_join(node->maintenanceThread, NULL);
     }
 
+    // Detach every outbound connection from its slot under outboundLock, then tear the connections
+    // down outside it -- the same pattern Node_ReapDeadOutbound uses, and for the same two reasons.
+    //
+    // Calling TcpClient_Destroy directly here instead raced with still-running inbound client
+    // threads: those read outboundClients[i].connection under outboundLock (via
+    // Node_HasLiveConnectionTo), while TcpClient_Disconnect cleared the same field with no lock
+    // held. The lock cannot simply be held across the destroy, because that path joins the io
+    // thread whose on_disconnect callback takes outboundLock itself.
+    tcp_connection_t* outbound[MAX_CONS];
+    size_t outboundToClose = 0;
+
+    pthread_mutex_lock(&node->outboundLock);
     for (size_t i = 0; i < MAX_CONS; ++i) {
-        TcpClient_Destroy(&node->outboundClients[i]);
+        tcp_connection_t* conn = node->outboundClients[i].connection;
+        if (!conn) continue;
+        node->outboundClients[i].connection = NULL;
+        node->outboundClients[i].peerBlockHeight = 0;
+        outbound[outboundToClose++] = conn;
     }
     node->outboundCount = 0;
+    pthread_mutex_unlock(&node->outboundLock);
+
+    for (size_t i = 0; i < outboundToClose; ++i) {
+        tcp_connection_t* conn = outbound[i];
+
+        TcpConnection_RequestClose(conn);
+        if (!pthread_equal(conn->ioThread, pthread_self())) {
+            pthread_join(conn->ioThread, NULL);
+        }
+        if (!TcpConnection_IsDisconnectNotified(conn) && conn->on_disconnect) {
+            TcpConnection_MarkDisconnectNotified(conn);
+            conn->on_disconnect(conn);
+        }
+
+        TcpConnection_Destroy(conn);
+        free(conn);
+    }
 
     if (node->server) {
         TcpServer_Stop(node->server);

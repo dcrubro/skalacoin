@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 
 #include <udpd/udppackettype.h>
+#include <stdatomic.h>
 
 #define UDP_LISTEN_PORT 9393
 #define UDP_PING_RETRY_INTERVAL_MS 1000
@@ -25,7 +26,9 @@ typedef struct udp_node {
     int sockFd; // AF_INET6, IPV6_V6ONLY=1
     int sockFdV4; // AF_INET
 
-    volatile int isRunning;
+    // Cross-thread stop flag: cleared by UdpNode_Stop, read by the recv and retry thread loops.
+    // See the note on net_node_t.maintenanceRunning -- volatile is not a substitute for atomic.
+    _Atomic int isRunning;
 
     pthread_t recvThreadV6;
     pthread_t recvThreadV4;

@@ -7,12 +7,15 @@
 #include <constants.h>
 
 #include <tcpd/tcpconnection.h>
+#include <stdatomic.h>
 
 typedef struct {
     int sockFd;    // IPv6 listening socket (-1 if IPv6 unavailable)
     int sockFdV4;  // IPv4 listening socket (-1 on bind failure)
     int opt;
-    int isRunning;
+    // Cross-thread stop flag: cleared by TcpServer_Stop, read by both accept threads and by
+    // exiting client threads. Must be atomic, not a plain int.
+    _Atomic int isRunning;
     void* owner;
 
     // Called before the client thread runs

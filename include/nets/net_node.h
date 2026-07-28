@@ -25,6 +25,7 @@ typedef struct node_discovery node_discovery_t;
 #include <block/block.h>
 #include <block/chain.h>
 #include <block/transaction.h>
+#include <stdatomic.h>
 
 typedef struct {
     tcp_server_t* server;
@@ -42,7 +43,10 @@ typedef struct {
     void* callbackUser;
     // Maintenance thread for periodic tasks (orphan attach, pruning, metrics)
     pthread_t maintenanceThread;
-    volatile int maintenanceRunning;
+    // Cross-thread stop flag: written by Node_Destroy on the main thread, read by the maintenance
+    // thread's loop condition. `volatile` stops the compiler hoisting the load but provides neither
+    // atomicity nor ordering, so this has to be a real atomic (and TSan rightly flagged it).
+    _Atomic int maintenanceRunning;
     int maintenanceIntervalMs;
     // UDP ping/pong daemon (latency oracle) and peer discovery state
     udp_node_t* udpNode;

@@ -16,15 +16,20 @@ typedef struct {
     int listenFd;
 } tcpaccept_thread_args_t;
 
-static void TcpServer_RemoveClientByPtrUnlocked(tcp_server_t* svr, tcp_connection_t* cli) {
+// Returns non-zero if `cli` was still registered (and has now been unregistered). A zero return
+// means someone else already claimed the slot -- see the detach logic in the client thread.
+static int TcpServer_RemoveClientByPtrUnlocked(tcp_server_t* svr, tcp_connection_t* cli) {
     if (!svr || !svr->clientsArrPtr || !cli) {
-        return;
+        return 0;
     }
 
     size_t idx = Generic_FindClientInArrayByPtr(svr->clientsArrPtr, cli, svr->maxClients);
     if (idx != SIZE_MAX) {
         svr->clientsArrPtr[idx] = NULL;
+        return 1;
     }
+
+    return 0;
 }
 
 static void* TcpServer_clientthreadprocess(void* ptr) {
@@ -65,12 +70,25 @@ static void* TcpServer_clientthreadprocess(void* ptr) {
         cli->on_disconnect(cli);
     }
 
+    // Unregister, decide who joins us, and free -- all under clientsMutex.
+    //
+    // The destroy/free used to happen after the lock was released, which left a window where
+    // TcpServer_Stop could be holding this very pointer and about to use it. Doing it under the
+    // same lock Stop uses to inspect the slots removes that window entirely.
     pthread_mutex_lock(&svr->clientsMutex);
-    TcpServer_RemoveClientByPtrUnlocked(svr, cli);
-    pthread_mutex_unlock(&svr->clientsMutex);
+
+    // If our slot was still ours, TcpServer_Stop has not claimed us and never will (we are leaving
+    // the array now), so nobody is going to join this thread -- detach it or its resources leak.
+    // If the slot was already cleared, Stop took our handle and is waiting in pthread_join, so we
+    // must stay joinable.
+    if (TcpServer_RemoveClientByPtrUnlocked(svr, cli)) {
+        pthread_detach(pthread_self());
+    }
 
     TcpConnection_Destroy(cli);
     free(cli);
+
+    pthread_mutex_unlock(&svr->clientsMutex);
 
     return NULL;
 }
@@ -359,30 +377,42 @@ void TcpServer_Stop(tcp_server_t* ptr) {
     }
     ptr->svrThreadV4 = 0;
 
+    // Ask every live client to close and copy out its thread handle, all under clientsMutex.
+    //
+    // This used to read the client slots with the lock released, which races with an exiting client
+    // thread clearing its own slot -- and worse, that thread destroys and frees the connection right
+    // afterwards, so the pointer read here could already be freed memory. Copying the pthread_t
+    // while holding the lock means the join below never dereferences the connection at all, and the
+    // client thread cannot free itself out from under us because it does that under the same lock.
     pthread_mutex_lock(&ptr->clientsMutex);
     size_t maxClients = ptr->maxClients;
-    tcp_connection_t** local = ptr->clientsArrPtr;
+    pthread_t* joinHandles = maxClients ? (pthread_t*)calloc(maxClients, sizeof(pthread_t)) : NULL;
+    size_t joinCount = 0;
+
+    if (ptr->clientsArrPtr) {
+        for (size_t i = 0; i < maxClients; ++i) {
+            tcp_connection_t* cli = ptr->clientsArrPtr[i];
+            if (!cli) {
+                continue;
+            }
+
+            TcpConnection_RequestClose(cli);
+
+            if (joinHandles && !pthread_equal(cli->ioThread, pthread_self())) {
+                joinHandles[joinCount++] = cli->ioThread;
+                // Claim the slot: the client thread checks whether it is still registered to decide
+                // whether to detach itself or stay joinable for the pthread_join below.
+                ptr->clientsArrPtr[i] = NULL;
+            }
+        }
+    }
     pthread_mutex_unlock(&ptr->clientsMutex);
 
-    for (size_t i = 0; i < maxClients; ++i) {
-        tcp_connection_t* cli = local[i];
-        if (!cli) {
-            continue;
-        }
-
-        TcpConnection_RequestClose(cli);
+    // Join outside the lock: a client thread needs clientsMutex to finish unregistering itself.
+    for (size_t i = 0; i < joinCount; ++i) {
+        pthread_join(joinHandles[i], NULL);
     }
-
-    for (size_t i = 0; i < maxClients; ++i) {
-        tcp_connection_t* cli = local[i];
-        if (!cli) {
-            continue;
-        }
-
-        if (!pthread_equal(cli->ioThread, pthread_self())) {
-            pthread_join(cli->ioThread, NULL);
-        }
-    }
+    free(joinHandles);
 
     pthread_mutex_lock(&ptr->clientsMutex);
     free(ptr->clientsArrPtr);
