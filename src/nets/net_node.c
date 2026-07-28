@@ -345,7 +345,8 @@ static void Node_OnPingTimeoutThunk(udp_node_t* udp, const struct sockaddr_stora
 typedef enum {
     NODE_BLOCK_REJECTED = 0,
     NODE_BLOCK_ORPHAN_QUEUED = 1,
-    NODE_BLOCK_ACCEPTED = 2
+    NODE_BLOCK_ACCEPTED = 2,
+    NODE_BLOCK_DUPLICATE = 3 // already on our chain; not a fault, do not log it as a rejection
 } node_block_accept_result_t;
 
 // Reclaims outbound slots whose peer has disconnected. Mirrors the inbound self-reclaim in
@@ -511,7 +512,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
                 // Exactly the block we already have.
                 DynArr_destroy(blk->transactions);
                 free(blk);
-                return NODE_BLOCK_REJECTED;
+                return NODE_BLOCK_DUPLICATE;
             }
         }
 
@@ -1105,6 +1106,8 @@ void Node_Server_OnData(tcp_connection_t* client) {
                     }
                 } else if (result == NODE_BLOCK_ORPHAN_QUEUED) {
                     printf("Queued orphan BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
+                } else if (result == NODE_BLOCK_DUPLICATE) {
+                    // Already on our chain (a peer relayed it to us twice); not an error.
                 } else {
                     printf("Rejected BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
                 }
@@ -1344,6 +1347,8 @@ void Node_Client_OnData(tcp_connection_t* client) {
                     }
                 } else if (result == NODE_BLOCK_ORPHAN_QUEUED) {
                     printf("Queued orphan BLOCK_DATA from node %u\n", client ? client->connectionId : 0U);
+                } else if (result == NODE_BLOCK_DUPLICATE) {
+                    // Already on our chain (a peer relayed it to us twice); not an error.
                 } else {
                     printf("Rejected BLOCK_DATA from node %u\n", client ? client->connectionId : 0U);
                 }
@@ -1375,6 +1380,8 @@ void Node_Client_OnData(tcp_connection_t* client) {
                     }
                 } else if (result == NODE_BLOCK_ORPHAN_QUEUED) {
                     printf("Queued orphan BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
+                } else if (result == NODE_BLOCK_DUPLICATE) {
+                    // Already on our chain (a peer relayed it to us twice); not an error.
                 } else {
                     printf("Rejected BROADCAST_BLOCK from node %u\n", client ? client->connectionId : 0U);
                 }
@@ -1536,36 +1543,79 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
             memcpy(payload + off, tx, sizeof(signed_transaction_t)); off += sizeof(signed_transaction_t);
         }
 
-        size_t delivered = 0;
+        // Collect one connection per distinct peer, then send with no lock held.
+        //
+        // A peer we both dialled and were dialled by occupies two connections (one outbound, one
+        // inbound). Sending on both delivers every block twice, and the receiver logs the second
+        // copy as a rejection. Peers are identified by peerNodeId rather than by endpoint, because
+        // a multi-homed host reaches us from several addresses and an inbound connection carries an
+        // ephemeral port while the outbound one carries the listen port.
+        //
+        // Sends happen outside outboundLock/clientsMutex on purpose: Node_SendPacket writes to a
+        // socket and can block when the peer is slow to read, and holding the server's clientsMutex
+        // across that stalls the accept path and every other user of it.
+        tcp_connection_t* targets[MAX_CONS * 2];
+        uint64_t targetNodeIds[MAX_CONS * 2];
+        size_t targetCount = 0;
 
-        // Snapshot outbound clients and send
+        uint64_t sourceNodeId = sourceConn ? sourceConn->peerNodeId : 0ULL;
+
+        // Skip a connection if it is the source, belongs to the source's node, or duplicates a peer
+        // we have already queued.
+        #define NODE_RELAY_SHOULD_SKIP(conn) ( \
+            (conn) == sourceConn || \
+            ((sourceNodeId != 0ULL) && ((conn)->peerNodeId == sourceNodeId)) || \
+            (sourceConn && (sourceNodeId == 0ULL) && TcpConnection_PeerAddrEqual((conn), sourceConn)))
+
         pthread_mutex_lock(&node->outboundLock);
-        for (size_t i = 0; i < MAX_CONS; ++i) {
+        for (size_t i = 0; i < MAX_CONS && targetCount < (MAX_CONS * 2); ++i) {
             tcp_connection_t* conn = node->outboundClients[i].connection;
-            if (!conn) continue;
-            if (conn == sourceConn) continue;
-            if (sourceConn && TcpConnection_PeerAddrEqual(conn, sourceConn)) continue;
-            if (Node_SendPacket(node, conn, PACKET_TYPE_BROADCAST_BLOCK, payload, off) == 0) {
-                delivered++;
+            if (!conn || TcpConnection_IsDisconnectNotified(conn)) continue;
+            if (NODE_RELAY_SHOULD_SKIP(conn)) continue;
+
+            bool duplicate = false;
+            for (size_t t = 0; t < targetCount; ++t) {
+                if (conn->peerNodeId != 0ULL && targetNodeIds[t] == conn->peerNodeId) { duplicate = true; break; }
             }
+            if (duplicate) continue;
+
+            TcpConnection_Pin(conn);
+            targetNodeIds[targetCount] = conn->peerNodeId;
+            targets[targetCount++] = conn;
         }
         pthread_mutex_unlock(&node->outboundLock);
 
-        // Relay to inbound peers as well. Broadcasting only to outbound connections meant that in a
-        // two-node setup the node that was dialled never pushed anything back, and the dialer only
-        // ever learned about new blocks through a manual `sync`.
+        // Inbound peers too. Broadcasting only to outbound connections meant that in a two-node
+        // setup the node that was dialled never pushed anything back, and the dialer only ever
+        // learned about new blocks through a manual `sync`.
         if (node->server) {
             pthread_mutex_lock(&node->server->clientsMutex);
-            for (size_t i = 0; i < node->server->maxClients; ++i) {
+            for (size_t i = 0; i < node->server->maxClients && targetCount < (MAX_CONS * 2); ++i) {
                 tcp_connection_t* conn = node->server->clientsArrPtr ? node->server->clientsArrPtr[i] : NULL;
                 if (!conn || TcpConnection_IsDisconnectNotified(conn)) continue;
-                if (conn == sourceConn) continue;
-                if (sourceConn && TcpConnection_PeerAddrEqual(conn, sourceConn)) continue;
-                if (Node_SendPacket(node, conn, PACKET_TYPE_BROADCAST_BLOCK, payload, off) == 0) {
-                    delivered++;
+                if (NODE_RELAY_SHOULD_SKIP(conn)) continue;
+
+                bool duplicate = false;
+                for (size_t t = 0; t < targetCount; ++t) {
+                    if (conn->peerNodeId != 0ULL && targetNodeIds[t] == conn->peerNodeId) { duplicate = true; break; }
                 }
+                if (duplicate) continue;
+
+                TcpConnection_Pin(conn);
+                targetNodeIds[targetCount] = conn->peerNodeId;
+                targets[targetCount++] = conn;
             }
             pthread_mutex_unlock(&node->server->clientsMutex);
+        }
+
+        #undef NODE_RELAY_SHOULD_SKIP
+
+        size_t delivered = 0;
+        for (size_t t = 0; t < targetCount; ++t) {
+            if (Node_SendPacket(node, targets[t], PACKET_TYPE_BROADCAST_BLOCK, payload, off) == 0) {
+                delivered++;
+            }
+            TcpConnection_Unpin(targets[t]);
         }
 
         if (delivered > 0) {

@@ -121,9 +121,12 @@ static const uint64_t TAIL_EMISSION = 750000000000ULL; // 0.75 coins per block f
 // No max supply. Instead of halving, it'll follow a more gradual, Monero-like emission curve.
 
 // Phase 3: update once per effective epoch and keep a fixed per-block reward for that epoch.
-static inline uint64_t GetInflationRateReward(uint256_t currentSupply, blockchain_t* chain) {
-    if (!chain || !chain->blocks) { return 0x00; } // Invalid
-    size_t height = Chain_Size(chain);
+//
+// The *AtHeight variants take the height directly and never call Chain_Size/Chain_GetBlockCopy, so
+// they are safe to call from inside a chainLock critical section. chainLock is a non-recursive
+// pthread_rwlock_t: taking it for reading while this thread already holds it for writing deadlocks
+// as soon as another thread is queued for the write lock.
+static inline uint64_t GetInflationRateRewardAtHeight(uint256_t currentSupply, uint64_t height) {
     const uint64_t effectiveEpochLength =
         (EPOCH_LENGTH / EMISSION_ACCELERATION_FACTOR) > 0
             ? (EPOCH_LENGTH / EMISSION_ACCELERATION_FACTOR)
@@ -161,27 +164,29 @@ static inline uint64_t GetInflationRateReward(uint256_t currentSupply, blockchai
     return (currentReward > TAIL_EMISSION) ? currentReward : TAIL_EMISSION;
 }
 
-static inline uint64_t CalculateBlockReward(uint256_t currentSupply, blockchain_t* chain) {
+static inline uint64_t GetInflationRateReward(uint256_t currentSupply, blockchain_t* chain) {
     if (!chain || !chain->blocks) { return 0x00; } // Invalid
+    return GetInflationRateRewardAtHeight(currentSupply, (uint64_t)Chain_Size(chain));
+}
 
+static inline uint64_t CalculateBlockRewardAtHeight(uint256_t currentSupply, uint64_t height) {
     const uint64_t effectivePhase1Blocks =
         (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR) > 0
             ? (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR)
             : 1;
-    const uint64_t height = (uint64_t)Chain_Size(chain);
 
     // After the phase-one target horizon, only floor/inflation schedule applies.
     if (height >= effectivePhase1Blocks) {
-        return GetInflationRateReward(currentSupply, chain);
+        return GetInflationRateRewardAtHeight(currentSupply, height);
     }
 
-    if (currentSupply.limbs[1] > 0 || 
-        currentSupply.limbs[2] > 0 || 
-        currentSupply.limbs[3] > 0 || 
+    if (currentSupply.limbs[1] > 0 ||
+        currentSupply.limbs[2] > 0 ||
+        currentSupply.limbs[3] > 0 ||
         currentSupply.limbs[0] >= M_CAP)
     {
         // Post-Monero phase with unlimited supply: floor/inflation schedule only.
-        return GetInflationRateReward(currentSupply, chain);
+        return GetInflationRateRewardAtHeight(currentSupply, height);
     }
 
     const uint64_t generated = currentSupply.limbs[0];
@@ -213,7 +218,12 @@ static inline uint64_t CalculateBlockReward(uint256_t currentSupply, blockchain_
     }
 
     // Phase 2 + 3: floor and epoch inflation updates.
-    return GetInflationRateReward(currentSupply, chain);
+    return GetInflationRateRewardAtHeight(currentSupply, height);
+}
+
+static inline uint64_t CalculateBlockReward(uint256_t currentSupply, blockchain_t* chain) {
+    if (!chain || !chain->blocks) { return 0x00; } // Invalid
+    return CalculateBlockRewardAtHeight(currentSupply, (uint64_t)Chain_Size(chain));
 }
 
 // Hashing DAG

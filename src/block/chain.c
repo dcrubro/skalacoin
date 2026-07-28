@@ -176,7 +176,8 @@ bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
     }
 
     currentSupply = rebuiltSupply;
-    currentReward = CalculateBlockReward(currentSupply, chain);
+    // *AtHeight: never take chainLock from here, callers may already hold it.
+    currentReward = CalculateBlockRewardAtHeight(currentSupply, (uint64_t)chain->size);
     return true;
 }
 
@@ -420,7 +421,10 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
         // forever. It also has to happen per block so that applying a whole branch works.
         if (ok) {
             (void)uint256_add_u64(&currentSupply, expectedCoinbaseAmount);
-            currentReward = CalculateBlockReward(currentSupply, chain);
+            // Must be the *AtHeight variant: we hold chainLock for writing here, and
+            // CalculateBlockReward would take it for reading via Chain_Size. chainLock is not
+            // recursive, so that self-deadlocks as soon as another thread queues for the write lock.
+            currentReward = CalculateBlockRewardAtHeight(currentSupply, (uint64_t)chain->size);
         }
         // ok remains true if no failures
     } while (0);
@@ -639,7 +643,8 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
     }
 
     currentSupply = rebuiltSupply;
-    currentReward = CalculateBlockReward(currentSupply, chain);
+    // *AtHeight: chainLock is held for writing here (see Chain_RollbackToHeight).
+    currentReward = CalculateBlockRewardAtHeight(currentSupply, (uint64_t)chain->size);
 
     return true;
 }
