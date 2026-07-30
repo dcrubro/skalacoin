@@ -72,6 +72,29 @@ int Node_BroadcastTransaction(net_node_t* node, signed_transaction_t* tx, tcp_co
 
 // Helpers for outbound peer selection and block broadcast
 int Node_GetBestOutboundPeer(net_node_t* node, tcp_connection_t** outConn, uint64_t* outHeight);
+
+/**
+ * Delivery receipts for windowed sync.
+ *
+ * A FETCH_BLOCK reply is handled on the peer's io thread and may legitimately never reach the
+ * chain: a block belonging to a competing branch is filed in the orphan pool instead. A sync loop
+ * that infers arrival from the chain growing therefore cannot tell "arrived but forked" from "lost
+ * in transit", so it re-requests until it times out. Against a peer on a fork that costs one full
+ * retry-and-timeout cycle for EVERY block, which is why syncing to a forked peer used to crawl.
+ *
+ * DUPLICATE is what makes a backwards fork walk terminate: it means we already hold exactly that
+ * block, so the two chains agree at that height and there is no reason to keep descending.
+**/
+typedef enum {
+    NODE_DELIVERY_APPENDED = 0,  // joined our chain
+    NODE_DELIVERY_DUPLICATE = 1, // we already held this exact block -- common ground
+    NODE_DELIVERY_ORPHANED = 2,  // belongs to a competing branch; now in the orphan pool
+    NODE_DELIVERY_REJECTED = 3   // failed validation
+} node_delivery_status_t;
+
+void Node_NoteBlockDelivered(uint64_t height, node_delivery_status_t status);
+bool Node_TakeBlockDelivery(uint64_t height, node_delivery_status_t* outStatus);
+void Node_ResetBlockDeliveries(void);
 void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp_connection_t* sourceConn);
 
 // Callback logic

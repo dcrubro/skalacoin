@@ -842,7 +842,9 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
     do {
         const size_t tipCount = DynArr_size(chain->blocks);
         if (forkHeight > tipCount) {
-            break; // fork point is beyond our chain; nothing to replace
+            printf("Chain_ReplaceBranch: fork point %zu is beyond our tip %zu; nothing to replace\n",
+                forkHeight, tipCount);
+            break;
         }
 
         if (!Chain_BranchIsLinkedLocked(chain, forkHeight, newBlocks, count)) {
@@ -883,10 +885,17 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
         uint256_t candidateWork;
         if (!Chain_ComputeWorkRange(chain, forkHeight, tipCount, &incumbentWork) ||
             !Chain_ComputeBranchWork(newBlocks, count, &candidateWork)) {
+            printf("Chain_ReplaceBranch: could not compute work for the branch at height %zu\n", forkHeight);
             break;
         }
         if (uint256_cmp(&candidateWork, &incumbentWork) <= 0) {
-            break; // not heavier; keep what we have
+            // Very often this just means the branch is still arriving -- a partial branch is
+            // genuinely lighter than what it would replace. Report the block counts so that case
+            // is distinguishable from a peer that really is on a weaker chain.
+            printf("Chain_ReplaceBranch: candidate at height %zu is not heavier "
+                   "(%zu candidate block(s) vs %zu incumbent); keeping our chain\n",
+                forkHeight, count, tipCount - forkHeight);
+            break;
         }
 
         // Snapshot what we are about to discard so a failed apply can be undone. The in-memory
@@ -896,6 +905,8 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
         if (snapshotCount > 0) {
             snapshot = (block_t**)calloc(snapshotCount, sizeof(block_t*));
             if (!snapshot) {
+                printf("Chain_ReplaceBranch: out of memory snapshotting %zu block(s); chain unchanged\n",
+                    snapshotCount);
                 break;
             }
 
@@ -915,6 +926,10 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
                 }
             }
             if (!snapshotOk) {
+                // Refusing here is the point: without a complete snapshot a failed apply could not
+                // be undone, so we would rather not start than risk a half-replaced chain.
+                printf("Chain_ReplaceBranch: could not snapshot the blocks being replaced at height %zu; "
+                       "refusing the reorg rather than risk an unrecoverable apply\n", forkHeight);
                 break;
             }
         }
@@ -923,6 +938,7 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
         // rollback -- the caller keeps ownership of what it passed in, whatever happens here.
         candidate = (block_t**)calloc(count, sizeof(block_t*));
         if (!candidate) {
+            printf("Chain_ReplaceBranch: out of memory copying %zu candidate block(s); chain unchanged\n", count);
             break;
         }
         bool copiedAll = true;
@@ -934,6 +950,8 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
             }
         }
         if (!copiedAll) {
+            printf("Chain_ReplaceBranch: could not copy the candidate branch at height %zu; chain unchanged\n",
+                forkHeight);
             break;
         }
 

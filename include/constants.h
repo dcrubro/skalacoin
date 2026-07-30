@@ -82,7 +82,18 @@ static const size_t MAX_ORPHAN_BLOCKS = 512U;
 // following the tip, and is exempt from the reorg penalty (Horizen does the same via
 // IsInitialBlockDownload). Determined purely from local state, so an unverified peer cannot
 // trigger the exemption by claiming a large height.
-static const uint64_t IBD_TIP_AGE_BLOCKS = 500ULL;
+//
+// This is also the ONLY way a non-mining node rejoins the network after ending up on a minority
+// fork: the penalty is served by local chain growth, and a node that does not mine has no way to
+// grow except by adopting the very branch the penalty is gating. It therefore has to be short
+// enough that such a node recovers in minutes rather than half a day.
+//
+// 20 block times is ~30 minutes at a 90s target, far beyond normal Poisson block spacing (a gap
+// that long has probability ~e^-20), so a node that is genuinely following the tip will not trip
+// it. Note the exemption is all-or-nothing -- once in IBD a node accepts a reorg of any depth --
+// so lowering this further widens that hole; it is the number to revisit if deep reorgs ever get
+// used against an idle node.
+static const uint64_t IBD_TIP_AGE_BLOCKS = 20ULL;
 // Number of trailing blocks whose median timestamp is used for the age test above. Using a median
 // rather than the tip alone means a single miner cannot backdate one block to fake being in IBD.
 static const size_t MEDIAN_TIME_SPAN = 11U;

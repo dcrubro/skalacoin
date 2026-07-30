@@ -349,6 +349,67 @@ typedef enum {
     NODE_BLOCK_DUPLICATE = 3 // already on our chain; not a fault, do not log it as a rejection
 } node_block_accept_result_t;
 
+// Delivery receipts for windowed sync -- see the contract in net_node.h. Written from peer io
+// threads, drained by the REPL thread running `sync`, so it needs its own lock; it never calls back
+// into chain.c or takes any other lock, so it cannot participate in a cycle.
+#define NODE_DELIVERY_SLOTS 512
+typedef struct {
+    uint64_t height;
+    node_delivery_status_t status;
+    bool valid;
+} node_delivery_t;
+
+static node_delivery_t g_deliveries[NODE_DELIVERY_SLOTS];
+static size_t g_deliveryNext = 0;
+static pthread_mutex_t g_deliveryLock = PTHREAD_MUTEX_INITIALIZER;
+
+void Node_NoteBlockDelivered(uint64_t height, node_delivery_status_t status) {
+    pthread_mutex_lock(&g_deliveryLock);
+
+    // Refresh an existing receipt rather than adding a second one for the same height: a retried
+    // request would otherwise leave a stale receipt that the next window could consume by mistake.
+    for (size_t i = 0; i < NODE_DELIVERY_SLOTS; ++i) {
+        if (g_deliveries[i].valid && g_deliveries[i].height == height) {
+            g_deliveries[i].status = status;
+            pthread_mutex_unlock(&g_deliveryLock);
+            return;
+        }
+    }
+
+    g_deliveries[g_deliveryNext].height = height;
+    g_deliveries[g_deliveryNext].status = status;
+    g_deliveries[g_deliveryNext].valid = true;
+    g_deliveryNext = (g_deliveryNext + 1u) % NODE_DELIVERY_SLOTS;
+
+    pthread_mutex_unlock(&g_deliveryLock);
+}
+
+bool Node_TakeBlockDelivery(uint64_t height, node_delivery_status_t* outStatus) {
+    bool found = false;
+
+    pthread_mutex_lock(&g_deliveryLock);
+    for (size_t i = 0; i < NODE_DELIVERY_SLOTS; ++i) {
+        if (g_deliveries[i].valid && g_deliveries[i].height == height) {
+            if (outStatus) {
+                *outStatus = g_deliveries[i].status;
+            }
+            g_deliveries[i].valid = false; // consumed
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_deliveryLock);
+
+    return found;
+}
+
+void Node_ResetBlockDeliveries(void) {
+    pthread_mutex_lock(&g_deliveryLock);
+    memset(g_deliveries, 0, sizeof(g_deliveries));
+    g_deliveryNext = 0;
+    pthread_mutex_unlock(&g_deliveryLock);
+}
+
 // Reclaims outbound slots whose peer has disconnected. Mirrors the inbound self-reclaim in
 // TcpServer_clientthreadprocess: detach dead connections from their slots under outboundLock, then
 // join their io threads and destroy/free them outside the lock. Pinned connections (a raw pointer
@@ -1362,6 +1423,19 @@ void Node_Client_OnData(tcp_connection_t* client) {
                 uint64_t blockHeight = 0;
                 memcpy(&blockHeight, payload, sizeof(blockHeight));
                 node_block_accept_result_t result = Node_ParseAndAcceptBlock(payload, payloadLen, true);
+
+                // Receipt for the windowed sync. BLOCK_DATA is only ever sent in reply to a
+                // FETCH_BLOCK, so recording it here (and not for BROADCAST_BLOCK) tells the sync
+                // loop the peer answered, whether or not the block could join our chain.
+                node_delivery_status_t deliveryStatus = NODE_DELIVERY_REJECTED;
+                switch (result) {
+                    case NODE_BLOCK_ACCEPTED:      deliveryStatus = NODE_DELIVERY_APPENDED; break;
+                    case NODE_BLOCK_DUPLICATE:     deliveryStatus = NODE_DELIVERY_DUPLICATE; break;
+                    case NODE_BLOCK_ORPHAN_QUEUED: deliveryStatus = NODE_DELIVERY_ORPHANED; break;
+                    default:                       deliveryStatus = NODE_DELIVERY_REJECTED; break;
+                }
+                Node_NoteBlockDelivered(blockHeight, deliveryStatus);
+
                 if (result == NODE_BLOCK_ACCEPTED) {
                     printf("Accepted BLOCK_DATA from node %u\n", client ? client->connectionId : 0U);
                     net_node_t* node = Node_FromConnection(client);
