@@ -463,16 +463,18 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         }
     }
 
-    // Validate block
-    if (!Block_IsFullyValid(blk)) {
-        printf("Rejected BLOCK_DATA at height %" PRIu64 " during validation\n", blockHeight);
+    // The chain check has to come first now: PoW validity is chain-relative (the epoch DAG size and
+    // seed are derived from it), so there is nothing to validate against without a chain.
+    if (!currentChain) {
+        printf("Rejected BLOCK_DATA at height %" PRIu64 ": no active chain\n", blockHeight);
         DynArr_destroy(blk->transactions);
         free(blk);
         return NODE_BLOCK_REJECTED;
     }
 
-    if (!currentChain) {
-        printf("Rejected BLOCK_DATA at height %" PRIu64 ": no active chain\n", blockHeight);
+    // Validate block
+    if (!Block_IsFullyValid(blk, currentChain)) {
+        printf("Rejected BLOCK_DATA at height %" PRIu64 " during validation\n", blockHeight);
         DynArr_destroy(blk->transactions);
         free(blk);
         return NODE_BLOCK_REJECTED;

@@ -7,13 +7,41 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <pthread.h>
 #include <uint256.h>
 #include <storage/block_table.h>
 #include <balance_sheet.h>
 
+// One entry of the memoised DAG size recurrence, one per epoch. See Chain_DagParamsForHeight.
 typedef struct {
+    uint64_t sizeBytes;  // DAG size used by every block whose height falls in this epoch
+    bool downQualified;  // this epoch's own votes met the down supermajority
+} dag_epoch_state_t;
+
+// Tagged so block.h can forward-declare it: PoW validity depends on the chain (it needs the epoch
+// seed), but chain.h includes block.h, so the tag is what breaks the cycle.
+typedef struct blockchain {
     DynArr* blocks;
     size_t size;
+
+    /**
+     * Memoised DAG size recurrence: a pure cache of a function of the block headers, extended
+     * lazily and dropped whenever anything at or below the tip changes (every epoch's size depends
+     * on the votes of every epoch before it). It lives on the chain rather than in a global because
+     * a second, header-only blockchain_t is built to re-verify historical PoW, and the two must not
+     * share a cache.
+     *
+     * `dagEpochsComputed` counts valid `sizeBytes` entries. `downQualified` is only filled in for
+     * an epoch once the *following* entry has been computed, so it is valid on
+     * [0, dagEpochsComputed - 1).
+     *
+     * Guarded by `dagCacheLock`, which is always taken AFTER `chainLock` and is never held across a
+     * call back into chain.c.
+    **/
+    dag_epoch_state_t* dagEpochs;
+    size_t dagEpochsComputed;
+    size_t dagEpochsCapacity;
+    pthread_mutex_t dagCacheLock;
 } blockchain_t;
 
 blockchain_t* Chain_Create();
@@ -79,6 +107,25 @@ uint32_t Chain_GetTargetForHeight(blockchain_t* chain, uint64_t height);
 // Refresh runtime state derived from the chain tip (difficulty target, epoch DAG).
 // Call after any change to the tip. Must NOT be called while holding `chainLock`.
 void Chain_OnTipAdvanced(blockchain_t* chain);
+
+// DAG
+/**
+ * The Autolykos2 DAG size and epoch seed that the block at `blockHeight` must be hashed against.
+ *
+ * This is the single source of truth for both, so the mining path and the verification path cannot
+ * drift apart. Size follows the default-grow recurrence gated by the miner votes in
+ * `header.reserved[0]` (see the DAG band in constants.h); the seed is epoch-aligned -- epoch 0 uses
+ * the genesis seed, epoch k uses the hash of the last block of epoch k-1 -- so it is constant for
+ * the whole epoch rather than changing every block.
+ *
+ * Requires the chain to hold every block below the start of `blockHeight`'s epoch, which is always
+ * true when validating or mining a block at that height. Returns false if it cannot produce both
+ * values; callers MUST treat that as an invalid proof rather than falling back to a default.
+ *
+ * Takes `chainLock` for reading internally. Must NOT be called while holding it.
+**/
+bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
+                              size_t* outDagBytes, uint8_t outSeed[32]);
 
 // Work
 // Expected number of hashes to satisfy `difficultyTargetBits`, i.e. 2^256 / (target + 1).

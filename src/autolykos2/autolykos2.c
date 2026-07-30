@@ -409,37 +409,6 @@ bool Autolykos2_Hash(
     );
 }
 
-bool Autolykos2_LightHash(const uint8_t* seed, blockchain_t* chain, uint64_t nonce, uint8_t* out) {
-    if (!seed || !chain || !out) {
-        return false;
-    }
-
-    const uint64_t height = (uint64_t)Chain_Size(chain);
-    const size_t dagBytes = CalculateTargetDAGSize(chain);
-    if (dagBytes < 32 || (dagBytes % 32) != 0) {
-        return false;
-    }
-
-    const size_t laneCount64 = dagBytes / 32u;
-    if (laneCount64 == 0 || laneCount64 > UINT32_MAX) {
-        return false;
-    }
-
-    // Light path derives the needed DAG lanes from seed on-demand, no large DAG allocation required.
-    return Autolykos2_HashCore(
-        seed,
-        seed,
-        seed,
-        32,
-        nonce,
-        height,
-        (uint32_t)laneCount64,
-        NULL,
-        false,
-        out
-    );
-}
-
 bool Autolykos2_LightHashAtHeight(
     const uint8_t seed32[32],
     const uint8_t* message,

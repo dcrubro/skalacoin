@@ -1,45 +1,118 @@
 #include <block/block.h>
+#include <block/chain.h>
 #include <autolykos2/autolykos2.h>
 #include <utils.h>
 #include <stdlib.h>
+#include <pthread.h>
 
+/**
+ * The process-global mining DAG.
+ *
+ * Guarded by `g_powCtxLock` because generation frees and reallocates the buffer that hashing reads
+ * from: without the lock, an epoch rollover would pull the DAG out from under a miner mid-hash.
+ * Only the miner ever builds or reads this -- validation goes through the light path -- so the lock
+ * is essentially uncontended, and a node that does not mine never allocates a DAG at all.
+**/
 static Autolykos2Context* g_autolykos2Ctx = NULL;
+static pthread_mutex_t g_powCtxLock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_dagEpoch = 0;
+static bool g_dagReady = false;
 
-static Autolykos2Context* GetAutolykos2Ctx(void) {
+// Caller must hold `g_powCtxLock`.
+static Autolykos2Context* GetAutolykos2CtxLocked(void) {
     if (!g_autolykos2Ctx) {
         g_autolykos2Ctx = Autolykos2_Create();
         if (!g_autolykos2Ctx) {
             fprintf(stderr, "Failed to create Autolykos2 context\n");
             exit(1);
         }
-        Autolykos2_DagAllocate(g_autolykos2Ctx, DAG_BASE_SIZE);
+        // Deliberately no DagAllocate here. Allocating without generating leaves dag.len == 0, so
+        // every heavy hash fails -- which used to be indistinguishable from a valid proof, because
+        // the failure path handed back a zeroed hash that compares below every target.
     }
     return g_autolykos2Ctx;
 }
 
 void Block_ShutdownPowContext(void) {
+    pthread_mutex_lock(&g_powCtxLock);
     if (g_autolykos2Ctx) {
         Autolykos2_Destroy(g_autolykos2Ctx);
         g_autolykos2Ctx = NULL;
     }
+    g_dagReady = false;
+    pthread_mutex_unlock(&g_powCtxLock);
 }
 
-bool Block_RebuildAutolykos2Dag(size_t dagBytes, const uint8_t seed32[32]) {
-    if (!seed32 || dagBytes == 0) {
+bool Block_EnsureAutolykos2Dag(uint64_t epochIndex, size_t dagBytes, const uint8_t seed32[32]) {
+    if (!seed32 || dagBytes < 32u || (dagBytes % 32u) != 0u) {
         return false;
     }
 
-    Autolykos2Context* ctx = GetAutolykos2Ctx();
-    if (!ctx) {
-        return false;
+    pthread_mutex_lock(&g_powCtxLock);
+
+    // Already built for this epoch at this size: generation is seconds of work, so never redo it.
+    if (g_dagReady && g_autolykos2Ctx && g_dagEpoch == epochIndex &&
+        Autolykos2_DagSize(g_autolykos2Ctx) == dagBytes) {
+        pthread_mutex_unlock(&g_powCtxLock);
+        return true;
     }
+
+    Autolykos2Context* ctx = GetAutolykos2CtxLocked();
+    g_dagReady = false; // the buffer is about to be invalid; no heavy hash may run against it
+
+    // Generation is one Blake2b per 64 bytes, single-threaded, so a multi-GiB DAG is tens of
+    // seconds. Say so rather than leaving the miner looking hung.
+    printf("Generating the epoch %llu mining DAG (%zu MiB), this takes a moment...\n",
+        (unsigned long long)epochIndex, dagBytes >> 20);
+    fflush(stdout);
 
     Autolykos2_DagClear(ctx);
-    if (!Autolykos2_DagAllocate(ctx, dagBytes)) {
+    const bool ok = Autolykos2_DagAllocate(ctx, dagBytes) && Autolykos2_DagGenerate(ctx, seed32);
+    if (ok) {
+        g_dagEpoch = epochIndex;
+        g_dagReady = true;
+    }
+
+    pthread_mutex_unlock(&g_powCtxLock);
+    return ok;
+}
+
+bool Block_PowHashHeavy(const block_t* block, uint64_t epochIndex, size_t dagBytes, uint8_t outHash[32]) {
+    if (!block || !outHash) {
         return false;
     }
 
-    return Autolykos2_DagGenerate(ctx, seed32);
+    pthread_mutex_lock(&g_powCtxLock);
+    // Checking the epoch and size here, rather than trusting the caller to have built the right
+    // DAG, is what makes this impossible to misuse: an unbuilt or stale DAG yields false and the
+    // caller falls back to deriving the lanes from the seed.
+    const bool usable = g_dagReady && g_autolykos2Ctx && g_dagEpoch == epochIndex &&
+                        Autolykos2_DagSize(g_autolykos2Ctx) == dagBytes;
+    const bool ok = usable &&
+                    Autolykos2_Hash(
+                        g_autolykos2Ctx,
+                        (const uint8_t*)&block->header,
+                        sizeof(block_header_t),
+                        block->header.nonce,
+                        block->header.blockNumber, // full 64-bit width; the light path takes uint64
+                        outHash);
+    pthread_mutex_unlock(&g_powCtxLock);
+    return ok;
+}
+
+bool Block_PowHashLight(const block_t* block, size_t dagBytes, const uint8_t seed32[32], uint8_t outHash[32]) {
+    if (!block || !seed32 || !outHash) {
+        return false;
+    }
+
+    return Autolykos2_LightHashAtHeight(
+        seed32,
+        (const uint8_t*)&block->header,
+        sizeof(block_header_t),
+        block->header.nonce,
+        block->header.blockNumber,
+        dagBytes,
+        outHash);
 }
 
 block_t* Block_Create() {
@@ -133,30 +206,6 @@ void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash) {
     free(next);
 }
 
-void Block_CalculateAutolykos2Hash(const block_t* block, uint8_t* outHash) {
-    if (!block || !outHash) {
-        return;
-    }
-
-    // PoW hash is computed from the block header, while canonical block hash remains SHA256.
-    Autolykos2Context* ctx = GetAutolykos2Ctx();
-    if (!ctx) {
-        memset(outHash, 0, 32);
-        return;
-    }
-
-    if (!Autolykos2_Hash(
-        ctx,
-        (const uint8_t*)&block->header,
-        sizeof(block_header_t),
-        block->header.nonce,
-        (uint32_t)block->header.blockNumber,
-        outHash
-    )) {
-        memset(outHash, 0, 32);
-    }
-}
-
 void Block_AddTransaction(block_t* block, signed_transaction_t* tx) {
     if (!block || !tx || !block->transactions) {
         return;
@@ -189,7 +238,8 @@ static int Uint256_CompareBE(const uint8_t a[32], const uint8_t b[32]) {
     return 0;
 }
 
-bool Block_HasValidProofOfWork(const block_t* block) {
+bool Block_HasValidProofOfWorkWithParams(const block_t* block, uint64_t epochIndex,
+                                         size_t dagBytes, const uint8_t seed32[32]) {
     if (!block) {
         return false;
     }
@@ -199,10 +249,47 @@ bool Block_HasValidProofOfWork(const block_t* block) {
         return false;
     }
 
+    // Prefer the prebuilt DAG when it is provably the one for this block's epoch and size -- the
+    // miner keeps it warm, and reading a lane beats recomputing it -- otherwise derive the lanes
+    // from the epoch seed. The two produce identical hashes, so which one runs is invisible to
+    // consensus; only speed differs.
     uint8_t hash[32];
-    Block_CalculateAutolykos2Hash(block, hash);
+    if (!Block_PowHashHeavy(block, epochIndex, dagBytes, hash) &&
+        !Block_PowHashLight(block, dagBytes, seed32, hash)) {
+        // Fail CLOSED. This used to hand back a zeroed hash on any failure and compare that to the
+        // target -- and zero is below every target, so a DAG that was missing, mis-sized or failed
+        // to build made the PoW check pass for every block instead of rejecting them.
+        return false;
+    }
 
     return Uint256_CompareBE(hash, target) <= 0;
+}
+
+bool Block_HasValidProofOfWork(const block_t* block, blockchain_t* chain) {
+    if (!block || !chain) {
+        return false;
+    }
+
+    size_t dagBytes = 0;
+    uint8_t seed[32];
+    if (!Chain_DagParamsForHeight(chain, block->header.blockNumber, &dagBytes, seed)) {
+        return false;
+    }
+
+    const uint64_t epochIndex = block->header.blockNumber / (uint64_t)EPOCH_LENGTH;
+    return Block_HasValidProofOfWorkWithParams(block, epochIndex, dagBytes, seed);
+}
+
+bool Block_HasValidVote(const block_t* block) {
+    if (!block) {
+        return false;
+    }
+
+    // Unrecognised vote values and non-zero spare bytes are rejected rather than ignored, so the
+    // header has no bits whose meaning is undefined and nothing to grind for extra nonce space.
+    return block->header.reserved[0] <= (uint8_t)DAG_VOTE_MAX &&
+           block->header.reserved[1] == 0u &&
+           block->header.reserved[2] == 0u;
 }
 
 bool Block_AllTransactionsValid(const block_t* block) {
@@ -296,7 +383,7 @@ bool Block_ValidateCoinbaseAndFees(const block_t* block, uint64_t expectedCoinba
     return true;
 }
 
-bool Block_IsFullyValid(const block_t* block) {
+bool Block_IsFullyValid(const block_t* block, blockchain_t* chain) {
     bool merkleValid = false;
     uint8_t calculatedMerkleRoot[32];
     if (block && block->transactions) {
@@ -304,7 +391,8 @@ bool Block_IsFullyValid(const block_t* block) {
         merkleValid = (memcmp(calculatedMerkleRoot, block->header.merkleRoot, 32) == 0);
     }
 
-    return Block_HasValidProofOfWork(block) && Block_AllTransactionsValid(block) && DynArr_size(block->transactions) > 0 && merkleValid;
+    return Block_HasValidVote(block) && Block_HasValidProofOfWork(block, chain) &&
+           Block_AllTransactionsValid(block) && DynArr_size(block->transactions) > 0 && merkleValid;
 }
 
 void Block_Destroy(block_t* block) {

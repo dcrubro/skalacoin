@@ -77,14 +77,33 @@ static void ApplyRuntimeConfigFromEnv(void) {
 
 uint32_t difficultyTarget = INITIAL_DIFFICULTY;
 
-static bool MineBlock(block_t* block) {
-    if (!block) {
+static bool MineBlock(blockchain_t* chain, block_t* block) {
+    if (!chain || !block) {
         return false;
+    }
+
+    // Resolve the epoch parameters ONCE. Doing it per nonce would take chainLock millions of times
+    // per block and contend with every network thread.
+    size_t dagBytes = 0;
+    uint8_t seed[32];
+    if (!Chain_DagParamsForHeight(chain, block->header.blockNumber, &dagBytes, seed)) {
+        fprintf(stderr, "failed to resolve epoch DAG parameters for height %llu\n",
+            (unsigned long long)block->header.blockNumber);
+        return false;
+    }
+
+    // Build the DAG for this block's epoch up front. It is only a speedup -- the check falls back
+    // to deriving the same lanes from the seed -- so a machine that cannot allocate one still
+    // mines, just slower.
+    const uint64_t epochIndex = block->header.blockNumber / (uint64_t)EPOCH_LENGTH;
+    if (!Block_EnsureAutolykos2Dag(epochIndex, dagBytes, seed)) {
+        fprintf(stderr, "could not build the epoch %llu DAG (%zu bytes); mining via the slow path\n",
+            (unsigned long long)epochIndex, dagBytes);
     }
 
     for (uint64_t nonce = 0;; ++nonce) {
         block->header.nonce = nonce;
-        if (Block_HasValidProofOfWork(block)) {
+        if (Block_HasValidProofOfWorkWithParams(block, epochIndex, dagBytes, seed)) {
             return true;
         }
 
@@ -111,12 +130,22 @@ static bool FlushChainAndSheet(blockchain_t* chain,
     return chainSaved && sheetSaved;
 }
 
+/**
+ * This node's DAG-size vote, stamped into every block it mines. DAG_VOTE_GROW is the default and
+ * means "let the schedule run" -- there is deliberately no vote that makes the DAG grow faster, so
+ * the only thing a miner can express is to brake or reverse it. Settable at runtime via `dagvote`.
+**/
+static uint8_t g_dagVote = (uint8_t)DAG_VOTE_GROW;
+
 static block_t* BuildNextBlock(blockchain_t* chain, uint32_t difficultyTarget) {
     block_t* block = Block_Create();
     if (!block) {
         return NULL;
     }
 
+    block->header.reserved[0] = g_dagVote;
+    block->header.reserved[1] = 0;
+    block->header.reserved[2] = 0;
     block->header.version = 1;
     block->header.blockNumber = (uint64_t)Chain_Size(chain);
     if (Chain_Size(chain) > 0) {
@@ -238,96 +267,17 @@ static void PrintBlockDetail(const block_t* block, size_t txCount, const uint8_t
     printf("\n");
 }
 
-static bool ComputeEpochSeedForHeightFromChain(const blockchain_t* chain, uint64_t blockHeight, uint8_t outSeed[32]) {
-    if (!chain || !outSeed) {
-        return false;
-    }
-
-    const uint64_t epochIndex = blockHeight / EPOCH_LENGTH;
-    if (epochIndex == 0) {
-        memset(outSeed, DAG_GENESIS_SEED, 32);
-        return true;
-    }
-
-    const uint64_t seedBlockNumber = (epochIndex * EPOCH_LENGTH) - 1ULL;
-    if (seedBlockNumber >= Chain_Size((blockchain_t*)chain)) {
-        return false;
-    }
-
-    block_t* seedBlock = NULL;
-    if (!Chain_GetBlockCopy((blockchain_t*)chain, (size_t)seedBlockNumber, &seedBlock)) {
-        return false;
-    }
-
-    Block_CalculateHash(seedBlock, outSeed);
-    Block_Destroy(seedBlock);
-    return true;
-}
-
-static bool ComputeEpochDagBytesForHeightFromChain(const blockchain_t* chain, uint64_t blockHeight, size_t* outDagBytes) {
-    if (!chain || !outDagBytes) {
-        return false;
-    }
-
-    if (blockHeight <= EPOCH_LENGTH) {
-        *outDagBytes = DAG_BASE_SIZE;
-        return true;
-    }
-
-    const uint64_t lastBlockNumber = blockHeight - 1ULL;
-    const uint64_t epochStartBlockNumber = lastBlockNumber - EPOCH_LENGTH;
-    if (lastBlockNumber >= Chain_Size((blockchain_t*)chain) || epochStartBlockNumber >= Chain_Size((blockchain_t*)chain)) {
-        return false;
-    }
-
-    block_t* lastBlock = NULL;
-    block_t* epochStartBlock = NULL;
-    if (!Chain_GetBlockCopy((blockchain_t*)chain, (size_t)lastBlockNumber, &lastBlock)) { return false; }
-    if (!Chain_GetBlockCopy((blockchain_t*)chain, (size_t)epochStartBlockNumber, &epochStartBlock)) { Block_Destroy(lastBlock); return false; }
-
-    int64_t difficultyDelta = (int64_t)epochStartBlock->header.difficultyTarget - (int64_t)lastBlock->header.difficultyTarget;
-    int64_t growth = (int64_t)((int64_t)DAG_BASE_GROWTH * difficultyDelta);
-
-    if (growth > 0) {
-        int64_t maxUp = (int64_t)((DAG_BASE_SIZE * DAG_MAX_UP_SWING_PERCENT_NUM) / DAG_SWING_PERCENT_DEN);
-        if (growth > maxUp) {
-            growth = maxUp;
-        }
-        if (growth > (int64_t)DAG_MAX_UP_SWING_GB) {
-            growth = (int64_t)DAG_MAX_UP_SWING_GB;
-        }
-    } else {
-        int64_t maxDown = (int64_t)((DAG_BASE_SIZE * DAG_MAX_DOWN_SWING_PERCENT_NUM) / DAG_SWING_PERCENT_DEN);
-        if (-growth > maxDown) {
-            growth = -maxDown;
-        }
-        if (-growth > (int64_t)DAG_MAX_DOWN_SWING_GB) {
-            growth = -(int64_t)DAG_MAX_DOWN_SWING_GB;
-        }
-    }
-
-    const int64_t targetSize = (int64_t)DAG_BASE_SIZE + growth;
-    if (targetSize <= 0) {
-        return false;
-    }
-
-    *outDagBytes = (size_t)targetSize;
-    Block_Destroy(lastBlock);
-    Block_Destroy(epochStartBlock);
-    return true;
-}
-
 static bool ComputeHistoricalAutolykosHashFromChain(const blockchain_t* chain, const block_t* block, uint64_t blockHeight, uint8_t outHash[32]) {
     if (!chain || !block || !outHash) {
         return false;
     }
 
+    // Same single source of truth the accept path uses, so a block that verifies here verifies
+    // there. This used to be a second, independent implementation of the epoch size and seed rules
+    // that disagreed with the one in constants.h -- notably at exactly height EPOCH_LENGTH.
     uint8_t seed[32];
     size_t dagBytes = 0;
-    if (!ComputeEpochSeedForHeightFromChain(chain, blockHeight, seed)) {
-        return false;
-    }
-    if (!ComputeEpochDagBytesForHeightFromChain(chain, blockHeight, &dagBytes)) {
+    if (!Chain_DagParamsForHeight((blockchain_t*)chain, blockHeight, &dagBytes, seed)) {
         return false;
     }
 
@@ -445,7 +395,7 @@ static bool MineAndAppendBlock(blockchain_t* chain,
     Block_CalculateMerkleRoot(block, merkleRoot);
     memcpy(block->header.merkleRoot, merkleRoot, sizeof(block->header.merkleRoot));
 
-    if (!MineBlock(block)) {
+    if (!MineBlock(chain, block)) {
         fprintf(stderr, "failed to mine block within nonce range\n");
         return false;
     }
@@ -477,7 +427,16 @@ static bool MineAndAppendBlock(blockchain_t* chain,
     uint8_t canonicalHash[32];
     uint8_t powHash[32];
     Block_CalculateHash(block, canonicalHash);
-    Block_CalculateAutolykos2Hash(block, powHash);
+    memset(powHash, 0, sizeof(powHash));
+    {
+        // For the log line only. Resolved fresh rather than carried out of MineBlock because the
+        // block is on the chain by now, so this also confirms it hashes the same from the tip.
+        size_t dagBytes = 0;
+        uint8_t seed[32];
+        if (Chain_DagParamsForHeight(chain, block->header.blockNumber, &dagBytes, seed)) {
+            (void)Block_PowHashLight(block, dagBytes, seed, powHash);
+        }
+    }
 
     char supplyStr[80];
     Uint256ToDecimal(currentSupply, supplyStr, sizeof(supplyStr));
@@ -761,12 +720,23 @@ int main(int argc, char* argv[]) {
     }
 
     {
+        // Report the epoch parameters the next block will use. The DAG itself is NOT generated
+        // here: it is a mining accelerator, so MineBlock builds it on demand and a node that never
+        // mines never pays for it. This used to build one from a seed derived from the tip block
+        // rather than the epoch boundary, which meant a node restarted mid-epoch mined against a
+        // different DAG than one that had run straight through the boundary.
+        size_t dagBytes = 0;
         uint8_t dagSeed[32];
-        GetNextDAGSeed(chain, dagSeed);
-        (void)Block_RebuildAutolykos2Dag(CalculateTargetDAGSize(chain), dagSeed);
-        printf("Built initial DAG with seed %02x%02x%02x%02x... and size %zu bytes\n",
-            dagSeed[0], dagSeed[1], dagSeed[2], dagSeed[3],
-            CalculateTargetDAGSize(chain));
+        const uint64_t nextHeight = (uint64_t)Chain_Size(chain);
+        if (Chain_DagParamsForHeight(chain, nextHeight, &dagBytes, dagSeed)) {
+            printf("Epoch %llu DAG: seed %02x%02x%02x%02x... size %zu bytes\n",
+                (unsigned long long)(nextHeight / (uint64_t)EPOCH_LENGTH),
+                dagSeed[0], dagSeed[1], dagSeed[2], dagSeed[3],
+                dagBytes);
+        } else {
+            fprintf(stderr, "Failed to resolve epoch DAG parameters for height %llu\n",
+                (unsigned long long)nextHeight);
+        }
     }
 
     if (Chain_Size(chain) > 0) {
@@ -892,6 +862,32 @@ int main(int argc, char* argv[]) {
 
         char* cmd = strtok(line, " \t");
         if (!cmd) {
+            continue;
+        }
+
+        if (strcmp(cmd, "dagvote") == 0) {
+            char* voteStr = strtok(NULL, " \t");
+            if (!voteStr) {
+                printf("dag vote is %u (%s)\n", (unsigned)g_dagVote,
+                    g_dagVote == DAG_VOTE_HOLD ? "hold" : (g_dagVote == DAG_VOTE_DOWN ? "down" : "grow"));
+                printf("usage: dagvote <grow|hold|down>\n");
+                continue;
+            }
+
+            if (strcmp(voteStr, "grow") == 0) {
+                g_dagVote = (uint8_t)DAG_VOTE_GROW;
+            } else if (strcmp(voteStr, "hold") == 0) {
+                g_dagVote = (uint8_t)DAG_VOTE_HOLD;
+            } else if (strcmp(voteStr, "down") == 0) {
+                g_dagVote = (uint8_t)DAG_VOTE_DOWN;
+            } else {
+                printf("usage: dagvote <grow|hold|down>\n");
+                continue;
+            }
+
+            // Only affects blocks this node mines from here on; it cannot change how already-mined
+            // blocks are counted, since the vote is committed to inside the hashed header.
+            printf("dag vote set to %s\n", voteStr);
             continue;
         }
 
@@ -1547,9 +1543,8 @@ int main(int argc, char* argv[]) {
             difficultyTarget = INITIAL_DIFFICULTY;
             currentReward = CalculateBlockReward(currentSupply, chain);
 
-            uint8_t dagSeed[32];
-            memset(dagSeed, DAG_GENESIS_SEED, sizeof(dagSeed));
-            (void)Block_RebuildAutolykos2Dag(DAG_BASE_SIZE, dagSeed);
+            // No DAG rebuild needed: Chain_Wipe drops the memoised epoch table, and MineBlock
+            // rebuilds the DAG on demand for whatever epoch it next mines in.
 
             printf("chain data wiped\n");
             continue;

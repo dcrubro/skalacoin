@@ -181,6 +181,27 @@ bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
     return true;
 }
 
+/**
+ * Drop the memoised DAG size recurrence.
+ *
+ * Every epoch's size is folded from the votes of every epoch before it, so any change at or below
+ * the tip invalidates the whole table. It is only a cache -- rebuilding it costs one pass over the
+ * headers reading a single byte each -- so blowing it away wholesale is both correct and cheap,
+ * and far safer than trying to work out which suffix a reorg actually disturbed.
+ *
+ * Takes `dagCacheLock`. Safe to call while holding `chainLock` (that is the required lock order);
+ * must NOT be called while already holding `dagCacheLock`.
+**/
+static void Chain_InvalidateDagEpochs(blockchain_t* chain) {
+    if (!chain) {
+        return;
+    }
+
+    pthread_mutex_lock(&chain->dagCacheLock);
+    chain->dagEpochsComputed = 0;
+    pthread_mutex_unlock(&chain->dagCacheLock);
+}
+
 static void Chain_ClearBlocks(blockchain_t* chain) {
     if (!chain || !chain->blocks) {
         return;
@@ -196,6 +217,7 @@ static void Chain_ClearBlocks(blockchain_t* chain) {
 
     DynArr_erase(chain->blocks);
     chain->size = 0;
+    Chain_InvalidateDagEpochs(chain);
 }
 
 blockchain_t* Chain_Create() {
@@ -207,6 +229,15 @@ blockchain_t* Chain_Create() {
     ptr->blocks = DYNARR_CREATE(block_t, 1);
     ptr->size = 0;
 
+    ptr->dagEpochs = NULL;
+    ptr->dagEpochsComputed = 0;
+    ptr->dagEpochsCapacity = 0;
+    if (pthread_mutex_init(&ptr->dagCacheLock, NULL) != 0) {
+        DynArr_destroy(ptr->blocks);
+        free(ptr);
+        return NULL;
+    }
+
     return ptr;
 }
 
@@ -216,6 +247,8 @@ void Chain_Destroy(blockchain_t* chain) {
             Chain_ClearBlocks(chain);
             DynArr_destroy(chain->blocks);
         }
+        free(chain->dagEpochs);
+        pthread_mutex_destroy(&chain->dagCacheLock);
         free(chain);
     }
 }
@@ -556,6 +589,9 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
 
     chain->size = DynArr_size(chain->blocks);
     currentBlockHeight = chain->size ? (uint64_t)(chain->size - 1) : 0ULL;
+
+    // Blocks below the old tip are gone, so the DAG recurrence folded from their votes is stale.
+    Chain_InvalidateDagEpochs(chain);
 
     // Rebuild balance sheet from scratch up to current chain size
     BalanceSheet_Destroy();
@@ -1678,6 +1714,195 @@ bool Chain_ComputeBranchWork(block_t** blocks, size_t count, uint256_t* outWork)
     return true;
 }
 
+/**
+ * Grow the memoised epoch table to hold at least `needed` entries.
+ * Caller must hold `chain->dagCacheLock`.
+**/
+static bool Chain_ReserveDagEpochsLocked(blockchain_t* chain, size_t needed) {
+    if (needed <= chain->dagEpochsCapacity) {
+        return true;
+    }
+
+    size_t capacity = chain->dagEpochsCapacity ? chain->dagEpochsCapacity : 8u;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2u) {
+            return false;
+        }
+        capacity *= 2u;
+    }
+
+    dag_epoch_state_t* grown =
+        (dag_epoch_state_t*)realloc(chain->dagEpochs, capacity * sizeof(dag_epoch_state_t));
+    if (!grown) {
+        return false;
+    }
+
+    chain->dagEpochs = grown;
+    chain->dagEpochsCapacity = capacity;
+    return true;
+}
+
+/**
+ * Fold the DAG size recurrence forward until entry `epochIndex` is valid.
+ *
+ * Entry k's size comes from the votes cast during epoch k-1, so extending to k requires blocks
+ * [0, k * EPOCH_LENGTH) to all be present. Growth is the default: the size only stays put or falls
+ * when miners actively say so, and there is no vote that makes it climb faster.
+ *
+ * Caller must hold `chainLock` (read) and `chain->dagCacheLock`.
+**/
+static bool Chain_ExtendDagEpochsLocked(blockchain_t* chain, size_t epochIndex) {
+    if (!chain || !chain->blocks) {
+        return false;
+    }
+
+    if (!Chain_ReserveDagEpochsLocked(chain, epochIndex + 1u)) {
+        return false;
+    }
+
+    if (chain->dagEpochsComputed == 0) {
+        chain->dagEpochs[0].sizeBytes = DAG_BASE_SIZE;
+        chain->dagEpochs[0].downQualified = false;
+        chain->dagEpochsComputed = 1;
+    }
+
+    const size_t chainSize = DynArr_size(chain->blocks);
+    const size_t epochLength = (size_t)EPOCH_LENGTH;
+
+    for (size_t k = chain->dagEpochsComputed; k <= epochIndex; ++k) {
+        const size_t prev = k - 1u; // the epoch whose votes decide entry k
+        const size_t from = prev * epochLength;
+        const size_t to = from + epochLength; // exclusive
+
+        if (to > chainSize) {
+            // The epoch that would decide this entry has not been fully mined yet.
+            return false;
+        }
+
+        uint64_t holdVotes = 0;
+        uint64_t downVotes = 0;
+        for (size_t i = from; i < to; ++i) {
+            const block_t* blk = (const block_t*)DynArr_at(chain->blocks, i);
+            if (!blk) {
+                return false;
+            }
+
+            // Anything other than HOLD or DOWN counts as GROW. The accept path rejects values
+            // above DAG_VOTE_MAX, so in practice the only other value that reaches here is GROW.
+            const uint8_t vote = blk->header.reserved[0];
+            if (vote == DAG_VOTE_HOLD) {
+                holdVotes++;
+            } else if (vote == DAG_VOTE_DOWN) {
+                downVotes++;
+            }
+        }
+
+        // Cross-multiplied rather than divided, so there is no rounding for nodes to disagree on.
+        // The denominator is the constant epoch length, not the number of blocks looked at, so a
+        // partial epoch can never be read as a stronger signal than it is.
+        const uint64_t epochBlocks = (uint64_t)EPOCH_LENGTH;
+        const bool brake = (holdVotes + downVotes) * DAG_BRAKE_DEN > epochBlocks * DAG_BRAKE_NUM;
+        const bool downQualified = downVotes * DAG_DOWN_DEN > epochBlocks * DAG_DOWN_NUM;
+
+        chain->dagEpochs[prev].downQualified = downQualified;
+        const bool priorDownQualified = (prev >= 1u) ? chain->dagEpochs[prev - 1u].downQualified : false;
+
+        const uint64_t prevSize = chain->dagEpochs[prev].sizeBytes;
+        uint64_t next;
+
+        // Order matters: a qualifying down vote also satisfies the brake condition (down > 7/8
+        // implies hold+down > 1/2), so testing the brake first would make shrinking impossible.
+        if (downQualified && priorDownQualified) {
+            // Shrinking needs the supermajority sustained across two consecutive epochs. That gates
+            // the *onset* only -- it is deliberately not reset afterwards, so miners who are
+            // genuinely being squeezed keep getting relief every epoch rather than every other one.
+            next = (prevSize > DAG_MIN_SIZE + DAG_EPOCH_STEP) ? (prevSize - DAG_EPOCH_STEP)
+                                                              : (uint64_t)DAG_MIN_SIZE;
+        } else if (brake) {
+            next = prevSize;
+        } else {
+            next = (prevSize + DAG_EPOCH_STEP < DAG_MAX_SIZE) ? (prevSize + DAG_EPOCH_STEP)
+                                                              : (uint64_t)DAG_MAX_SIZE;
+        }
+
+        chain->dagEpochs[k].sizeBytes = next;
+        chain->dagEpochs[k].downQualified = false; // filled in when entry k+1 is folded
+        chain->dagEpochsComputed = k + 1u;
+    }
+
+    return true;
+}
+
+/**
+ * Epoch-aligned DAG seed for `blockHeight`: the genesis seed in epoch 0, otherwise the hash of the
+ * last block of the previous epoch. Constant for a whole epoch, which is what lets the DAG be
+ * generated once per epoch instead of once per block.
+ *
+ * Caller must hold `chainLock`.
+**/
+static bool Chain_EpochDagSeedForHeightLocked(blockchain_t* chain, uint64_t blockHeight, uint8_t outSeed[32]) {
+    const uint64_t epochIndex = blockHeight / (uint64_t)EPOCH_LENGTH;
+    if (epochIndex == 0) {
+        memset(outSeed, DAG_GENESIS_SEED, 32);
+        return true;
+    }
+
+    const uint64_t seedBlockNumber = (epochIndex * (uint64_t)EPOCH_LENGTH) - 1ULL;
+    if (seedBlockNumber >= (uint64_t)DynArr_size(chain->blocks)) {
+        return false;
+    }
+
+    const block_t* seedBlock = (const block_t*)DynArr_at(chain->blocks, (size_t)seedBlockNumber);
+    if (!seedBlock) {
+        return false;
+    }
+
+    Block_CalculateHash(seedBlock, outSeed);
+    return true;
+}
+
+bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
+                              size_t* outDagBytes, uint8_t outSeed[32]) {
+    if (!chain || !chain->blocks || !outDagBytes || !outSeed) {
+        return false;
+    }
+
+    const size_t epochIndex = (size_t)(blockHeight / (uint64_t)EPOCH_LENGTH);
+
+    uint64_t bytes = 0;
+    bool ok = false;
+
+    pthread_rwlock_rdlock(&chainLock);
+
+    // Lock order is chainLock -> dagCacheLock, everywhere. Nothing under dagCacheLock calls back
+    // into chain.c, so this pair cannot deadlock.
+    pthread_mutex_lock(&chain->dagCacheLock);
+    if (Chain_ExtendDagEpochsLocked(chain, epochIndex)) {
+        bytes = chain->dagEpochs[epochIndex].sizeBytes;
+        ok = true;
+    }
+    pthread_mutex_unlock(&chain->dagCacheLock);
+
+    if (ok) {
+        ok = Chain_EpochDagSeedForHeightLocked(chain, blockHeight, outSeed);
+    }
+
+    pthread_rwlock_unlock(&chainLock);
+
+    if (!ok) {
+        return false;
+    }
+
+    // Autolykos2 addresses the DAG in 32-byte lanes. A size that is zero or not a multiple of 32
+    // would make hashing fail, and a proof that cannot be computed must never read as valid.
+    if (bytes < 32ULL || (bytes % 32ULL) != 0ULL) {
+        return false;
+    }
+
+    *outDagBytes = (size_t)bytes;
+    return true;
+}
+
 void Chain_OnTipAdvanced(blockchain_t* chain) {
     if (!chain || !chain->blocks) {
         return;
@@ -1689,9 +1914,9 @@ void Chain_OnTipAdvanced(blockchain_t* chain) {
     // (mining, P2P accept, sync, orphan attach, reorg) stays on the same difficulty as its peers.
     difficultyTarget = Chain_GetTargetForHeight(chain, (uint64_t)chainSize);
 
-    if (chainSize % EPOCH_LENGTH == 0 && chainSize > 0) {
-        uint8_t dagSeed[32];
-        GetNextDAGSeed(chain, dagSeed);
-        (void)Block_RebuildAutolykos2Dag(CalculateTargetDAGSize(chain), dagSeed);
-    }
+    // The epoch DAG is deliberately NOT rebuilt here. It is a mining accelerator only -- validation
+    // derives its lanes from the epoch seed, so a node that does not mine never allocates one --
+    // and MineBlock builds it on demand for the height it is working on. Keeping generation off
+    // this path matters twice over: it is seconds of work per epoch, and it used to run from
+    // whichever thread happened to advance the tip, freeing the buffer under any miner mid-hash.
 }

@@ -18,7 +18,10 @@ typedef struct {
     uint8_t merkleRoot[32];
     uint32_t difficultyTarget; // Encoding: [1 byte exponent][3 byte coefficient]; Target = coefficient * 256^(exponent-3)
     uint8_t version;
-    uint8_t reserved[3];       // 3 bytes (Explicit padding for 8-byte alignment)
+    // reserved[0] carries the miner's DAG-size vote (DAG_VOTE_* in constants.h); reserved[1..2] must
+    // be zero. All three are inside the hashed header, so a vote is committed to by both the
+    // canonical hash and the PoW hash and cannot be altered after the block is mined.
+    uint8_t reserved[3];
 } block_header_t;
 #pragma pack(pop)
 
@@ -27,17 +30,49 @@ typedef struct {
     DynArr* transactions; // Array of signed_transaction_t, NOTE: Potentially move to a hashmap at some point for quick lookups.
 } block_t;
 
+// PoW validity is chain-relative: it needs the epoch DAG size and seed. chain.h includes this
+// header, so the tag declared there is forward-declared here to break the cycle.
+typedef struct blockchain blockchain_t;
+
 block_t* Block_Create();
 void Block_CalculateHash(const block_t* block, uint8_t* outHash);
 void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash);
-void Block_CalculateAutolykos2Hash(const block_t* block, uint8_t* outHash);
-bool Block_RebuildAutolykos2Dag(size_t dagBytes, const uint8_t seed32[32]);
 void Block_AddTransaction(block_t* block, signed_transaction_t* tx);
 void Block_RemoveTransaction(block_t* block, uint8_t* txHash);
-bool Block_HasValidProofOfWork(const block_t* block);
+
+/**
+ * Autolykos2 PoW hashing.
+ *
+ * The heavy variant reads its lanes from the process-global DAG and is a MINING accelerator only;
+ * the light variant derives the same lanes from the epoch seed on demand. They are bit-for-bit
+ * equivalent by construction -- Autolykos2_DagGenerate fills lane i with exactly what
+ * ReadDagLaneFromSeed recomputes for lane i -- so a block mined through either verifies through
+ * either. Validation always uses the light path: it needs no allocation, which is what keeps the
+ * DAG a miner requirement rather than a full-node memory requirement, and it stays correct for
+ * blocks from earlier epochs (the heavy path can only ever answer for whichever epoch the global
+ * DAG was last built for).
+**/
+bool Block_EnsureAutolykos2Dag(uint64_t epochIndex, size_t dagBytes, const uint8_t seed32[32]);
+// Fails rather than answering from a DAG built for a different epoch or size, so it can never
+// silently hash against the wrong lanes.
+bool Block_PowHashHeavy(const block_t* block, uint64_t epochIndex, size_t dagBytes, uint8_t outHash[32]);
+bool Block_PowHashLight(const block_t* block, size_t dagBytes, const uint8_t seed32[32], uint8_t outHash[32]);
+
+// PoW check against explicitly supplied epoch parameters, for callers that resolve them once and
+// then iterate (the miner). Returns false if the hash cannot be computed -- never treat an
+// uncomputable proof as valid.
+bool Block_HasValidProofOfWorkWithParams(const block_t* block, uint64_t epochIndex,
+                                         size_t dagBytes, const uint8_t seed32[32]);
+
+// PoW check that resolves the epoch parameters for the block's own height from `chain`.
+bool Block_HasValidProofOfWork(const block_t* block, blockchain_t* chain);
+
+// Header vote field is a recognised value and the unused reserved bytes are zero.
+bool Block_HasValidVote(const block_t* block);
+
 bool Block_AllTransactionsValid(const block_t* block);
 bool Block_ValidateCoinbaseAndFees(const block_t* block, uint64_t expectedCoinbaseAmount, uint64_t* outTotalFees);
-bool Block_IsFullyValid(const block_t* block);
+bool Block_IsFullyValid(const block_t* block, blockchain_t* chain);
 void Block_ShutdownPowContext(void);
 void Block_Destroy(block_t* block);
 void Block_Print(const block_t* block);

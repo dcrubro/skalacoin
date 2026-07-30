@@ -55,7 +55,11 @@ static const int MAX_FORK_PROBE_ROUNDS = 3;
 // before it may be adopted, so a rented-hashrate attacker has to sustain the attack publicly
 // instead of winning by dumping a privately mined branch.
 //
-// penalty(B) = ceil(FACTOR_NUM/FACTOR_DEN * B^EXPONENT * TARGET_BLOCK_TIME / REF_BLOCK_TIME)
+// penalty(B) = ceil(FACTOR_NUM/FACTOR_DEN * B^EXPONENT * REF_BLOCK_TIME / TARGET_BLOCK_TIME)
+//
+// The block-time ratio is REF/TARGET, not TARGET/REF. penalty() counts BLOCKS, so the wall-clock
+// protection is penalty(B) * TARGET_BLOCK_TIME ~= B^EXPONENT * REF_BLOCK_TIME: TARGET_BLOCK_TIME
+// cancels and the protection is block-time-independent. See fetch_scheduler.c.
 //
 // Expressed as integer rationals on purpose: this feeds fork choice, so it must evaluate
 // identically on every node. Floating point is not acceptable here.
@@ -65,7 +69,8 @@ static const uint64_t REORG_PENALTY_FACTOR_DEN = 1ULL; // base scaling factor (t
 static const uint32_t REORG_PENALTY_EXPONENT = 2U; // exponent p in penalty ~ B^p
 static const uint64_t REORG_PENALTY_REF_BLOCK_TIME = 150ULL; // reference block time in seconds used by original scheme
 // Beyond this depth the penalty saturates. At the configured parameters penalty(1000) is already
-// ~600k blocks (over a year), so this only exists to keep the arithmetic away from overflow.
+// ~1.67M blocks (~4.75 years at a 90s block time), so this only exists to keep the arithmetic away
+// from overflow rather than to bound the penalty in any meaningful sense.
 static const uint64_t REORG_PENALTY_MAX_DEPTH = 1000ULL;
 
 // Upper bound on pooled orphan blocks. Orphans are accepted before the chain-derived difficulty
@@ -95,26 +100,58 @@ static const size_t MEDIAN_TIME_SPAN = 11U;
 // Keep this at 20 to match the canonical curve shape against a 2^64 atomic supply cap.
 #define MONERO_EMISSION_SPEED_FACTOR 20U
 
-// Future Autolykos2 constants:
+// Autolykos2 epoch / DAG constants.
 #define EPOCH_LENGTH 350000 // ~1 year at 90s
-#define DAG_BASE_GROWTH (1ULL << 30) // 1 GB per epoch, adjusted by acceleration
-//#define DAG_BASE_SIZE (6ULL << 30) // 6 GB, adjusted per cycle based off DAG_BASE_GROWTH
-#define DAG_BASE_SIZE (1ULL << 30) // TEMPORARY FOR TESTING
-// Swings - calculated as MIN(percentage, absolute GB) to prevent absurd swings from low hashrate or very large DAG growth.
-// Percentages are integer numerator/denominator pairs, never float literals: DAG size feeds PoW
-// verification, so it has to evaluate identically on every node.
-#define DAG_MAX_UP_SWING_PERCENT_NUM 15ULL // +15%
-#define DAG_MAX_DOWN_SWING_PERCENT_NUM 10ULL // -10%
-#define DAG_SWING_PERCENT_DEN 100ULL
-#define DAG_MAX_UP_SWING_GB (2ULL << 30) // 2 GB
-#define DAG_MAX_DOWN_SWING_GB (1ULL << 30) // 1 GB
-#define DAG_GENESIS_SEED 0x00 // Genesis seed is zeroes, every epoch's seed is the hash of the previous block, therefore unpredictable until the block is mined
+#define DAG_GENESIS_SEED 0x00 // Epoch 0's seed is all zeroes; epoch k's seed is the hash of the last
+                              // block of epoch k-1, so it is unpredictable until that block is mined.
 
 /**
- * Each epoch has 2 phases, connected logarithmically:
- * - Phase 1: Aggressive DAG growth (target is ~75% of the max cap) to kick out any ASICs, 30k blocks (roughly 1 month)
- * - Phase 2: Stable DAG growth (target is the max cap) to provide a stable environment for GPU miners, 320k blocks (roughly 11 months)
+ * DAG size band and the miner signal that moves within it.
+ *
+ * Growth is the DEFAULT: the size walks up by DAG_EPOCH_STEP every epoch unless miners actively
+ * brake it. There is deliberately no "grow faster" vote -- every signal a miner can express only
+ * slows the walk or reverses it. That is what makes the scheme safe against pool capture: under
+ * stratum-style pooled mining the pool builds the header, so it controls its share of the vote, and
+ * a pool that wanted a larger DAG to price smaller miners out simply has no lever to pull. The
+ * entire upward trajectory is set by DAG_EPOCH_STEP and DAG_MAX_SIZE, i.e. by release, not by vote.
+ *
+ * DAG_MIN_SIZE is the ASIC-resistance floor: it must stay above the on-die SRAM an ASIC could
+ * economically carry, because *this constant*, not the vote, is what secures the property. No vote
+ * outcome can go below it. DAG_MAX_SIZE is the intended destination rather than an emergency bound,
+ * since the DAG reaches it on its own -- pick it as the largest DAG miners should ever hold.
+ *
+ * NOTE: these three sizes are economic judgements, not derivations. Sanity-check them before
+ * launch. DAG_BASE_SIZE was previously commented as an intended 6 GiB; it now has to sit inside
+ * the band (see the static_assert below). Lowering the DAG for a test run means lowering
+ * DAG_MIN_SIZE too, not just DAG_BASE_SIZE.
 **/
+#define DAG_MIN_SIZE   (2ULL << 30) // 2 GiB -- ASIC-resistance floor
+#define DAG_BASE_SIZE  (2ULL << 30) // epoch 0 size
+#define DAG_MAX_SIZE   (8ULL << 30) // 8 GiB -- intended destination, ~6 unbraked years from base
+#define DAG_EPOCH_STEP (1ULL << 30) // 1 GiB drift per epoch, in either direction
+
+// Vote thresholds as integer numerator/denominator pairs, never float literals: this feeds PoW
+// verification, so every node must reach the same verdict. The tests cross-multiply rather than
+// divide, so there is no rounding to disagree on.
+#define DAG_BRAKE_NUM 1ULL
+#define DAG_BRAKE_DEN 2ULL // brake growth when hold+down votes exceed 1/2 of the epoch
+#define DAG_DOWN_NUM  7ULL
+#define DAG_DOWN_DEN  8ULL // shrink when down votes exceed 7/8 of the epoch, two epochs running
+
+// reserved[0] of the block header carries the vote. 0 must mean GROW: the point of this shape is
+// that inaction produces growth, so a miner that knows nothing about the vote contributes to the
+// intended default instead of silently freezing the schedule.
+#define DAG_VOTE_GROW 0u // default -- let the schedule run
+#define DAG_VOTE_HOLD 1u // brake: stop growing
+#define DAG_VOTE_DOWN 2u // reverse: shrink (needs a sustained supermajority to take effect)
+#define DAG_VOTE_MAX  DAG_VOTE_DOWN
+
+static_assert(DAG_MIN_SIZE <= DAG_BASE_SIZE && DAG_BASE_SIZE <= DAG_MAX_SIZE,
+              "DAG_BASE_SIZE must start inside [DAG_MIN_SIZE, DAG_MAX_SIZE]");
+static_assert(DAG_MIN_SIZE % 32ULL == 0ULL && DAG_MAX_SIZE % 32ULL == 0ULL &&
+              DAG_BASE_SIZE % 32ULL == 0ULL && DAG_EPOCH_STEP % 32ULL == 0ULL,
+              "Autolykos2 lane addressing requires every DAG size to be a multiple of 32");
+static_assert(DAG_EPOCH_STEP > 0ULL, "DAG_EPOCH_STEP must be positive or the DAG can never move");
 
 static const uint64_t M_CAP = 18446744073709551615ULL; // Max uint64
 static const uint64_t TAIL_EMISSION = 750000000000ULL; // 0.75 coins per block floor
@@ -226,76 +263,9 @@ static inline uint64_t CalculateBlockReward(uint256_t currentSupply, blockchain_
     return CalculateBlockRewardAtHeight(currentSupply, (uint64_t)Chain_Size(chain));
 }
 
-// Hashing DAG
-static inline size_t CalculateTargetDAGSize(blockchain_t* chain) {
-    // Base size plus (base growth * difficulty factor), adjusted by acceleration
-    if (!chain || !chain->blocks) { return 0; } // Invalid
-    uint64_t height = (uint64_t)Chain_Size(chain);
-    
-    if (height < EPOCH_LENGTH) {
-        return DAG_BASE_SIZE;
-    }
-
-    // Get the height - EPOCH_LENGTH block and the last block;
-    block_t* lastBlock = NULL;
-    block_t* epochStartBlock = NULL;
-    if (!Chain_GetBlockCopy(chain, Chain_Size(chain) - 1, &lastBlock) || !lastBlock) {
-        if (lastBlock) Block_Destroy(lastBlock);
-        return 0;
-    }
-    if (!Chain_GetBlockCopy(chain, (size_t)(Chain_Size(chain) - 1 - EPOCH_LENGTH), &epochStartBlock) || !epochStartBlock) {
-        Block_Destroy(lastBlock);
-        if (epochStartBlock) Block_Destroy(epochStartBlock);
-        return 0;
-    }
-
-    int64_t difficultyDelta = (int64_t)epochStartBlock->header.difficultyTarget - (int64_t)lastBlock->header.difficultyTarget;
-    int64_t growth = (DAG_BASE_GROWTH * difficultyDelta); // Can be negative if difficulty has decreased, which is why we use int64_t
-
-    // Clamp
-    if (growth > 0) {
-        // Difficulty increased -> Clamp the UPWARD swing
-        int64_t maxUp = (int64_t)((DAG_BASE_SIZE * DAG_MAX_UP_SWING_PERCENT_NUM) / DAG_SWING_PERCENT_DEN);
-        if (growth > maxUp) growth = maxUp;
-        if (growth > (int64_t)DAG_MAX_UP_SWING_GB) growth = DAG_MAX_UP_SWING_GB;
-    } else {
-        // Difficulty decreased -> Clamp the DOWNWARD swing
-        int64_t maxDown = (int64_t)((DAG_BASE_SIZE * DAG_MAX_DOWN_SWING_PERCENT_NUM) / DAG_SWING_PERCENT_DEN);
-        if (-growth > maxDown) growth = -maxDown;
-        if (-growth > (int64_t)DAG_MAX_DOWN_SWING_GB) growth = -(int64_t)DAG_MAX_DOWN_SWING_GB;
-    }
-    
-    int64_t targetSize = (int64_t)DAG_BASE_SIZE + growth;
-    if (targetSize <= 0) {
-        Block_Destroy(lastBlock);
-        Block_Destroy(epochStartBlock);
-        return 0;
-    }
-
-    size_t out = (size_t)targetSize;
-    Block_Destroy(lastBlock);
-    Block_Destroy(epochStartBlock);
-    return out;
-}
-
-static inline void GetNextDAGSeed(blockchain_t* chain, uint8_t outSeed[32]) {
-    if (!chain || !chain->blocks || !outSeed) { return; } // Invalid
-    uint64_t height = (uint64_t)Chain_Size(chain);
-
-    if (height < EPOCH_LENGTH) {
-        memset(outSeed, DAG_GENESIS_SEED, 32);
-        return;
-    }
-
-    block_t* prevBlock = NULL;
-    if (!Chain_GetBlockCopy(chain, Chain_Size(chain) - 1, &prevBlock) || !prevBlock) {
-        memset(outSeed, 0x00, 32); // Fallback to zeroes if we can't get the previous block for some reason; The caller should treat this as an error if height >= EPOCH_LENGTH
-        if (prevBlock) Block_Destroy(prevBlock);
-        return;
-    }
-
-    Block_CalculateHash(prevBlock, outSeed);
-    Block_Destroy(prevBlock);
-}
+// Hashing DAG: see Chain_DagParamsForHeight in block/chain.h. Both the size and the epoch seed are
+// derived from the chain by that one function, so the mining and verification paths cannot drift
+// apart. The previous CalculateTargetDAGSize/GetNextDAGSeed pair lived here, took chainLock
+// internally, was not epoch-aligned, and disagreed with the verifier's own copy in main.c.
 
 #endif

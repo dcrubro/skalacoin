@@ -24,9 +24,16 @@ uint64_t FetchScheduler_ComputeReorgPenaltyBlocks(uint64_t delayBlocks) {
     }
 
     // Scale by theta and by the block-time ratio, as one fraction so there is a single rounding
-    // step: penalty = ceil(raised * FACTOR_NUM * TARGET_BLOCK_TIME / (FACTOR_DEN * REF_BLOCK_TIME))
-    const uint64_t numeratorScale = REORG_PENALTY_FACTOR_NUM * (uint64_t)TARGET_BLOCK_TIME;
-    const uint64_t denominator = REORG_PENALTY_FACTOR_DEN * REORG_PENALTY_REF_BLOCK_TIME;
+    // step: penalty = ceil(raised * FACTOR_NUM * REF_BLOCK_TIME / (FACTOR_DEN * TARGET_BLOCK_TIME))
+    //
+    // REF_BLOCK_TIME is the NUMERATOR and TARGET_BLOCK_TIME the DENOMINATOR, not the other way
+    // round. The result is a count of BLOCKS, so the wall-clock protection it buys is
+    // penalty(d) * TARGET_BLOCK_TIME ~= d^p * REF_BLOCK_TIME -- TARGET_BLOCK_TIME cancels, and the
+    // protection is the same number of seconds whatever the block time is. Inverting these two
+    // makes wall-clock protection scale as TARGET_BLOCK_TIME^2, so shortening the block time
+    // silently weakens reorg protection. Do not "simplify" this back.
+    const uint64_t numeratorScale = REORG_PENALTY_FACTOR_NUM * REORG_PENALTY_REF_BLOCK_TIME;
+    const uint64_t denominator = REORG_PENALTY_FACTOR_DEN * (uint64_t)TARGET_BLOCK_TIME;
     if (denominator == 0ULL) {
         return 0ULL;
     }

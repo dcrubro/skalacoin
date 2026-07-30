@@ -32,7 +32,9 @@ bool Autolykos2_Hash(
 	uint8_t outHash[32]
 );
 
-bool Autolykos2_LightHash(const uint8_t* seed, blockchain_t* chain, uint64_t nonce, uint8_t* out);
+// Derives the DAG lanes it needs straight from the epoch seed, so it needs no DAG allocation and
+// stays correct for any height regardless of which epoch a DAG happens to be built for. Produces
+// exactly the same hash as Autolykos2_Hash against a DAG generated from the same seed and size.
 bool Autolykos2_LightHashAtHeight(
 	const uint8_t seed32[32],
 	const uint8_t* message,
