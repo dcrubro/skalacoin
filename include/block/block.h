@@ -53,9 +53,11 @@ void Block_RemoveTransaction(block_t* block, uint8_t* txHash);
  * DAG was last built for).
 **/
 bool Block_EnsureAutolykos2Dag(uint64_t epochIndex, size_t dagBytes, const uint8_t seed32[32]);
-// Fails rather than answering from a DAG built for a different epoch or size, so it can never
-// silently hash against the wrong lanes.
-bool Block_PowHashHeavy(const block_t* block, uint64_t epochIndex, size_t dagBytes, uint8_t outHash[32]);
+// Fails rather than answering from a DAG built for a different epoch, size OR SEED, so it can
+// never silently hash against the wrong lanes. The seed matters because a reorg changes it while
+// leaving the epoch index and size unchanged.
+bool Block_PowHashHeavy(const block_t* block, uint64_t epochIndex, size_t dagBytes,
+                        const uint8_t seed32[32], uint8_t outHash[32]);
 bool Block_PowHashLight(const block_t* block, size_t dagBytes, const uint8_t seed32[32], uint8_t outHash[32]);
 
 // PoW check against explicitly supplied epoch parameters, for callers that resolve them once and
@@ -72,6 +74,24 @@ bool Block_HasValidVote(const block_t* block);
 
 bool Block_AllTransactionsValid(const block_t* block);
 bool Block_ValidateCoinbaseAndFees(const block_t* block, uint64_t expectedCoinbaseAmount, uint64_t* outTotalFees);
+
+/**
+ * Self-contained validity: merkle root, transactions, vote encoding, non-empty. Needs no chain, so
+ * it is meaningful for ANY block, including one on a branch we do not have.
+ *
+ * This is what the receive path checks. Proof of work is deliberately NOT checked there, because
+ * PoW is only meaningful relative to the branch a block belongs to: the epoch seed is the last
+ * block of the previous epoch on ITS OWN branch. Validating a competing branch's block against our
+ * epoch seed does not merely fail to resolve -- when the two chains diverge before the boundary it
+ * resolves to the WRONG seed and rejects a perfectly valid block, which made any fork spanning an
+ * epoch boundary impossible to assemble.
+ *
+ * Chain_AddBlock verifies proof of work at the moment a block joins the chain, where the branch
+ * context is real. That, not the receive path, is what enforces the invariant.
+**/
+bool Block_HasValidStructure(const block_t* block);
+
+// Full check including chain-relative PoW. Only meaningful for a block that extends `chain`.
 bool Block_IsFullyValid(const block_t* block, blockchain_t* chain);
 void Block_ShutdownPowContext(void);
 void Block_Destroy(block_t* block);

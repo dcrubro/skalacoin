@@ -22,6 +22,17 @@ void OrphanPool_Insert(block_t* block, uint64_t height, uint64_t observedAtTipHe
 // Returns the number of blocks successfully attached.
 size_t OrphanPool_AttemptAttach(blockchain_t* chain);
 
+/**
+ * As OrphanPool_AttemptAttach, but skips the reorg delay penalty when `bypassPenalty` is set.
+ *
+ * Reserved for an explicit operator action (`sync force`). The penalty is served by local chain
+ * growth, so a node that is neither mining nor stale enough to count as catching up can never
+ * clear it by itself; this is the manual way out for an operator who knows their branch is the
+ * wrong one. Work comparison and linkage still apply, so it cannot adopt a lighter branch, and
+ * nothing a peer sends can reach it.
+**/
+size_t OrphanPool_AttemptAttachForced(blockchain_t* chain, bool bypassPenalty);
+
 // True if a block with this hash is already pooled.
 bool OrphanPool_Contains(const uint8_t blockHash[32]);
 

@@ -10,6 +10,11 @@
 
 uint64_t currentBlockHeight = 0;
 
+// Defined near the DAG helpers at the bottom; needed early by Chain_AddBlockLocked, which verifies
+// proof of work while already holding chainLock for writing.
+static bool Chain_DagParamsForHeightLocked(blockchain_t* chain, uint64_t blockHeight,
+                                           size_t* outDagBytes, uint8_t outSeed[32]);
+
 static bool EnsureDirectoryExists(const char* dirpath) {
     if (!dirpath || dirpath[0] == '\0') {
         return false;
@@ -263,6 +268,7 @@ void Chain_Destroy(blockchain_t* chain) {
 **/
 static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
     bool ok = true;
+    block_t* stored = NULL; // the chain's own copy; the caller's `block` loses its transactions below
 
     if (!chain || !block || !chain->blocks || !block->transactions) {
         return false;
@@ -295,6 +301,34 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
     // Ensure the block was mined at the difficulty this chain requires at that height. Without this
     // a peer whose difficulty went stale (or a malicious one) can hand us a block mined at an
     // easier target, which Block_HasValidProofOfWork accepts because it checks the header's own value.
+    /**
+     * Proof of work is verified HERE, at the moment a block joins the chain, and not only on the
+     * receive path.
+     *
+     * A block on a competing branch cannot always be PoW-checked when it arrives: its epoch seed is
+     * the last block of the previous epoch ON ITS OWN BRANCH, which may still be sitting in the
+     * orphan pool rather than in our chain. Those blocks are pooled with PoW deferred, so this is
+     * the checkpoint that keeps the real invariant -- nothing enters the chain without verified
+     * work. By the time a branch is applied the rollback has put its ancestors in place, so the
+     * epoch parameters always resolve here.
+    **/
+    {
+        size_t dagBytes = 0;
+        uint8_t dagSeed[32];
+        if (!Chain_DagParamsForHeightLocked(chain, block->header.blockNumber, &dagBytes, dagSeed)) {
+            printf("Chain_AddBlock: validation failed: blockIndex=%zu cannot resolve epoch DAG parameters\n",
+                expectedIndex);
+            return false;
+        }
+
+        const uint64_t epochIndex = block->header.blockNumber / (uint64_t)EPOCH_LENGTH;
+        if (!Block_HasValidProofOfWorkWithParams(block, epochIndex, dagBytes, dagSeed)) {
+            printf("Chain_AddBlock: validation failed: blockIndex=%zu proof of work is invalid\n",
+                expectedIndex);
+            return false;
+        }
+    }
+
     uint32_t expectedTarget = Chain_GetTargetForHeight(chain, (uint64_t)expectedIndex);
     if (block->header.difficultyTarget != expectedTarget) {
         printf("Chain_AddBlock: validation failed: blockIndex=%zu expectedDifficulty=%#x observedDifficulty=%#x\n",
@@ -393,8 +427,29 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
         // Push the block only after validation succeeds.
         block_t* blk = (block_t*)DynArr_push_back(chain->blocks, block);
         if (!blk) { ok = false; break; }
+        stored = blk;
         chain->size++;
         currentBlockHeight = (uint64_t)(chain->size - 1);
+
+        /**
+         * The chain now owns the transaction array, so clear the CALLER's pointer to it.
+         *
+         * DynArr_push_back stores the struct by value, which leaves the chain's element and the
+         * caller's block_t sharing one `transactions` pointer. Three separate places later free
+         * that array through the chain's copy -- Chain_ClearBlocks, Chain_RollbackToHeightLocked
+         * and Chain_SaveToFile -- and each of them NULLs only the chain's side, leaving the
+         * caller holding a dangling pointer. Whether a caller must then use free() or
+         * Block_Destroy() was a convention carried in comments at every call site plus a
+         * consumed-count passed around; getting it wrong aborted in the allocator.
+         *
+         * Clearing it here makes the rule structural: free(wrapper) and Block_Destroy(wrapper)
+         * are now equivalent and both safe, because DynArr_destroy(NULL) is a no-op.
+         *
+         * This runs right after the push and NOT at the end on success, deliberately. If the
+         * ledger pass below fails we return false with the block still in the chain, so a caller
+         * that destroys its wrapper on failure would otherwise free the chain's array.
+        **/
+        block->transactions = NULL;
 
         // Second pass: apply the ledger changes.
         if (blk->transactions) {
@@ -464,7 +519,7 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
 
     if (ok) {
         printf("Added new block to chain:\n");
-        Block_ShortPrint(block);
+        Block_ShortPrint(stored ? stored : block); // stored still has the transactions; `block` no longer does
     }
 
     return ok;
@@ -795,20 +850,21 @@ static bool Chain_BranchIsLinkedLocked(blockchain_t* chain, size_t forkHeight, b
     return true;
 }
 
-static void Chain_FreeBlockArray(block_t** blocks, size_t count, size_t consumedByChain) {
+/**
+ * Free an array of blocks and the array itself.
+ *
+ * No consumed-count is needed: Chain_AddBlockLocked clears the caller's `transactions` pointer when
+ * it takes ownership, so Block_Destroy is correct whether or not a given block reached the chain.
+ * The count used to be threaded through here, and getting it wrong -- resetting it after a rollback
+ * had already freed the aliased arrays -- is what aborted in the allocator.
+**/
+static void Chain_FreeBlockArray(block_t** blocks, size_t count) {
     if (!blocks) {
         return;
     }
 
     for (size_t i = 0; i < count; ++i) {
-        if (!blocks[i]) {
-            continue;
-        }
-        if (i < consumedByChain) {
-            // Chain_AddBlockLocked shallow-copies the struct, so the chain owns the transactions
-            // now. Free only our wrapper -- Block_Destroy would take the chain's array with it.
-            free(blocks[i]);
-        } else {
+        if (blocks[i]) {
             Block_Destroy(blocks[i]);
         }
     }
@@ -824,7 +880,8 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
                          size_t forkHeight,
                          block_t** newBlocks,
                          size_t count,
-                         uint64_t observedAtTipHeight) {
+                         uint64_t observedAtTipHeight,
+                         bool bypassPenalty) {
     if (!chain || !chain->blocks || !newBlocks || count == 0 || forkHeight == 0) {
         return false;
     }
@@ -835,9 +892,8 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
     bool ok = false;
     block_t** snapshot = NULL;      // deep copies of the blocks we are replacing
     size_t snapshotCount = 0;
-    size_t snapshotConsumed = 0;
     block_t** candidate = NULL;     // deep copies of the branch we are applying
-    size_t candidateConsumed = 0;
+    size_t candidateApplied = 0;    // how far the apply got, for the log line below
 
     do {
         const size_t tipCount = DynArr_size(chain->blocks);
@@ -862,18 +918,64 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
         // in by a caller: a peer claiming a huge height must not be able to switch the penalty off.
         const bool inInitialBlockDownload = Chain_IsInitialBlockDownload(chain);
         const uint64_t tipHeight = tipCount > 0 ? (uint64_t)(tipCount - 1) : 0ULL;
-        if (!inInitialBlockDownload && tipCount > forkHeight) {
+        if (bypassPenalty && tipCount > forkHeight) {
+            // Operator override, never reachable from anything a peer sends. Announced loudly
+            // because it is the one place the delay protection is deliberately not applied.
+            printf("Chain_ReplaceBranch: reorg penalty BYPASSED at height %zu by operator request\n",
+                forkHeight);
+        }
+        if (!bypassPenalty && !inInitialBlockDownload && tipCount > forkHeight) {
             const uint64_t observedTip = observedAtTipHeight > tipHeight ? tipHeight : observedAtTipHeight;
             const uint64_t depth = observedTip >= (uint64_t)forkHeight
                 ? (observedTip - (uint64_t)forkHeight + 1ULL)
                 : 1ULL;
             const uint64_t penalty = FetchScheduler_ComputeReorgPenaltyBlocks(depth);
-            const uint64_t elapsed = tipHeight >= observedTip ? (tipHeight - observedTip) : 0ULL;
+
+            /**
+             * The delay can be served by EITHER side making progress.
+             *
+             * Measuring it against our own chain growth alone assumed we are an active participant
+             * whose tip advances. A node that is behind is not: its tip is frozen precisely because
+             * it is rejecting the branch, so `elapsed` stays 0 forever and it can never rejoin. That
+             * is not a reorg contest at all -- being 500 blocks behind is being behind, and
+             * refusing to adopt protects nothing while the node falls further back every hour.
+             *
+             * A branch that already extends `penalty` blocks past our tip has demonstrated exactly
+             * what the delay asks for -- that much sustained public work -- and every one of those
+             * blocks carries PoW we validated ourselves. Requiring us to independently produce the
+             * same amount is demanding the same proof twice. Counting only VALIDATED blocks is what
+             * keeps this safe: a peer's advertised height is not evidence and never reaches here.
+             *
+             * The rule degrades correctly in both directions. A mining node's tip advances, so an
+             * attacker has to outpace it by `penalty` blocks. A node that is merely observing
+             * follows the heaviest chain, which is what an observer should do.
+            **/
+            const uint64_t localGrowth = tipHeight >= observedTip ? (tipHeight - observedTip) : 0ULL;
+            const uint64_t candidateTip = (uint64_t)forkHeight + (uint64_t)count - 1ULL;
+            const uint64_t branchLead = candidateTip > tipHeight ? (candidateTip - tipHeight) : 0ULL;
+            const uint64_t elapsed = localGrowth > branchLead ? localGrowth : branchLead;
 
             if (elapsed < penalty) {
-                printf("Chain_ReplaceBranch: deferring reorg at height %zu: depth=%" PRIu64
-                       " penalty=%" PRIu64 " elapsed=%" PRIu64 "\n",
-                    forkHeight, depth, penalty, elapsed);
+                // The maintenance thread retries pooled branches once a second, and `elapsed` can
+                // only change when our own tip moves -- so without this the same line is printed
+                // every second for as long as the branch stays deferred, which on a node that is
+                // not mining is forever. Report each distinct deferral once, and again whenever the
+                // situation actually changes. Guarded by chainLock (held for writing here).
+                static size_t lastDeferredFork = SIZE_MAX;
+                static uint64_t lastDeferredTip = UINT64_MAX;
+                static uint64_t lastDeferredPenalty = UINT64_MAX;
+                static uint64_t lastDeferredElapsed = UINT64_MAX;
+                if (forkHeight != lastDeferredFork || tipHeight != lastDeferredTip ||
+                    penalty != lastDeferredPenalty || elapsed != lastDeferredElapsed) {
+                    printf("Chain_ReplaceBranch: deferring reorg at height %zu: depth=%" PRIu64
+                           " penalty=%" PRIu64 " elapsed=%" PRIu64
+                           " (localGrowth=%" PRIu64 " branchLead=%" PRIu64 ")\n",
+                        forkHeight, depth, penalty, elapsed, localGrowth, branchLead);
+                    lastDeferredFork = forkHeight;
+                    lastDeferredTip = tipHeight;
+                    lastDeferredPenalty = penalty;
+                    lastDeferredElapsed = elapsed;
+                }
                 break;
             }
         }
@@ -966,7 +1068,7 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
                 applied = false;
                 break;
             }
-            candidateConsumed++;
+            candidateApplied++;
         }
 
         if (applied) {
@@ -976,14 +1078,13 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
 
         // Undo: drop whatever of the candidate branch made it in and put the original blocks back.
         printf("Chain_ReplaceBranch: candidate branch failed to apply at height %zu; restoring previous chain\n",
-            forkHeight + candidateConsumed);
+            forkHeight + candidateApplied);
 
         if (!Chain_RollbackToHeightLocked(chain, forkHeight)) {
             fprintf(stderr, "Chain_ReplaceBranch: FAILED to roll back after a failed apply; chain is truncated to %zu\n",
                 forkHeight);
             break;
         }
-        candidateConsumed = 0; // the rollback freed the copies' transactions
 
         for (size_t i = 0; i < snapshotCount; ++i) {
             if (!Chain_AddBlockLocked(chain, snapshot[i])) {
@@ -991,12 +1092,11 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
                     forkHeight + i, forkHeight + i);
                 break;
             }
-            snapshotConsumed++;
         }
     } while (0);
 
-    Chain_FreeBlockArray(snapshot, snapshotCount, snapshotConsumed);
-    Chain_FreeBlockArray(candidate, candidate ? count : 0, candidateConsumed);
+    Chain_FreeBlockArray(snapshot, snapshotCount);
+    Chain_FreeBlockArray(candidate, candidate ? count : 0);
 
     pthread_mutex_unlock(&balanceSheetLock);
     pthread_rwlock_unlock(&chainLock);
@@ -1879,8 +1979,15 @@ static bool Chain_EpochDagSeedForHeightLocked(blockchain_t* chain, uint64_t bloc
     return true;
 }
 
-bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
-                              size_t* outDagBytes, uint8_t outSeed[32]) {
+/**
+ * As Chain_DagParamsForHeight, but assumes `chainLock` is already held (read OR write).
+ *
+ * Needed because Chain_AddBlockLocked verifies proof of work while holding the write lock, and
+ * chainLock is not recursive -- taking it for reading there deadlocks the moment another thread
+ * queues for the write lock.
+**/
+static bool Chain_DagParamsForHeightLocked(blockchain_t* chain, uint64_t blockHeight,
+                                           size_t* outDagBytes, uint8_t outSeed[32]) {
     if (!chain || !chain->blocks || !outDagBytes || !outSeed) {
         return false;
     }
@@ -1889,8 +1996,6 @@ bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
 
     uint64_t bytes = 0;
     bool ok = false;
-
-    pthread_rwlock_rdlock(&chainLock);
 
     // Lock order is chainLock -> dagCacheLock, everywhere. Nothing under dagCacheLock calls back
     // into chain.c, so this pair cannot deadlock.
@@ -1905,8 +2010,6 @@ bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
         ok = Chain_EpochDagSeedForHeightLocked(chain, blockHeight, outSeed);
     }
 
-    pthread_rwlock_unlock(&chainLock);
-
     if (!ok) {
         return false;
     }
@@ -1919,6 +2022,19 @@ bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
 
     *outDagBytes = (size_t)bytes;
     return true;
+}
+
+bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
+                              size_t* outDagBytes, uint8_t outSeed[32]) {
+    if (!chain || !chain->blocks || !outDagBytes || !outSeed) {
+        return false;
+    }
+
+    pthread_rwlock_rdlock(&chainLock);
+    const bool ok = Chain_DagParamsForHeightLocked(chain, blockHeight, outDagBytes, outSeed);
+    pthread_rwlock_unlock(&chainLock);
+
+    return ok;
 }
 
 void Chain_OnTipAdvanced(blockchain_t* chain) {

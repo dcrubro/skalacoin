@@ -478,17 +478,19 @@ static bool MineAndAppendBlock(blockchain_t* chain,
         return false;
     }
 
-    if (!Chain_AddBlock(chain, block)) {
-        fprintf(stderr, "failed to append block to chain\n");
-        return false;
-    }
-
+    // Read the coinbase BEFORE handing the block to the chain. Chain_AddBlock takes ownership of
+    // the transaction array and clears our pointer to it, so this has to happen first.
     uint64_t coinbaseAmount = 0;
     if (block->transactions && DynArr_size(block->transactions) > 0) {
         signed_transaction_t* firstTx = (signed_transaction_t*)DynArr_at(block->transactions, 0);
         if (firstTx && Address_IsCoinbase(firstTx->transaction.senderAddress)) {
             coinbaseAmount = firstTx->transaction.amount1;
         }
+    }
+
+    if (!Chain_AddBlock(chain, block)) {
+        fprintf(stderr, "failed to append block to chain\n");
+        return false;
     }
 
     /* Debug proof removed: miner printed proof that coinbase == baseReward + totalFees during debugging. */
@@ -922,7 +924,7 @@ int main(int argc, char* argv[]) {
     char supplyStr[80];
     Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
     printf("Current chain has %zu blocks, total supply %s\n", Chain_Size(chain), supplyStr);
-    printf("Commands: mine <x>, send <address> <amount> [fee], txpooldetail <txhash>, balance [address], connect <ipv4> [port], peers, sync (requires nodes), flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
+    printf("Commands: mine <x>, send <address> <amount> [fee], txpooldetail <txhash>, balance [address], connect <ipv4> [port], peers, sync [force] (requires nodes), dagvote <grow|hold|down>, flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
 
     char line[1024];
     while (true) {
@@ -1025,7 +1027,7 @@ int main(int argc, char* argv[]) {
                     break;
                 }
 
-                free(block); // Chain stores block by value and owns copied transaction array.
+                Block_Destroy(block); // Chain_AddBlock already took the transaction array.
 
                 // Broadcast newly mined block to outbound peers
                 if (node) {
@@ -1132,7 +1134,7 @@ int main(int argc, char* argv[]) {
 
             FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
 
-            free(block);
+            Block_Destroy(block); // the chain took the transaction array; this frees the wrapper
             if (node) {
                 Node_BroadcastChainRange(node, Chain_Size(chain) - 1, NULL);
             }
@@ -1162,6 +1164,24 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
+            // `sync force` skips the reorg delay penalty for this sync only. The penalty is served
+            // by local chain growth, so a node that is neither mining nor stale enough to count as
+            // catching up cannot clear it on its own -- this is the operator's way out when they
+            // know their branch is the wrong one. Work comparison and linkage still apply.
+            bool forceSync = false;
+            {
+                const char* syncArg = strtok(NULL, " \t");
+                if (syncArg && strcmp(syncArg, "force") == 0) {
+                    forceSync = true;
+                } else if (syncArg) {
+                    printf("usage: sync [force]\n");
+                    continue;
+                }
+            }
+            if (forceSync) {
+                printf("sync force: the reorg delay penalty will be skipped for this sync\n");
+            }
+
             // Choose the best outbound peer by advertised height
             tcp_connection_t* peerConn = NULL;
             uint64_t peerHeight = 0;
@@ -1173,6 +1193,12 @@ int main(int argc, char* argv[]) {
             // Continue syncing in a loop until we've caught up to the peer or no progress is made.
             bool madeProgressOverall = false;
             int forkProbes = 0;
+
+            // Fork state for this sync. The backward walk runs once; after that the window keeps
+            // marching forward so the competing branch accumulates in the pool, which is what lets
+            // its length past our tip satisfy the reorg delay.
+            bool forkPointLocated = false;
+            uint64_t pooledSinceAttach = 0;
 
             // Drop receipts left over from an earlier sync, so a stale one cannot be mistaken for
             // an answer to a request this run has not sent yet.
@@ -1285,7 +1311,7 @@ int main(int argc, char* argv[]) {
                             printf("Divergence at height %" PRIu64 "; probing for the fork point\n", h);
                             RequestForkWindow(node, peerConn, h);
 
-                            size_t reattached = OrphanPool_AttemptAttach(chain);
+                            size_t reattached = OrphanPool_AttemptAttachForced(chain, forceSync);
                             if (reattached > 0) {
                                 printf("Reorg attached %zu block(s) from the peer's branch\n", reattached);
                             } else {
@@ -1334,51 +1360,62 @@ int main(int argc, char* argv[]) {
                     // and made the peer re-serve the whole chain several times over.
                     node_delivery_status_t deliveryStatus = NODE_DELIVERY_REJECTED;
                     if (Node_TakeBlockDelivery(h, &deliveryStatus) && deliveryStatus != NODE_DELIVERY_APPENDED) {
-                        if (forkProbes >= MAX_FORK_PROBE_ROUNDS) {
-                            printf("block %" PRIu64 " is on a branch we cannot join after %d probe(s); "
-                                   "giving up on this peer\n", h, forkProbes);
-                            inFlight = 0;
-                            nextReq = end; // stop refilling the window; this peer is unreachable by extension
-                            break;
-                        }
+                        // Locate the fork point ONCE. After that the branch just needs to keep
+                        // accumulating: the delay is satisfied by the branch extending past our tip
+                        // (see Chain_ReplaceBranch), so the window must march FORWARD pooling
+                        // blocks. Resetting it to our tip on every forked delivery -- which is what
+                        // this used to do -- re-requested the same eight heights forever, so the
+                        // pool never grew past the window size and a node that was far behind could
+                        // never accumulate enough of the branch to adopt it.
+                        if (!forkPointLocated) {
+                            forkProbes++;
+                            printf("block %" PRIu64 " arrived but does not extend our chain; "
+                                   "probing for the fork point\n", h);
 
-                        forkProbes++;
-                        printf("block %" PRIu64 " arrived but does not extend our chain; "
-                               "probing for the fork point (round %d/%d)\n",
-                            h, forkProbes, MAX_FORK_PROBE_ROUNDS);
-
-                        // Pull a window BELOW the divergence so the pool can walk prevHash back to
-                        // the common ancestor. Without this the fork point is never requested at
-                        // all, because the window only ever moves forward from our own tip.
-                        const bool foundCommon = RequestForkWindow(node, peerConn, h);
-
-                        size_t reattached = foundCommon ? OrphanPool_AttemptAttach(chain) : 0;
-                        if (reattached > 0) {
-                            printf("Reorg attached %zu block(s) from the peer's branch\n", reattached);
-                            forkProbes = 0; // real progress; allow probing again if it forks further on
-                        } else if (!foundCommon) {
-                            printf("No shared block found with this peer; its branch cannot be linked to ours\n");
-                        } else {
-                            // Deliberately not phrased as a failure: the branch stays pooled and the
-                            // 1Hz maintenance thread retries it, which is usually what completes a
-                            // reorg whose blocks were still arriving when this pass ran.
-                            printf("Reorg not completed on this pass; branch stays pooled for retry\n");
-                        }
-
-                        // Restart the window against whatever our tip is now.
-                        nextReq = Chain_Size(chain);
-                        inFlight = 0;
-                        if (Chain_Size(chain) > 0) {
-                            block_t* tip = NULL;
-                            if (Chain_GetBlockCopy(chain, Chain_Size(chain) - 1, &tip) && tip) {
-                                Block_CalculateHash(tip, expectedPrevHash);
-                                Block_Destroy(tip);
+                            forkPointLocated = RequestForkWindow(node, peerConn, h);
+                            if (!forkPointLocated) {
+                                printf("No shared block found with this peer within %" PRIu64
+                                       " blocks; its branch cannot be linked to ours\n", REORG_FETCH_DEPTH);
+                                inFlight = 0;
+                                nextReq = end; // this peer is unreachable by extension
+                                break;
                             }
-                        } else {
-                            memset(expectedPrevHash, 0, sizeof(expectedPrevHash));
                         }
 
+                        // Delivered, so drop it from the in-flight set and let the window advance.
+                        for (int j = i; j < inFlight - 1; ++j) {
+                            requestedHeights[j] = requestedHeights[j + 1];
+                            retryCount[j] = retryCount[j + 1];
+                            sentAtMs[j] = sentAtMs[j + 1];
+                        }
+                        inFlight--;
+                        pooledSinceAttach++;
                         progressed = true;
+
+                        // Retry adoption as the branch grows, rather than once per probe. Each
+                        // attempt walks the pool, so do it per window-full instead of per block.
+                        if (pooledSinceAttach >= (uint64_t)maxInFlight) {
+                            pooledSinceAttach = 0;
+                            size_t reattached = OrphanPool_AttemptAttachForced(chain, forceSync);
+                            if (reattached > 0) {
+                                printf("Reorg attached %zu block(s) from the peer's branch\n", reattached);
+
+                                // The chain moved; realign the window and the expected parent hash.
+                                nextReq = Chain_Size(chain);
+                                inFlight = 0;
+                                forkPointLocated = false; // a further divergence would need a new walk
+                                if (Chain_Size(chain) > 0) {
+                                    block_t* tip = NULL;
+                                    if (Chain_GetBlockCopy(chain, Chain_Size(chain) - 1, &tip) && tip) {
+                                        Block_CalculateHash(tip, expectedPrevHash);
+                                        Block_Destroy(tip);
+                                    }
+                                } else {
+                                    memset(expectedPrevHash, 0, sizeof(expectedPrevHash));
+                                }
+                            }
+                        }
+
                         break;
                     }
 
@@ -1408,6 +1445,17 @@ int main(int argc, char* argv[]) {
                 if (!progressed) {
                     // small sleep to avoid spinning
                     sleep_for_milliseconds(50);
+                }
+            }
+
+            // The window drained. Anything pooled since the last attempt has not been tried yet --
+            // without this a branch whose final partial batch never reached the retry threshold
+            // would sit in the pool unadopted until the maintenance thread happened to pick it up.
+            if (pooledSinceAttach > 0) {
+                pooledSinceAttach = 0;
+                size_t reattached = OrphanPool_AttemptAttachForced(chain, forceSync);
+                if (reattached > 0) {
+                    printf("Reorg attached %zu block(s) from the peer's branch\n", reattached);
                 }
             }
 
@@ -1445,7 +1493,7 @@ int main(int argc, char* argv[]) {
                         peerHeight, newLocal);
                     const bool foundCommon = RequestForkWindow(node, peerConn, newLocal);
 
-                    size_t attached = foundCommon ? OrphanPool_AttemptAttach(chain) : 0;
+                    size_t attached = foundCommon ? OrphanPool_AttemptAttachForced(chain, forceSync) : 0;
                     if (attached > 0) {
                         printf("Fork probe adopted %zu block(s) from the peer's branch\n", attached);
                         continue;

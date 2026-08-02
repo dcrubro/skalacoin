@@ -65,6 +65,12 @@ bool Chain_RollbackToHeight(blockchain_t* chain, size_t height);
  * see the comment in the implementation. The initial-block-download exemption is decided inside,
  * from local state only, so no caller can switch the penalty off.
  *
+ * `bypassPenalty` skips the delay check ONLY. It exists for an explicit operator action (`sync
+ * force`) on a node whose chain is known to be the wrong one -- the penalty is served by local
+ * chain growth, so a node that is neither mining nor stale enough to count as catching up cannot
+ * clear it on its own. It must never be reachable from anything a peer says; work comparison,
+ * linkage and atomicity are still enforced, so this cannot adopt a branch that is not heavier.
+ *
  * On any failure the original chain, balance sheet, supply and reward are restored and false is
  * returned. The caller keeps ownership of `newBlocks` in every case: the chain applies copies.
 **/
@@ -72,7 +78,8 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
                          size_t forkHeight,
                          block_t** newBlocks,
                          size_t count,
-                         uint64_t observedAtTipHeight);
+                         uint64_t observedAtTipHeight,
+                         bool bypassPenalty);
 
 // True when this node is catching up rather than following the tip (empty chain, or a median
 // block time far in the past). Used to exempt initial sync from the reorg penalty.

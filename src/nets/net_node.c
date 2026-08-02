@@ -533,8 +533,15 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         return NODE_BLOCK_REJECTED;
     }
 
-    // Validate block
-    if (!Block_IsFullyValid(blk, currentChain)) {
+    // Only the self-contained checks run here. Proof of work is verified by Chain_AddBlock, at the
+    // point a block actually joins the chain.
+    //
+    // PoW cannot be judged here because it is relative to the branch the block belongs to: the
+    // epoch seed is the last block of the previous epoch on ITS branch. For a block on a competing
+    // branch our chain gives the WRONG seed whenever the two diverge before that boundary, so
+    // checking it here rejected perfectly valid blocks and made any fork spanning an epoch boundary
+    // impossible to assemble. Deferring costs at most a slot in a pool that is already capped.
+    if (!Block_HasValidStructure(blk)) {
         printf("Rejected BLOCK_DATA at height %" PRIu64 " during validation\n", blockHeight);
         DynArr_destroy(blk->transactions);
         free(blk);
@@ -607,12 +614,11 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
     }
 
     if (!Chain_AddBlock(currentChain, blk)) {
-        // Chain_AddBlock failed; cleanup
+        // Chain_AddBlock failed; cleanup. Safe either way: if it failed before taking the block we
+        // still own the transactions, and if it failed after (the ledger pass can fail with the
+        // block already pushed) our pointer to them was cleared, so this frees only the wrapper.
         printf("Rejected BLOCK_DATA at height %" PRIu64 " during chain add\n", blockHeight);
-        if (blk->transactions) {
-            DynArr_destroy(blk->transactions);
-        }
-        free(blk);
+        Block_Destroy(blk);
         return NODE_BLOCK_REJECTED;
     }
 
@@ -625,8 +631,9 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         BalanceSheet_SaveToFile(chainDataDir);
     }
 
-    // Chain_AddBlock copied the block into the chain; free our temporary wrapper but do NOT destroy transactions (they are freed by Chain_SaveToFile when persisted)
-    free(blk);
+    // Chain_AddBlock took ownership of the transaction array and cleared our pointer to it, so
+    // destroying the wrapper here frees only the wrapper.
+    Block_Destroy(blk);
     // Attempt to attach any orphans that may now have their parents present.
     size_t attached = OrphanPool_AttemptAttach(currentChain);
     if (attached > 0) {

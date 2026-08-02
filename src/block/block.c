@@ -16,6 +16,10 @@
 static Autolykos2Context* g_autolykos2Ctx = NULL;
 static pthread_mutex_t g_powCtxLock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_dagEpoch = 0;
+// The seed the current DAG was generated from. Matching on epoch index and size is NOT enough: a
+// reorg replaces the block an epoch's seed is derived from while leaving the epoch index and size
+// unchanged, so a stale DAG would still look current and silently hash against the wrong lanes.
+static uint8_t g_dagSeed[32];
 static bool g_dagReady = false;
 
 // Caller must hold `g_powCtxLock`.
@@ -50,9 +54,11 @@ bool Block_EnsureAutolykos2Dag(uint64_t epochIndex, size_t dagBytes, const uint8
 
     pthread_mutex_lock(&g_powCtxLock);
 
-    // Already built for this epoch at this size: generation is seconds of work, so never redo it.
+    // Already built from exactly this seed at this size: generation is seconds of work, never redo
+    // it. The seed has to be part of the test -- see g_dagSeed.
     if (g_dagReady && g_autolykos2Ctx && g_dagEpoch == epochIndex &&
-        Autolykos2_DagSize(g_autolykos2Ctx) == dagBytes) {
+        Autolykos2_DagSize(g_autolykos2Ctx) == dagBytes &&
+        memcmp(g_dagSeed, seed32, 32) == 0) {
         pthread_mutex_unlock(&g_powCtxLock);
         return true;
     }
@@ -70,6 +76,7 @@ bool Block_EnsureAutolykos2Dag(uint64_t epochIndex, size_t dagBytes, const uint8
     const bool ok = Autolykos2_DagAllocate(ctx, dagBytes) && Autolykos2_DagGenerate(ctx, seed32);
     if (ok) {
         g_dagEpoch = epochIndex;
+        memcpy(g_dagSeed, seed32, 32);
         g_dagReady = true;
     }
 
@@ -77,17 +84,22 @@ bool Block_EnsureAutolykos2Dag(uint64_t epochIndex, size_t dagBytes, const uint8
     return ok;
 }
 
-bool Block_PowHashHeavy(const block_t* block, uint64_t epochIndex, size_t dagBytes, uint8_t outHash[32]) {
-    if (!block || !outHash) {
+bool Block_PowHashHeavy(const block_t* block, uint64_t epochIndex, size_t dagBytes,
+                        const uint8_t seed32[32], uint8_t outHash[32]) {
+    if (!block || !seed32 || !outHash) {
         return false;
     }
 
     pthread_mutex_lock(&g_powCtxLock);
-    // Checking the epoch and size here, rather than trusting the caller to have built the right
-    // DAG, is what makes this impossible to misuse: an unbuilt or stale DAG yields false and the
-    // caller falls back to deriving the lanes from the seed.
+    // Verifying the SEED here, not just the epoch and size, is what makes this impossible to
+    // misuse. A reorg changes the block an epoch's seed is derived from while the epoch index and
+    // size stay put, so an epoch+size check alone happily accepts a DAG built from the pre-reorg
+    // seed and returns a hash for the wrong lanes -- which shows up as a valid block failing PoW
+    // while a branch is being applied. A mismatch yields false and the caller derives the lanes
+    // from the seed instead.
     const bool usable = g_dagReady && g_autolykos2Ctx && g_dagEpoch == epochIndex &&
-                        Autolykos2_DagSize(g_autolykos2Ctx) == dagBytes;
+                        Autolykos2_DagSize(g_autolykos2Ctx) == dagBytes &&
+                        memcmp(g_dagSeed, seed32, 32) == 0;
     const bool ok = usable &&
                     Autolykos2_Hash(
                         g_autolykos2Ctx,
@@ -254,7 +266,7 @@ bool Block_HasValidProofOfWorkWithParams(const block_t* block, uint64_t epochInd
     // from the epoch seed. The two produce identical hashes, so which one runs is invisible to
     // consensus; only speed differs.
     uint8_t hash[32];
-    if (!Block_PowHashHeavy(block, epochIndex, dagBytes, hash) &&
+    if (!Block_PowHashHeavy(block, epochIndex, dagBytes, seed32, hash) &&
         !Block_PowHashLight(block, dagBytes, seed32, hash)) {
         // Fail CLOSED. This used to hand back a zeroed hash on any failure and compare that to the
         // target -- and zero is below every target, so a DAG that was missing, mis-sized or failed
@@ -383,16 +395,24 @@ bool Block_ValidateCoinbaseAndFees(const block_t* block, uint64_t expectedCoinba
     return true;
 }
 
-bool Block_IsFullyValid(const block_t* block, blockchain_t* chain) {
-    bool merkleValid = false;
-    uint8_t calculatedMerkleRoot[32];
-    if (block && block->transactions) {
-        Block_CalculateMerkleRoot(block, calculatedMerkleRoot);
-        merkleValid = (memcmp(calculatedMerkleRoot, block->header.merkleRoot, 32) == 0);
+bool Block_HasValidStructure(const block_t* block) {
+    if (!block || !block->transactions) {
+        return false;
     }
 
-    return Block_HasValidVote(block) && Block_HasValidProofOfWork(block, chain) &&
-           Block_AllTransactionsValid(block) && DynArr_size(block->transactions) > 0 && merkleValid;
+    uint8_t calculatedMerkleRoot[32];
+    Block_CalculateMerkleRoot(block, calculatedMerkleRoot);
+    if (memcmp(calculatedMerkleRoot, block->header.merkleRoot, 32) != 0) {
+        return false;
+    }
+
+    return Block_HasValidVote(block) &&
+           Block_AllTransactionsValid(block) &&
+           DynArr_size(block->transactions) > 0;
+}
+
+bool Block_IsFullyValid(const block_t* block, blockchain_t* chain) {
+    return Block_HasValidStructure(block) && Block_HasValidProofOfWork(block, chain);
 }
 
 void Block_Destroy(block_t* block) {

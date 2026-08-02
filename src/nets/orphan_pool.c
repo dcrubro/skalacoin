@@ -441,8 +441,8 @@ static size_t OrphanPool_ExtendTip(blockchain_t* chain) {
             continue;
         }
 
-        // The chain took over the copy's transaction array; free only our wrapper.
-        free(candidate);
+        // Chain_AddBlock took ownership of the transaction array and cleared our pointer to it.
+        Block_Destroy(candidate);
 
         pthread_mutex_lock(&g_orphanLock);
         block_t* taken = OrphanPool_TakeByHashLocked(candidateHash);
@@ -461,7 +461,7 @@ static size_t OrphanPool_ExtendTip(blockchain_t* chain) {
  * Look for a competing branch that forks below our tip and is worth adopting.
  * The work comparison, the reorg penalty and the atomicity all live in Chain_ReplaceBranch.
 **/
-static size_t OrphanPool_TryAdoptBranch(blockchain_t* chain) {
+static size_t OrphanPool_TryAdoptBranch(blockchain_t* chain, bool bypassPenalty) {
     const size_t chainSize = Chain_Size(chain);
     if (chainSize == 0) {
         return 0;
@@ -516,7 +516,8 @@ static size_t OrphanPool_TryAdoptBranch(blockchain_t* chain) {
 
         bool adopted = false;
         if (copiedAll) {
-            adopted = Chain_ReplaceBranch(chain, forkHeight, branchCopies, branchCount, observedAtTipHeight);
+            adopted = Chain_ReplaceBranch(chain, forkHeight, branchCopies, branchCount, observedAtTipHeight,
+                                          bypassPenalty);
         }
 
         for (size_t i = 0; i < branchCount; ++i) {
@@ -548,6 +549,10 @@ static size_t OrphanPool_TryAdoptBranch(blockchain_t* chain) {
 }
 
 size_t OrphanPool_AttemptAttach(blockchain_t* chain) {
+    return OrphanPool_AttemptAttachForced(chain, false);
+}
+
+size_t OrphanPool_AttemptAttachForced(blockchain_t* chain, bool bypassPenalty) {
     if (!chain) {
         return 0;
     }
@@ -567,7 +572,7 @@ size_t OrphanPool_AttemptAttach(blockchain_t* chain) {
         size_t extended = OrphanPool_ExtendTip(chain);
         attached += extended;
 
-        size_t adopted = OrphanPool_TryAdoptBranch(chain);
+        size_t adopted = OrphanPool_TryAdoptBranch(chain, bypassPenalty);
         attached += adopted;
 
         if (extended == 0 && adopted == 0) {
