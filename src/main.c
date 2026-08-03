@@ -101,14 +101,35 @@ static bool MineBlock(blockchain_t* chain, block_t* block) {
             (unsigned long long)epochIndex, dagBytes);
     }
 
-    for (uint64_t nonce = 0;; ++nonce) {
-        block->header.nonce = nonce;
-        if (Block_HasValidProofOfWorkWithParams(block, epochIndex, dagBytes, seed)) {
-            return true;
-        }
+    // Whatever BuildNextBlock stamped is only the time the search STARTED, so the header timestamp
+    // is refreshed as we go and the nonce sweep restarts against the new header. See
+    // MINING_TIMESTAMP_REFRESH_MS.
+    uint64_t stampedAt = block->header.timestamp;
 
-        if (nonce == UINT64_MAX) {
-            return false;
+    for (;;) {
+        for (uint64_t nonce = 0;; ++nonce) {
+            block->header.nonce = nonce;
+            if (Block_HasValidProofOfWorkWithParams(block, epochIndex, dagBytes, seed)) {
+                return true;
+            }
+
+            if (nonce == UINT64_MAX) {
+                return false;
+            }
+
+            if (((nonce + 1) % MINING_TIMESTAMP_CHECK_NONCES) != 0) {
+                continue;
+            }
+
+            // Only ever move the timestamp forward. CLOCK_REALTIME can step backwards under NTP,
+            // and backdating the block we are mining is exactly what the median-time-past rule
+            // treats as a node faking being behind.
+            const uint64_t now = get_current_time_ms();
+            if (now > stampedAt && (now - stampedAt) >= MINING_TIMESTAMP_REFRESH_MS) {
+                block->header.timestamp = now;
+                stampedAt = now;
+                break; // New header, so the nonces tried against the old one are worth retrying
+            }
         }
     }
 }

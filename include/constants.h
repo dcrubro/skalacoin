@@ -33,8 +33,26 @@
 #define DIFFICULTY_ADJUSTMENT_INTERVAL 3840 // Every 3840 blocks (roughly every 4 days with a 90 second block time)
                                            // Max adjustment per is x2. So if blocks are coming in too fast, the difficulty will at most double every 24 hours, and vice versa if they're coming in too slow.
 #define TARGET_BLOCK_TIME 90 // Target block time in seconds
-//#define INITIAL_DIFFICULTY 0x1f0c1422 // Default compact target used by Autolykos2 PoW (This is ridiculously low)
-#define INITIAL_DIFFICULTY 0x1f1b7c51 // This takes 90s on my machine with a single thread, good for testing
+// The retarget measures the span between the FIRST and LAST block of the window, which is one fewer
+// interval than the window has blocks, and divides by it. Two blocks is the minimum that leaves a
+// non-zero span. See Chain_ComputeTargetAtHeight.
+static_assert(DIFFICULTY_ADJUSTMENT_INTERVAL >= 2,
+    "DIFFICULTY_ADJUSTMENT_INTERVAL must span at least one block interval");
+#define INITIAL_DIFFICULTY 0x1f0c1422 // Default compact target used by Autolykos2 PoW (This is ridiculously low)
+//#define INITIAL_DIFFICULTY 0x1f1b7c51 // Ridiculously low difficulty for testing.
+
+// Mining
+// The timestamp lives in the header the PoW hashes, so the miner restamps it while searching rather
+// than keeping the one stamped when the search started. Two things fall out of that: a block carries
+// the time it was actually found instead of a timestamp that is a whole block time stale on average,
+// and every restamp is a fresh search space, so the nonce sweep starts over from 0 and never has to
+// walk out to keep finding untried candidates. It costs nothing to throw the old nonce range away --
+// each attempt is independent, so the work already done was never getting any closer.
+static const uint64_t MINING_TIMESTAMP_REFRESH_MS = 2ULL; // Don't restamp for a drift smaller than this
+// Reading the clock once per hash would be wasted work next to a memory-hard hash, so the check is
+// batched. Note this, not the refresh interval, is what actually bounds accuracy once a batch of
+// hashes takes longer than MINING_TIMESTAMP_REFRESH_MS -- keep it small enough that it doesn't.
+static const uint64_t MINING_TIMESTAMP_CHECK_NONCES = 16ULL;
 
 // Sync / Reorg tuning constants
 // Timeouts and retry/backoff behavior for block fetches during sync (milliseconds)

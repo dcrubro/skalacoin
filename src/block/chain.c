@@ -1681,7 +1681,13 @@ uint32_t Chain_ComputeTargetAtHeight(blockchain_t* chain, uint64_t height, uint3
         return currentTarget; // Invalid/non-increasing time window; keep current target
     }
 
-    const uint64_t targetTime = (uint64_t)TARGET_BLOCK_TIME * 1000ULL * (uint64_t)DIFFICULTY_ADJUSTMENT_INTERVAL;
+    // The window holds DIFFICULTY_ADJUSTMENT_INTERVAL blocks, but the two timestamps subtracted
+    // above are its FIRST and LAST, so what was measured is one fewer interval than there are
+    // blocks. Bitcoin compares that span against the full interval count anyway and carries a
+    // permanent ~1/(interval-1) fast bias for it; we compare against the span we actually measured,
+    // so the steady state is TARGET_BLOCK_TIME rather than TARGET_BLOCK_TIME * n/(n-1).
+    const uint64_t measuredIntervals = (uint64_t)DIFFICULTY_ADJUSTMENT_INTERVAL - 1ULL;
+    const uint64_t targetTime = (uint64_t)TARGET_BLOCK_TIME * 1000ULL * measuredIntervals;
 
     // Clamp per-epoch target movement: at most x2 easier or x2 harder. Clamping the measured span
     // is equivalent to clamping the ratio, but stays in integers.
