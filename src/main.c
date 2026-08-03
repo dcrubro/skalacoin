@@ -992,7 +992,7 @@ int main(int argc, char* argv[]) {
     char supplyStr[80];
     Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
     printf("Current chain has %zu blocks, total supply %s\n", Chain_Size(chain), supplyStr);
-    printf("Commands: mine <x>, send <address> <amount> [fee], txpooldetail <txhash>, balance [address], connect <ipv4> [port], peers, sync [force] (requires nodes), dagvote <grow|hold|down>, flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
+    printf("Commands: mine <x>, send <address> <amount> [fee], sendrawtx <hex_tx>, txpooldetail <txhash>, balance [address], connect <ipv4> [port], peers, sync [force] (requires nodes), dagvote <grow|hold|down>, flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
 
     char line[1024];
     while (true) {
@@ -1121,8 +1121,9 @@ int main(int argc, char* argv[]) {
             char* addressStr = strtok(NULL, " \t");
             char* amountStr = strtok(NULL, " \t");
             char* feeStr = strtok(NULL, " \t");
+            char* broadcastStr = strtok(NULL, " \t");
             if (!addressStr || !amountStr) {
-                printf("usage: send <address> <amount>\n");
+                printf("usage: send <address> <amount> [fee, default=0] [broadcast (true/false), default=true]\n");
                 continue;
             }
 
@@ -1145,6 +1146,16 @@ int main(int argc, char* argv[]) {
                 fee = strtoull(feeStr, &endptr2, 10);
                 if (*feeStr == '\0' || feeStr[0] == '-' || (endptr2 && *endptr2 != '\0')) {
                     printf("invalid fee\n");
+                    continue;
+                }
+            }
+
+            bool broadcast = true;
+            if (broadcastStr) {
+                if (strcmp(broadcastStr, "false") == 0) {
+                    broadcast = false;
+                } else if (strcmp(broadcastStr, "true") != 0) {
+                    printf("invalid broadcast value: expected true or false\n");
                     continue;
                 }
             }
@@ -1220,9 +1231,87 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             
-            printf("transaction added to mempool, broadcasting...\n");
+            printf("transaction hash: ");
+            uint8_t txHash[32];
+            Transaction_CalculateHash(&spendTx, txHash);
+            char txHashHex[65];
+            AddressToHexString(txHash, txHashHex); // It's the same function, but it works for any 32-byte value, not just addresses.
+            printf("%s\n", txHashHex);
 
-            if (Node_BroadcastTransaction(node, &spendTx, NULL) == 0) {
+            if (broadcast) {
+                printf("transaction added to mempool, broadcasting...\n");
+
+                if (Node_BroadcastTransaction(node, &spendTx, NULL) == 0) {
+                    printf("transaction broadcast to peers\n");
+                } else {
+                    printf("failed to broadcast transaction to peers\n");
+                }
+            } else {
+                // Output raw signed_transaction_t in hex format
+                printf("transaction added to mempool, not broadcasting\n");
+                printf("raw transaction hex: ");
+                for (size_t i = 0; i < sizeof(signed_transaction_t); ++i) {
+                    printf("%02x", ((uint8_t*)&spendTx)[i]);
+                }
+                printf("\n");
+            }
+
+            continue;
+        }
+
+        if (strcmp(cmd, "sendrawtx") == 0) {
+            char* rawTxHex = strtok(NULL, " \t");
+            if (!rawTxHex) {
+                printf("usage: sendrawtx <raw transaction hex>\n");
+                continue;
+            }
+
+            if (strlen(rawTxHex) != sizeof(signed_transaction_t) * 2) {
+                printf("invalid raw transaction hex length: expected %zu hex chars\n", sizeof(signed_transaction_t) * 2);
+                continue;
+            }
+
+            signed_transaction_t tx;
+            // Literally just set tx to the hex values. This is not safe for untrusted input, but this is a test miner CLI.
+            uint8_t* txBytes = (uint8_t*)&tx;
+            for (size_t i = 0; i < sizeof(signed_transaction_t); ++i) {
+                char byteHex[3] = { rawTxHex[i * 2], rawTxHex[i * 2 + 1], '\0' };
+                char* endptr = NULL;
+                unsigned long byteValue = strtoul(byteHex, &endptr, 16);
+                if (*endptr != '\0') {
+                    printf("invalid hex character in raw transaction\n");
+                    continue;
+                }
+                txBytes[i] = (uint8_t)byteValue;
+            }
+
+            // Verify the transaction before broadcasting
+            if (!Transaction_Verify(&tx)) {
+                printf("invalid transaction\n");
+                continue;
+            }
+
+            // Insert into txmempool, subject to the same admission policy peers apply, so we do
+            // not broadcast something the rest of the network will decline to hold.
+            if (!TxMempool_PolicyAccepts(&tx, get_current_time_ms())) {
+                printf("transaction timestamp is outside the accepted window, not sending\n");
+                continue;
+            }
+
+            if (TxMempool_Insert(tx) < 0) {
+                printf("failed to add transaction to mempool, transaction rejected\n");
+                continue;
+            }
+
+            printf("transaction hash: ");
+            uint8_t txHash[32];
+            Transaction_CalculateHash(&tx, txHash);
+            char txHashHex[65];
+            AddressToHexString(txHash, txHashHex); // It's the same function, but it works for any 32-byte value, not just addresses.
+            printf("%s\n", txHashHex);
+
+            printf("transaction added to mempool, broadcasting...\n");
+            if (Node_BroadcastTransaction(node, &tx, NULL) == 0) {
                 printf("transaction broadcast to peers\n");
             } else {
                 printf("failed to broadcast transaction to peers\n");
@@ -1831,7 +1920,7 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        printf("Unknown command. Available: mine, send, sync, txpooldetail, blockdetail, balance, connect, peers, flushchain, fullverify, wipechain, genaddr, exit\n");
+        printf("Unknown command. Available: mine, send, sendrawtx, sync, txpooldetail, blockdetail, balance, connect, peers, flushchain, fullverify, wipechain, genaddr, exit\n");
     }
 
     (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
