@@ -91,6 +91,25 @@ static const uint64_t REORG_PENALTY_REF_BLOCK_TIME = 150ULL; // reference block 
 // from overflow rather than to bound the penalty in any meaningful sense.
 static const uint64_t REORG_PENALTY_MAX_DEPTH = 1000ULL;
 
+/**
+ * Mempool transaction timestamp policy. LOCAL POLICY, NOT CONSENSUS.
+ *
+ * These govern what this node is willing to hold and relay; a block containing a transaction that
+ * violates either is still accepted. That separation is deliberate -- a node with a skewed clock
+ * must not be able to fork itself off the network over an admission rule.
+ *
+ * A too-OLD timestamp needs no rule here: the per-account replay guard (see balance_sheet.h) already
+ * refuses anything at or below a sender's last included transaction.
+**/
+// Refuse to admit a transaction dated further ahead than this of OUR OWN CLOCK. Measured against
+// the clock and not against the chain tip on purpose: on a quiet chain the tip can be hours old, and
+// judging "future" against it would refuse honest transactions exactly when blocks are sparse.
+static const uint64_t TX_MAX_FUTURE_DRIFT_MS = 2ULL * 60ULL * 60ULL * 1000ULL; // 2 hours
+// Drop transactions older than this from the mempool, so it is not inflated by junk that will never
+// be mined. Roughly the ~4 days DIFFICULTY_ADJUSTMENT_INTERVAL spans, but expressed in milliseconds
+// so it does not drift if the block time changes.
+static const uint64_t TX_EXPIRY_MS = 4ULL * 24ULL * 60ULL * 60ULL * 1000ULL; // 4 days
+
 // Upper bound on pooled orphan blocks. Orphans are accepted before the chain-derived difficulty
 // check (that lives in Chain_AddBlock, which orphans only reach on attach), so without a cap a
 // peer can push blocks at an arbitrary height until the node runs out of memory.

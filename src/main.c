@@ -202,6 +202,52 @@ static void AddCoinbaseTransaction(block_t* block, const uint8_t minerAddress[32
     Block_AddTransaction(block, &coinbaseTx);
 }
 
+/**
+ * Put each sender's transactions into timestamp order, without disturbing anyone else's position.
+ *
+ * Chain_AddBlockLocked requires a sender's timestamps to strictly increase and walks a block in
+ * order, so a sender's later, higher-fee transaction sorted ahead of their earlier one would make
+ * the block we just built invalid by our own rule.
+ *
+ * This cannot be folded into CompareTransactionPriority. "Higher fee first, except same sender goes
+ * by time" is not a strict weak ordering -- A beats B on fee, B beats C on fee, C beats A on time --
+ * and qsort with an inconsistent comparator is undefined behaviour. So sort by priority first, then
+ * permute each sender's transactions among the slots they already occupy: fee-based slot allocation
+ * survives untouched and only the order within one sender's own slots changes.
+ *
+ * Selection sort restricted to each sender's slots. Quadratic in the worst case (a whole block from
+ * one sender); fine while blocks are small.
+**/
+static void OrderSameSenderByTimestamp(signed_transaction_t* txs, size_t count) {
+    if (!txs || count < 2) {
+        return;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (Address_IsCoinbase(txs[i].transaction.senderAddress)) {
+            continue;
+        }
+
+        size_t earliest = i;
+        for (size_t j = i + 1; j < count; ++j) {
+            // Only ever compare against the SAME sender, so other senders keep their fee ranking.
+            if (memcmp(txs[j].transaction.senderAddress, txs[i].transaction.senderAddress, 32) != 0) {
+                continue;
+            }
+            if (txs[j].transaction.timestamp < txs[earliest].transaction.timestamp) {
+                earliest = j;
+            }
+        }
+
+        if (earliest != i) {
+            // Both slots belong to the same sender, so this swap cannot reorder anyone else.
+            signed_transaction_t tmp = txs[i];
+            txs[i] = txs[earliest];
+            txs[earliest] = tmp;
+        }
+    }
+}
+
 static int CompareTransactionPriority(const void* lhs, const void* rhs) {
     const signed_transaction_t* left = (const signed_transaction_t*)lhs;
     const signed_transaction_t* right = (const signed_transaction_t*)rhs;
@@ -241,6 +287,7 @@ static bool BuildSpendableMempoolSelection(
 
     if (snapshot && snapshotCount > 1) {
         qsort(snapshot, snapshotCount, sizeof(signed_transaction_t), CompareTransactionPriority);
+        OrderSameSenderByTimestamp(snapshot, snapshotCount);
     }
 
     signed_transaction_t* acceptedTxs = NULL;
@@ -1162,7 +1209,12 @@ int main(int argc, char* argv[]) {
             printf("send committed in mined block\n");
             */
 
-            // Insert into txmempool
+            // Insert into txmempool, subject to the same admission policy peers apply, so we do
+            // not broadcast something the rest of the network will decline to hold.
+            if (!TxMempool_PolicyAccepts(&spendTx, get_current_time_ms())) {
+                printf("transaction timestamp is outside the accepted window, not sending\n");
+                continue;
+            }
             if (TxMempool_Insert(spendTx) < 0) {
                 printf("failed to add transaction to mempool, transaction rejected\n");
                 continue;

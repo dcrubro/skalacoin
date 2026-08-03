@@ -83,7 +83,15 @@ static bool CreditAddress(const uint8_t address[32], uint64_t amount) {
     return BalanceSheet_Insert(entry) >= 0;
 }
 
-static bool DebitAddress(const uint8_t address[32], const uint256_t* amount) {
+/**
+ * Debit a sender and advance its replay guard in one step.
+ *
+ * `txTimestamp` is the timestamp of the transaction doing the spending; it becomes the account's
+ * `lastTxTimestamp`, which is what makes a byte-identical replay of that transaction invalid later.
+ * Taking it here rather than updating the entry separately means the debit and the guard cannot
+ * drift apart -- every path that spends from an account necessarily advances it.
+**/
+static bool DebitAddress(const uint8_t address[32], const uint256_t* amount, uint64_t txTimestamp) {
     if (!address || !amount) {
         return false;
     }
@@ -99,6 +107,10 @@ static bool DebitAddress(const uint8_t address[32], const uint256_t* amount) {
 
     if (!uint256_subtract(&entry.balance, amount)) {
         return false;
+    }
+
+    if (txTimestamp > entry.lastTxTimestamp) {
+        entry.lastTxTimestamp = txTimestamp;
     }
 
     return BalanceSheet_Insert(entry) >= 0;
@@ -424,6 +436,31 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
 
         free(spendableTxs);
 
+        /**
+         * Replay guard: each sender's transaction timestamps must strictly increase.
+         *
+         * Without this, any transaction already in the chain could be rebroadcast and mined again,
+         * debiting the sender a second time. UTXO chains get this for free because the inputs no
+         * longer exist; an account model has nothing to stop it. Timestamps are unix milliseconds,
+         * so two genuinely distinct transactions never collide, and an exact collision means a
+         * byte-identical copy -- precisely what must be refused.
+         *
+         * Checked HERE, with the rest of block validation and before the push, rather than in the
+         * ledger pass below: that pass runs after the block is already in the chain and can only
+         * return false, leaving an invalid block behind.
+         *
+         * Placement in Chain_AddBlockLocked is what makes it apply everywhere -- mining, broadcast,
+         * windowed sync, orphan attach and reorg apply all funnel through here, and it is the only
+         * insertion point into the chain besides the header-only disk load. Do not add a second
+         * copy on the receive path where the symptom happens to be visible.
+        **/
+        if (!Chain_BlockRespectsSenderOrdering(block)) {
+            printf("Chain_AddBlock: validation failed: blockIndex=%zu contains a transaction that is "
+                   "not newer than its sender's last -- replay or out-of-order\n", expectedIndex);
+            ok = false;
+            break;
+        }
+
         // Push the block only after validation succeeds.
         block_t* blk = (block_t*)DynArr_push_back(chain->blocks, block);
         if (!blk) { ok = false; break; }
@@ -462,7 +499,8 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
 
                 if (!Address_IsCoinbase(tx->transaction.senderAddress)) {
                     uint256_t spend;
-                    if (!BuildSpendAmount(tx, &spend) || !DebitAddress(tx->transaction.senderAddress, &spend)) {
+                    if (!BuildSpendAmount(tx, &spend) ||
+                        !DebitAddress(tx->transaction.senderAddress, &spend, tx->transaction.timestamp)) {
                         fprintf(stderr, "Error: Failed to debit sender balance during block addition. Bailing!\n");
                         ok = false; break;
                     }
@@ -631,6 +669,52 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
         return true; // nothing to do
     }
 
+    /**
+     * Return the discarded blocks' transactions to the mempool before anything is freed.
+     *
+     * Without this a reorg silently destroys them: they were removed from the mempool when mined
+     * (see Chain_AddBlockLocked) and nothing ever put them back, so a transaction that existed only
+     * in an orphaned block was gone from both the chain and the pool and would never be mined
+     * unless its sender happened to rebroadcast. An accidental orphan should cost a transaction one
+     * block of delay, not its existence.
+     *
+     * Coinbases are deliberately NOT restored -- they are bound to a specific height and reward and
+     * are invalid anywhere else.
+     *
+     * A transaction that also appears in the branch replacing this one needs no special handling:
+     * Chain_ReplaceBranch rolls back and then applies under a single lock acquisition, and
+     * Chain_AddBlockLocked removes every applied transaction from the pool again. So it is
+     * re-inserted here and removed again moments later, with no window in which a miner could pick
+     * up a copy of something already back in the chain. That ordering is what makes this safe in an
+     * account model, where re-mining a transaction would debit the sender twice.
+     *
+     * Blocks are usually header-only by now (anything saved or loaded has transactions == NULL), so
+     * this goes through the same borrow/disk-fallback pair the balance-sheet replay below uses.
+    **/
+    for (size_t i = cur; i > height; --i) {
+        const size_t idx = i - 1;
+
+        block_t* source = NULL;
+        bool loadedFromDisk = false;
+        if (!Chain_BorrowBlockTransactions(chain, idx, &source, &loadedFromDisk)) {
+            // Nothing recoverable for this block; the rollback itself must still proceed.
+            continue;
+        }
+
+        if (source && source->transactions) {
+            const size_t txCount = DynArr_size(source->transactions);
+            for (size_t t = 0; t < txCount; ++t) {
+                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(source->transactions, t);
+                if (!tx || Address_IsCoinbase(tx->transaction.senderAddress)) {
+                    continue;
+                }
+                (void)TxMempool_Insert(*tx);
+            }
+        }
+
+        Chain_ReturnBlockTransactions(source, loadedFromDisk);
+    }
+
     // Remove blocks above height
     for (size_t i = cur; i > height; --i) {
         size_t idx = i - 1;
@@ -702,6 +786,12 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
                     senderEntry.balance = uint256_from_u64(0);
                 }
                 (void)uint256_subtract(&senderEntry.balance, &spend);
+                // Rebuild the replay guard in the same pass that rebuilds the balance. Because this
+                // replay is what a rollback already does, the guard needs no invalidation logic of
+                // its own -- after any reorg it reflects exactly the blocks that remain.
+                if (tx->transaction.timestamp > senderEntry.lastTxTimestamp) {
+                    senderEntry.lastTxTimestamp = tx->transaction.timestamp;
+                }
                 (void)BalanceSheet_Insert(senderEntry);
 
                 // Credit recipient1
@@ -870,6 +960,58 @@ static void Chain_FreeBlockArray(block_t** blocks, size_t count) {
     }
 
     free(blocks);
+}
+
+bool Chain_BlockRespectsSenderOrdering(const block_t* block) {
+    if (!block || !block->transactions) {
+        return false;
+    }
+
+    const size_t txCount = DynArr_size(block->transactions);
+
+    for (size_t i = 0; i < txCount; ++i) {
+        const signed_transaction_t* tx = (const signed_transaction_t*)DynArr_at(block->transactions, i);
+        if (!tx || Address_IsCoinbase(tx->transaction.senderAddress)) {
+            continue; // coinbase is exempt -- see balance_sheet.h
+        }
+
+        // Baseline is THIS sender's own last included transaction.
+        uint64_t lastSeen = 0;
+        balance_sheet_entry_t senderEntry;
+        if (BalanceSheet_Lookup((uint8_t*)tx->transaction.senderAddress, &senderEntry)) {
+            lastSeen = senderEntry.lastTxTimestamp;
+        }
+
+        /**
+         * Fold in earlier transactions from THE SAME SENDER in this same block, which the sheet
+         * does not know about yet: the ledger applies a block in order, so they must be ordered.
+         *
+         * The sender comparison is load-bearing. Without it this would absorb every other sender's
+         * timestamps and reject ordinary multi-sender blocks -- Alice's transaction would be judged
+         * against Bob's. Senders are strictly independent here.
+         *
+         * Quadratic in the worst case (a whole block from one sender). Fine while blocks are small;
+         * worth a per-sender map if they grow.
+        **/
+        for (size_t j = 0; j < i; ++j) {
+            const signed_transaction_t* prev = (const signed_transaction_t*)DynArr_at(block->transactions, j);
+            if (!prev || Address_IsCoinbase(prev->transaction.senderAddress)) {
+                continue;
+            }
+            if (memcmp(prev->transaction.senderAddress, tx->transaction.senderAddress, 32) != 0) {
+                continue; // different sender -- says nothing about this one's ordering
+            }
+            if (prev->transaction.timestamp > lastSeen) {
+                lastSeen = prev->transaction.timestamp;
+            }
+        }
+
+        if (tx->transaction.timestamp <= lastSeen) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 uint64_t Chain_ReorgPenaltyForDepth(uint64_t reorgDepth) {

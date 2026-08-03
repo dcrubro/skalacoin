@@ -457,6 +457,14 @@ static void* Node_MaintenanceThread(void* arg) {
                 BalanceSheet_SaveToFile(chainDataDir);
             }
         }
+        // Drop transactions too old to be worth holding, so the pool is not inflated by junk that
+        // will never be mined. Policy only -- a block containing one is still accepted.
+        {
+            const size_t pruned = TxMempool_PruneExpired(get_current_time_ms());
+            if (pruned > 0) {
+                printf("Maintenance: pruned %zu expired transaction(s) from the mempool\n", pruned);
+            }
+        }
         // Reclaim outbound slots whose peer has disconnected so they can be reused.
         Node_ReapDeadOutbound(n);
         // Peer discovery tick: ping/query connected peers and connect to the best-ping discoveries.
@@ -1235,7 +1243,14 @@ void Node_Server_OnData(tcp_connection_t* client) {
                     return;
                 }
 
-                // Push to mempool if it's not already present
+                // Push to mempool if it's not already present, subject to admission policy.
+                // Policy only: a block containing this transaction is still accepted even if we
+                // decline to hold or relay it ourselves.
+                if (!TxMempool_PolicyAccepts(&tx, get_current_time_ms())) {
+                    printf("Declined transaction from node %u: timestamp outside the accepted window\n",
+                        client ? client->connectionId : 0U);
+                    return;
+                }
                 if (!TxMempool_Lookup(txHash, &tx)) {
                     if (TxMempool_Insert(tx) >= 0) {
                         printf("Added transaction %s from node %u to mempool\n", txHashHex, client ? client->connectionId : 0U);

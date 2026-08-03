@@ -1,4 +1,5 @@
 #include <txmempool.h>
+#include <constants.h>
 #include <pthread.h>
 
 static pthread_mutex_t g_txMempoolLock;
@@ -10,6 +11,52 @@ void TxMempool_Init() {
     txMempool = kh_init(tx_mempool_map_m);
     pthread_mutex_init(&g_txMempoolLock, NULL);
     g_txMempoolLockInitialized = true;
+}
+
+bool TxMempool_PolicyAccepts(const signed_transaction_t* tx, uint64_t nowMs) {
+    if (!tx) {
+        return false;
+    }
+
+    const uint64_t ts = tx->transaction.timestamp;
+
+    // Dated too far in the future, measured against OUR CLOCK rather than the chain tip -- see the
+    // note in the header. Refusing this also limits the one real footgun in the replay guard: a
+    // wildly future timestamp permanently advances that account's lastTxTimestamp and locks it out
+    // until real time catches up.
+    if (ts > nowMs && (ts - nowMs) > TX_MAX_FUTURE_DRIFT_MS) {
+        return false;
+    }
+
+    // Too old to be worth holding. Not a validity judgement -- just pool hygiene.
+    if (nowMs > ts && (nowMs - ts) > TX_EXPIRY_MS) {
+        return false;
+    }
+
+    return true;
+}
+
+size_t TxMempool_PruneExpired(uint64_t nowMs) {
+    if (!txMempool) {
+        return 0;
+    }
+
+    size_t removed = 0;
+
+    pthread_mutex_lock(&g_txMempoolLock);
+    for (khiter_t k = kh_begin(txMempool); k != kh_end(txMempool); ++k) {
+        if (!kh_exist(txMempool, k)) {
+            continue;
+        }
+        const uint64_t ts = kh_value(txMempool, k).transaction.timestamp;
+        if (nowMs > ts && (nowMs - ts) > TX_EXPIRY_MS) {
+            kh_del(tx_mempool_map_m, txMempool, k);
+            removed++;
+        }
+    }
+    pthread_mutex_unlock(&g_txMempoolLock);
+
+    return removed;
 }
 
 int TxMempool_Insert(signed_transaction_t tx) {

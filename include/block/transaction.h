@@ -23,7 +23,11 @@ static inline bool Address_IsCoinbase(const uint8_t address[32]) {
 // 168 bytes total for v1
 #pragma pack(push, 1) // Ensure no padding for consistent file storage
 typedef struct {
-    uint64_t timestamp; // Unix timestamp in seconds - not enforced, but used for uniqueness when everything else is the same.
+    uint64_t timestamp; // Unix timestamp in MILLISECONDS (get_current_time_ms). Two of a sender's
+                        // transactions must have strictly increasing timestamps -- see
+                        // lastTxTimestamp in balance_sheet.h. Millisecond resolution is what makes
+                        // an exact collision mean 'byte-identical replay' rather than 'two real
+                        // transactions that happened to coincide'.
     uint64_t fee; // Rewarded to the miner; can be zero, but the miner may choose to ignore transactions with very low fees
     uint64_t amount1;
     uint64_t amount2;

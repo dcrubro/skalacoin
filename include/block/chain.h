@@ -90,6 +90,20 @@ bool Chain_IsInitialBlockDownload(blockchain_t* chain);
 // want to report it.
 uint64_t Chain_ReorgPenaltyForDepth(uint64_t reorgDepth);
 
+/**
+ * Replay guard: true if every non-coinbase transaction in `block` is newer than its own sender's
+ * last included transaction, and newer than that same sender's earlier transactions in this block.
+ *
+ * Reads the balance sheet's per-account `lastTxTimestamp` (see balance_sheet.h). Senders are
+ * considered independently -- one account's transactions say nothing about another's ordering, so
+ * an ordinary block full of different senders always passes. Coinbase is exempt.
+ *
+ * Exposed rather than inlined so this can be tested directly; Chain_AddBlockLocked calls it as part
+ * of block validation, which is what makes it apply to mining, sync, broadcast, orphan attach and
+ * reorg alike.
+**/
+bool Chain_BlockRespectsSenderOrdering(const block_t* block);
+
 // Recompute `currentSupply` and `currentReward` from the in-memory chain blocks.
 // Returns true on success and updates runtime state globals.
 bool Chain_RecomputeRuntimeState(blockchain_t* chain);
