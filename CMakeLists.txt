@@ -12,24 +12,73 @@ set(CMAKE_C_EXTENSIONS OFF)
 # ---------------------------------------------------------
 # Build configuration
 #
-#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug     # -Og -g3, ASan+UBSan, GCC -fanalyzer
-#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # -O3, _FORTIFY_SOURCE, no instrumentation
+#   cmake -S . -B build          -DCMAKE_BUILD_TYPE=Debug     # -Og -g3, ASan + UBSan
+#   cmake -S . -B build-strict   -DCMAKE_BUILD_TYPE=Strict    # Debug plus -Werror
+#   cmake -S . -B build-analyzer -DCMAKE_BUILD_TYPE=Analyzer  # -Og -g3, GCC -fanalyzer
+#   cmake -S . -B build-release  -DCMAKE_BUILD_TYPE=Release   # -O3, _FORTIFY_SOURCE
 #
-# Debug is tuned to *find* memory bugs, Release to *survive* them. The warning
-# set is the same in both; only the instrumentation differs.
+# Debug finds memory bugs at run time, Analyzer finds them at compile time,
+# Release survives them. Strict is Debug with warnings promoted to errors — the
+# configuration CI should gate on, kept separate so a new warning never blocks
+# someone mid-debugging. The warning set is identical in all four; only the
+# instrumentation and the error policy differ.
+#
+# Debug and Analyzer are separate configurations rather than one Debug build
+# with everything switched on, because the two tools actively interfere: ASan's
+# instrumentation inflates the CFG enough that -fanalyzer exhausts its
+# exploration budget and silently stops reporting. Measured on
+# src/tcpd/tcpserver.c with GCC 16 — -fanalyzer alone reports the fd leak in
+# TcpServer_Init, -fanalyzer plus ASan reports nothing at all.
+#
+# ThreadSanitizer is deliberately absent: it cannot be combined with ASan, so it
+# would need a third configuration of its own.
 # ---------------------------------------------------------
+set(SKALACOIN_CUSTOM_CONFIGS Strict Analyzer)
+set(SKALACOIN_BUILD_TYPES Debug Strict Analyzer Release RelWithDebInfo MinSizeRel)
+
 get_property(SKALACOIN_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-if(NOT SKALACOIN_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
+if(SKALACOIN_MULTI_CONFIG)
+    foreach(_cfg IN LISTS SKALACOIN_CUSTOM_CONFIGS)
+        if(NOT "${_cfg}" IN_LIST CMAKE_CONFIGURATION_TYPES)
+            list(APPEND CMAKE_CONFIGURATION_TYPES ${_cfg})
+        endif()
+    endforeach()
+elseif(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
     message(STATUS "No CMAKE_BUILD_TYPE specified; defaulting to Debug")
 endif()
-set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS ${SKALACOIN_BUILD_TYPES})
 
-# OFF until src/ is clean under the warning set below; flip it on afterwards so
-# it stays clean.
-option(SKALACOIN_WERROR "Debug: treat warnings as errors" OFF)
-option(SKALACOIN_ENABLE_SANITIZERS "Debug: build with AddressSanitizer + UndefinedBehaviorSanitizer" ON)
-option(SKALACOIN_ENABLE_ANALYZER "Debug: run the compiler's static analyzer (GCC -fanalyzer)" ON)
+# Strict and Analyzer are custom configurations, so CMake has no built-in flags
+# for them. Both inherit Debug's, and imported targets (OpenSSL::Crypto,
+# CURL::libcurl) need a mapping because they only ship Debug/Release/NOCONFIG.
+foreach(_cfg IN LISTS SKALACOIN_CUSTOM_CONFIGS)
+    string(TOUPPER ${_cfg} _cfg_upper)
+    foreach(_lang C CXX)
+        set(CMAKE_${_lang}_FLAGS_${_cfg_upper} "${CMAKE_${_lang}_FLAGS_DEBUG}"
+            CACHE STRING "Flags used by the ${_lang} compiler during ${_cfg} builds.")
+        mark_as_advanced(CMAKE_${_lang}_FLAGS_${_cfg_upper})
+    endforeach()
+    foreach(_linker EXE SHARED MODULE STATIC)
+        set(CMAKE_${_linker}_LINKER_FLAGS_${_cfg_upper} "${CMAKE_${_linker}_LINKER_FLAGS_DEBUG}"
+            CACHE STRING "Flags used by the linker during ${_cfg} builds.")
+        mark_as_advanced(CMAKE_${_linker}_LINKER_FLAGS_${_cfg_upper})
+    endforeach()
+    set(CMAKE_MAP_IMPORTED_CONFIG_${_cfg_upper} Debug "" Release RelWithDebInfo)
+endforeach()
+
+# Debug, Strict and Analyzer share the developer flag set (-Og -g3, warnings).
+set(SKALACOIN_IS_DEBUGLIKE "$<OR:$<CONFIG:Debug>,$<CONFIG:Strict>,$<CONFIG:Analyzer>>")
+# Debug and Strict are the runtime-instrumented pair; Analyzer must stay clean
+# of sanitizers or -fanalyzer goes quiet (see above).
+set(SKALACOIN_IS_SANITIZED "$<OR:$<CONFIG:Debug>,$<CONFIG:Strict>>")
+
+# The Strict configuration always errors on warnings; this option additionally
+# promotes them in Debug and Analyzer. OFF until src/ is clean under the warning
+# set below — until then, build Strict when you want the gate.
+option(SKALACOIN_WERROR "Debug/Analyzer: treat warnings as errors (always on in Strict)" OFF)
+option(SKALACOIN_ENABLE_SANITIZERS "Debug config: AddressSanitizer + UndefinedBehaviorSanitizer" ON)
+option(SKALACOIN_ENABLE_ANALYZER "Analyzer config: the compiler's static analyzer (GCC -fanalyzer)" ON)
 option(SKALACOIN_ENABLE_HARDENING "All configs: stack protector, _FORTIFY_SOURCE, RELRO/NOW, CFI" ON)
 option(SKALACOIN_ENABLE_LTO "Optimized configs: link-time optimization" OFF)
 
@@ -67,15 +116,22 @@ endfunction()
 # Instrumentation such as -fsanitize=address has to reach the linker as well,
 # and is only usable if the matching runtime library actually exists, so the
 # probe hands the flag to both halves of the try-compile.
+#
+# Flags are also probed cumulatively, in the order given: some are only legal in
+# the presence of an earlier one (-fsanitize=pointer-compare is rejected unless
+# -fsanitize=address is already on the command line), and probing it alone would
+# quietly drop it.
 function(skalacoin_append_supported_instrument_flags out_var)
     set(_accepted ${${out_var}})
+    set(_context "")
     foreach(_flag IN LISTS ARGN)
         string(MAKE_C_IDENTIFIER "SKALACOIN_HAS_INSTRUMENT_${_flag}" _cache_var)
-        set(CMAKE_REQUIRED_FLAGS "${SKALACOIN_FLAG_PROBE_STRICT}")
-        set(CMAKE_REQUIRED_LINK_OPTIONS "${_flag}")
+        string(JOIN " " CMAKE_REQUIRED_FLAGS ${SKALACOIN_FLAG_PROBE_STRICT} ${_context})
+        set(CMAKE_REQUIRED_LINK_OPTIONS ${_context} "${_flag}")
         check_c_compiler_flag("${_flag}" ${_cache_var})
         if(${_cache_var})
             list(APPEND _accepted "${_flag}")
+            list(APPEND _context "${_flag}")
         endif()
     endforeach()
     set(${out_var} "${_accepted}" PARENT_SCOPE)
@@ -96,27 +152,32 @@ endfunction()
 # Warnings for our own C code; the per-config flag sets are applied through
 # generator expressions so multi-config generators (Xcode, VS) work too.
 set(SKALACOIN_C_WARNINGS "")
-set(SKALACOIN_C_FLAGS_DEBUG "")
+set(SKALACOIN_C_FLAGS_DEBUGLIKE "")
 set(SKALACOIN_C_FLAGS_OPTIMIZED "")
+# The two instrumentation sets, each owned by one configuration and never both.
+set(SKALACOIN_SANITIZER_FLAGS "")
+set(SKALACOIN_ANALYZER_FLAGS "")
 # Instrumentation that must be handed to the linker as well, and that also
 # covers the vendored code we link in.
 set(SKALACOIN_INSTRUMENT_COMPILE "")
 set(SKALACOIN_INSTRUMENT_LINK "")
 
 if(MSVC)
+    set(SKALACOIN_WERROR_FLAG /WX)
     list(APPEND SKALACOIN_C_WARNINGS /W4 /permissive- /sdl)
-    list(APPEND SKALACOIN_C_FLAGS_DEBUG /Od /RTC1 /GS)
+    list(APPEND SKALACOIN_C_FLAGS_DEBUGLIKE /Od /RTC1 /GS)
     list(APPEND SKALACOIN_C_FLAGS_OPTIMIZED /O2 /GS /guard:cf)
     if(SKALACOIN_WERROR)
-        list(APPEND SKALACOIN_C_FLAGS_DEBUG /WX)
+        list(APPEND SKALACOIN_C_FLAGS_DEBUGLIKE ${SKALACOIN_WERROR_FLAG})
     endif()
     if(SKALACOIN_ENABLE_ANALYZER)
-        list(APPEND SKALACOIN_C_FLAGS_DEBUG /analyze)
+        list(APPEND SKALACOIN_ANALYZER_FLAGS /analyze)
     endif()
     if(SKALACOIN_ENABLE_SANITIZERS)
-        list(APPEND SKALACOIN_INSTRUMENT_COMPILE /fsanitize=address)
+        list(APPEND SKALACOIN_SANITIZER_FLAGS /fsanitize=address)
     endif()
 else()
+    set(SKALACOIN_WERROR_FLAG -Werror)
     # Portable warning set, memory-safety first.
     skalacoin_append_supported_c_flags(SKALACOIN_C_WARNINGS
         -Wall
@@ -167,14 +228,17 @@ else()
             -Wflex-array-member-not-at-end
         )
         # -fanalyzer is a whole-path symbolic execution pass (leaks, double
-        # free, use-after-free, NULL derefs across function boundaries). It is
-        # slow, so Debug only.
+        # free, use-after-free, NULL derefs across function boundaries).
+        # Verbosity 1 prints just the state transitions; raise it to 2+ when a
+        # report needs its full control-flow path.
         if(SKALACOIN_ENABLE_ANALYZER)
-            skalacoin_append_supported_c_flags(SKALACOIN_C_FLAGS_DEBUG -fanalyzer)
+            skalacoin_append_supported_c_flags(SKALACOIN_ANALYZER_FLAGS -fanalyzer-verbosity=1 -fanalyzer)
         endif()
     elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
         # Clang-only diagnostics. Clang has no in-compiler equivalent of
-        # -fanalyzer; run `scan-build cmake --build build` for that.
+        # -fanalyzer, so the Analyzer config is simply an uninstrumented Debug
+        # build here — which is exactly the base `scan-build cmake --build
+        # build-analyzer` wants.
         skalacoin_append_supported_c_flags(SKALACOIN_C_WARNINGS
             -Warray-bounds-pointer-arithmetic
             -Wconditional-uninitialized
@@ -190,17 +254,17 @@ else()
     # -Og keeps the code steppable while still running the optimizer passes
     # that -Wmaybe-uninitialized / -Wstringop-* rely on; at -O0 those warnings
     # go quiet. -fno-omit-frame-pointer buys readable sanitizer backtraces.
-    skalacoin_append_supported_c_flags(SKALACOIN_C_FLAGS_DEBUG
+    skalacoin_append_supported_c_flags(SKALACOIN_C_FLAGS_DEBUGLIKE
         -Og
         -g3
         -fno-omit-frame-pointer
     )
     if(SKALACOIN_WERROR)
-        list(APPEND SKALACOIN_C_FLAGS_DEBUG -Werror)
+        list(APPEND SKALACOIN_C_FLAGS_DEBUGLIKE ${SKALACOIN_WERROR_FLAG})
     endif()
 
     if(SKALACOIN_ENABLE_HARDENING)
-        skalacoin_append_supported_c_flags(SKALACOIN_C_FLAGS_DEBUG
+        skalacoin_append_supported_c_flags(SKALACOIN_C_FLAGS_DEBUGLIKE
             -fstack-protector-strong
         )
         # _FORTIFY_SOURCE needs an optimized build to see through the buffer
@@ -223,18 +287,31 @@ else()
     endif()
 
     if(SKALACOIN_ENABLE_SANITIZERS)
+        # Everything that composes with ASan. LeakSanitizer is not listed
+        # because ASan already includes it where it is supported, and
+        # -fsanitize=leak cannot be combined with -fsanitize=address.
         # -fno-sanitize-recover makes UB abort instead of printing and
         # continuing, so a bad shift or overflow cannot be ignored in CI.
-        set(SKALACOIN_SANITIZER_FLAGS "")
+        # pointer-compare/pointer-subtract additionally need
+        # ASAN_OPTIONS=detect_invalid_pointer_pairs=2 at run time.
         skalacoin_append_supported_instrument_flags(SKALACOIN_SANITIZER_FLAGS
             -fsanitize=address
+            -fsanitize-address-use-after-scope
+            -fsanitize=pointer-compare
+            -fsanitize=pointer-subtract
             -fsanitize=undefined
+            -fsanitize=bounds-strict
             -fno-sanitize-recover=undefined
             -fno-omit-frame-pointer
         )
-        list(APPEND SKALACOIN_INSTRUMENT_COMPILE "$<$<CONFIG:Debug>:${SKALACOIN_SANITIZER_FLAGS}>")
-        list(APPEND SKALACOIN_INSTRUMENT_LINK "$<$<CONFIG:Debug>:${SKALACOIN_SANITIZER_FLAGS}>")
     endif()
+endif()
+
+# Each instrumentation set belongs to exactly one configuration. Keeping them in
+# separate configs is the point of the Analyzer build, so never emit both.
+if(SKALACOIN_SANITIZER_FLAGS)
+    list(APPEND SKALACOIN_INSTRUMENT_COMPILE "$<${SKALACOIN_IS_SANITIZED}:${SKALACOIN_SANITIZER_FLAGS}>")
+    list(APPEND SKALACOIN_INSTRUMENT_LINK "$<${SKALACOIN_IS_SANITIZED}:${SKALACOIN_SANITIZER_FLAGS}>")
 endif()
 
 if(SKALACOIN_ENABLE_LTO)
@@ -427,7 +504,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-foreach(OUTPUTCONFIG DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+foreach(OUTPUTCONFIG DEBUG STRICT ANALYZER RELEASE RELWITHDEBINFO MINSIZEREL)
     string(TOUPPER ${OUTPUTCONFIG} OUTPUTCONFIG_UPPER)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${OUTPUTCONFIG_UPPER} ${CMAKE_BINARY_DIR}/bin)
     set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${OUTPUTCONFIG_UPPER} ${CMAKE_BINARY_DIR}/lib)
@@ -464,8 +541,13 @@ target_include_directories(node PRIVATE
 target_compile_options(node PRIVATE
     "${SKALACOIN_C_WARNINGS}"
     "${SKALACOIN_INSTRUMENT_COMPILE}"
-    "$<$<CONFIG:Debug>:${SKALACOIN_C_FLAGS_DEBUG}>"
-    "$<$<NOT:$<CONFIG:Debug>>:${SKALACOIN_C_FLAGS_OPTIMIZED}>"
+    "$<${SKALACOIN_IS_DEBUGLIKE}:${SKALACOIN_C_FLAGS_DEBUGLIKE}>"
+    "$<$<NOT:${SKALACOIN_IS_DEBUGLIKE}>:${SKALACOIN_C_FLAGS_OPTIMIZED}>"
+    # The static analyzer runs on our C sources only, never on the vendored
+    # C++ below, and never alongside the sanitizers.
+    "$<$<CONFIG:Analyzer>:${SKALACOIN_ANALYZER_FLAGS}>"
+    # Strict is Debug with the warning set turned into a build gate.
+    "$<$<CONFIG:Strict>:${SKALACOIN_WERROR_FLAG}>"
 )
 target_link_options(node PRIVATE "${SKALACOIN_INSTRUMENT_LINK}")
 
@@ -492,8 +574,12 @@ set_target_properties(node PROPERTIES OUTPUT_NAME "skalacoin_node")
 # ---------------------------------------------------------
 message(STATUS "skalacoin: build type      ${CMAKE_BUILD_TYPE}")
 message(STATUS "skalacoin: compiler        ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
-message(STATUS "skalacoin: warnings-as-err ${SKALACOIN_WERROR}")
-message(STATUS "skalacoin: sanitizers      ${SKALACOIN_ENABLE_SANITIZERS} (Debug only) [${SKALACOIN_SANITIZER_FLAGS}]")
-message(STATUS "skalacoin: static analyzer ${SKALACOIN_ENABLE_ANALYZER} (Debug only, GCC)")
+message(STATUS "skalacoin: warnings-as-err ${SKALACOIN_WERROR} (always on in Strict)")
+message(STATUS "skalacoin: sanitizers      [Debug/Strict] ${SKALACOIN_SANITIZER_FLAGS}")
+message(STATUS "skalacoin: static analyzer [Analyzer]     ${SKALACOIN_ANALYZER_FLAGS}")
 message(STATUS "skalacoin: hardening       ${SKALACOIN_ENABLE_HARDENING}")
 message(STATUS "skalacoin: LTO             ${SKALACOIN_ENABLE_LTO}")
+if(CMAKE_BUILD_TYPE STREQUAL "Analyzer" AND NOT SKALACOIN_ANALYZER_FLAGS)
+    message(STATUS "skalacoin: NOTE - Analyzer config has no static analyzer on "
+                   "${CMAKE_C_COMPILER_ID}; use scan-build over this build tree")
+endif()

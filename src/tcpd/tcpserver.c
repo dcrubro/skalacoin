@@ -93,6 +93,15 @@ static void* TcpServer_clientthreadprocess(void* ptr) {
     return NULL;
 }
 
+// listenFd is borrowed, not owned: it is ptr->sockFd / ptr->sockFdV4, handed
+// over by TcpServer_Start and closed by TcpServer_Stop. GCC's -fanalyzer infers
+// from accept() that the fd is open and then holds this function responsible
+// for closing it, so it reports a leak on every path that leaves the loop.
+// Clang does not know this warning group, hence the guard.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+#endif
 static void* TcpServer_threadprocess(void* ptr) {
     tcpaccept_thread_args_t* args = (tcpaccept_thread_args_t*)ptr;
     if (!args || !args->serverPtr) {
@@ -188,6 +197,9 @@ static void* TcpServer_threadprocess(void* ptr) {
 
     return NULL;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 tcp_server_t* TcpServer_Create() {
     tcp_server_t* svr = (tcp_server_t*)malloc(sizeof(*svr));
@@ -274,6 +286,14 @@ void TcpServer_Init(tcp_server_t* ptr, unsigned short port, const char* addr) {
     }
 }
 
+// Same borrowed-fd false positive as TcpServer_threadprocess: listen() teaches
+// -fanalyzer that ptr->sockFd / ptr->sockFdV4 are open passive sockets, so it
+// expects this function to close them. They belong to the tcp_server_t and are
+// closed by TcpServer_Stop.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+#endif
 void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
     if (!ptr || (ptr->sockFd < 0 && ptr->sockFdV4 < 0) || maxcons <= 0 || ptr->isRunning) {
         return;
@@ -347,6 +367,9 @@ void TcpServer_Start(tcp_server_t* ptr, int maxcons) {
         pthread_mutex_unlock(&ptr->clientsMutex);
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 void TcpServer_Stop(tcp_server_t* ptr) {
     if (!ptr || !ptr->isRunning) {

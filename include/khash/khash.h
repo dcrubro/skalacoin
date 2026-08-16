@@ -113,7 +113,6 @@ int main() {
 	* Added destructor
 */
 
-
 #ifndef __AC_KHASH_H
 #define __AC_KHASH_H
 

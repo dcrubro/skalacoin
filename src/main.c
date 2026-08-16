@@ -767,7 +767,7 @@ static bool VerifyChainFully(blockchain_t* chain) {
 }
 
 // Use when error
-void KillEverythingAndExit(net_node_t* node, blockchain_t* chain) {
+[[noreturn]] void KillEverythingAndExit(net_node_t* node, blockchain_t* chain) {
     Node_Destroy(node);
     currentChain = NULL;
     Chain_Destroy(chain);
@@ -918,18 +918,21 @@ int main(int argc, char* argv[]) {
         if (read != 32) {
             fprintf(stderr, "failed to read wallet file\n");
             fclose(walletFile);
+            KillEverythingAndExit(node, chain);
         }
 
         read = fread(minerCompressedPubkey, 1, 33, walletFile);
         if (read != 33) {
             fprintf(stderr, "failed to read wallet file\n");
             fclose(walletFile);
+            KillEverythingAndExit(node, chain);
         }
 
         read = fread(minerAddress, 1, 32, walletFile);
         if (read != 32) {
             fprintf(stderr, "failed to read wallet file\n");
             fclose(walletFile);
+            KillEverythingAndExit(node, chain);
         }
 
         fclose(walletFile);
