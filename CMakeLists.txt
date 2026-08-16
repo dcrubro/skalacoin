@@ -79,6 +79,17 @@ set(SKALACOIN_IS_SANITIZED "$<OR:$<CONFIG:Debug>,$<CONFIG:Strict>>")
 option(SKALACOIN_WERROR "Debug/Analyzer: treat warnings as errors (always on in Strict)" OFF)
 option(SKALACOIN_ENABLE_SANITIZERS "Debug config: AddressSanitizer + UndefinedBehaviorSanitizer" ON)
 option(SKALACOIN_ENABLE_ANALYZER "Analyzer config: the compiler's static analyzer (GCC -fanalyzer)" ON)
+
+# How much of the control-flow path -fanalyzer prints per report. 1 lists only
+# the state transitions (opened here / first close here / leaks here), which is
+# what you want while triaging; raise it when a report needs the branch-by-branch
+# path that explains how it got there. GCC silently accepts out-of-range values,
+# so validate here instead.
+set(ANALYZER_VERBOSITY 1 CACHE STRING "Analyzer config: -fanalyzer path detail, 0 (terse) to 5 (full)")
+set_property(CACHE ANALYZER_VERBOSITY PROPERTY STRINGS 0 1 2 3 4 5)
+if(NOT ANALYZER_VERBOSITY MATCHES "^[0-5]$")
+    message(FATAL_ERROR "ANALYZER_VERBOSITY must be an integer from 0 to 5, got '${ANALYZER_VERBOSITY}'")
+endif()
 option(SKALACOIN_ENABLE_HARDENING "All configs: stack protector, _FORTIFY_SOURCE, RELRO/NOW, CFI" ON)
 option(SKALACOIN_ENABLE_LTO "Optimized configs: link-time optimization" OFF)
 
@@ -229,10 +240,11 @@ else()
         )
         # -fanalyzer is a whole-path symbolic execution pass (leaks, double
         # free, use-after-free, NULL derefs across function boundaries).
-        # Verbosity 1 prints just the state transitions; raise it to 2+ when a
-        # report needs its full control-flow path.
         if(SKALACOIN_ENABLE_ANALYZER)
-            skalacoin_append_supported_c_flags(SKALACOIN_ANALYZER_FLAGS -fanalyzer-verbosity=1 -fanalyzer)
+            skalacoin_append_supported_c_flags(SKALACOIN_ANALYZER_FLAGS
+                -fanalyzer-verbosity=${ANALYZER_VERBOSITY}
+                -fanalyzer
+            )
         endif()
     elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
         # Clang-only diagnostics. Clang has no in-compiler equivalent of
@@ -535,8 +547,16 @@ if(SKALACOIN_AUTOLYKOS2_REF_AVAILABLE)
     target_link_libraries(node PRIVATE autolykos2_ref)
 endif()
 
-target_include_directories(node PRIVATE 
+target_include_directories(node PRIVATE
     ${PROJECT_SOURCE_DIR}/include
+)
+# khash is vendored third-party code we cannot fix, and it accounts for half the
+# warnings under Strict. SYSTEM turns -I into -isystem, which suppresses
+# diagnostics from headers found through it. It needs its own search path: via
+# ${PROJECT_SOURCE_DIR}/include the header resolves through the plain -I above
+# and stays a normal header, so the sources include it as <khash.h>.
+target_include_directories(node SYSTEM PRIVATE
+    ${PROJECT_SOURCE_DIR}/include/khash
 )
 target_compile_options(node PRIVATE
     "${SKALACOIN_C_WARNINGS}"

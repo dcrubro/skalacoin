@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <khash/khash.h>
+#include <khash.h>
 #include <crypto/crypto.h>
 #include <block/transaction.h>
 #include <string.h>
@@ -33,7 +33,17 @@ typedef struct {
     // TODO: Additional things
 } balance_sheet_entry_t;
 
+// KHASH_INIT expands to khash's own implementation, which is not -Wconversion
+// clean. -isystem silences the header itself but not code expanded from its
+// macros, because the diagnostic is attributed to this line.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wconversion"
+#endif
 KHASH_INIT(balance_sheet_map_m, key32_t, balance_sheet_entry_t, 1, hash_key32, eq_key32)
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 extern khash_t(balance_sheet_map_m)* sheetMap;
 
 void BalanceSheet_Init();

@@ -2,11 +2,20 @@
 #define TXMEMPOOL_H
 
 #include <block/transaction.h>
-#include <khash/khash.h>
+#include <khash.h>
 #include <utils.h>
 #include <uint256.h>
 
+// See balance_sheet.h: khash's macro expansion is not -Wconversion clean, and
+// -isystem does not cover code expanded from a system header's macros.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wconversion"
+#endif
 KHASH_INIT(tx_mempool_map_m, key32_t, signed_transaction_t, 1, hash_key32, eq_key32)
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 extern khash_t(tx_mempool_map_m)* txMempool;
 
 void TxMempool_Init();
