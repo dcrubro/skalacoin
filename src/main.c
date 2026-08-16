@@ -1390,9 +1390,14 @@ int main(int argc, char* argv[]) {
             uint64_t nextReq = start;
 
             const int maxInFlight = MAX_PARALLEL_FETCHES;
-            uint64_t requestedHeights[64];
-            int retryCount[64];
-            uint64_t sentAtMs[64];
+            // Zeroed so a slot is never read before it is written. Slots below
+            // inFlight are always initialized by the fill loop, but that is a
+            // loop invariant -fanalyzer cannot prove, and an explicit
+            // initializer is cheaper than teaching it (one memset per sync
+            // command) and survives future changes to the fill logic.
+            uint64_t requestedHeights[64] = {0};
+            int retryCount[64] = {0};
+            uint64_t sentAtMs[64] = {0};
             int inFlight = 0;
 
             if (maxInFlight > (int)(sizeof(requestedHeights)/sizeof(requestedHeights[0]))) {

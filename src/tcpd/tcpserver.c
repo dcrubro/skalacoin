@@ -238,6 +238,16 @@ void TcpServer_Destroy(tcp_server_t* ptr) {
     free(ptr);
 }
 
+// Both sockets are handed to the caller through ptr->sockFd / ptr->sockFdV4 and
+// closed by TcpServer_Stop, so neither leaks. -fanalyzer loses track of the
+// first store across the second socket's branches and reports it anyway; the
+// report is positional, not semantic — swapping the IPv6 and IPv4 blocks moves
+// the warning from fd6 to fd4, and deleting the unrelated second block silences
+// it entirely.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+#endif
 void TcpServer_Init(tcp_server_t* ptr, unsigned short port, const char* addr) {
     if (!ptr || !addr) {
         return;
@@ -285,6 +295,9 @@ void TcpServer_Init(tcp_server_t* ptr, unsigned short port, const char* addr) {
         }
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 // Same borrowed-fd false positive as TcpServer_threadprocess: listen() teaches
 // -fanalyzer that ptr->sockFd / ptr->sockFdV4 are open passive sockets, so it

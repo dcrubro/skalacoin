@@ -181,6 +181,14 @@ static void* UdpNode_RetryThreadProc(void* arg) {
     return NULL;
 }
 
+// Same borrowed/escaped-fd false positive as TcpServer_Init: both sockets are
+// handed to the caller through node->sockFd / node->sockFdV4 and closed by
+// UdpNode_Stop. -fanalyzer loses the first store across the second socket's
+// branches and reports it as a leak.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+#endif
 int UdpNode_Init(udp_node_t* node, uint16_t port) {
     if (!node) {
         return -1;
@@ -237,6 +245,9 @@ int UdpNode_Init(udp_node_t* node, uint16_t port) {
     pthread_mutex_init(&node->pingsMutex, NULL);
     return 0;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 void UdpNode_SetCallbacks(udp_node_t* node,
         void (*on_pong)(udp_node_t*, const struct sockaddr_storage*, uint64_t, int, uint64_t, void*),
