@@ -513,20 +513,32 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
     memcpy(&txCount, payload + offset, sizeof(txCount));
     offset += sizeof(txCount);
 
-    blk->transactions = DYNARR_CREATE(signed_transaction_t, txCount == 0 ? 1 : (size_t)txCount);
-    if (!blk->transactions) { free(blk); return NODE_BLOCK_REJECTED; }
+    // The count is peer-supplied, so never size an allocation from more transactions than the
+    // payload can actually carry. Such a block fails the length check in the loop below anyway;
+    // rejecting it here just stops a peer from making us reserve memory for it first.
+    if (txCount > (payloadLen - offset) / sizeof(signed_transaction_t)) {
+        free(blk);
+        return NODE_BLOCK_REJECTED;
+    }
+
+    blk->transactions = vector_create(sizeof(signed_transaction_t));
+    if (!blk->transactions || vector_reserve(blk->transactions, (size_t)txCount) != 0) {
+        vector_destroy(&blk->transactions);
+        free(blk);
+        return NODE_BLOCK_REJECTED;
+    }
 
     for (uint64_t i = 0; i < txCount; ++i) {
         if (offset + sizeof(signed_transaction_t) > payloadLen) {
-            DynArr_destroy(blk->transactions);
+            vector_destroy(&blk->transactions);
             free(blk);
             return NODE_BLOCK_REJECTED;
         }
         signed_transaction_t tx;
         memcpy(&tx, payload + offset, sizeof(tx));
         offset += sizeof(tx);
-        if (!DynArr_push_back(blk->transactions, &tx)) {
-            DynArr_destroy(blk->transactions);
+        if (vector_push_back(blk->transactions, &tx) != 0) {
+            vector_destroy(&blk->transactions);
             free(blk);
             return NODE_BLOCK_REJECTED;
         }
@@ -536,7 +548,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
     // seed are derived from it), so there is nothing to validate against without a chain.
     if (!currentChain) {
         printf("Rejected BLOCK_DATA at height %" PRIu64 ": no active chain\n", blockHeight);
-        DynArr_destroy(blk->transactions);
+        vector_destroy(&blk->transactions);
         free(blk);
         return NODE_BLOCK_REJECTED;
     }
@@ -551,7 +563,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
     // impossible to assemble. Deferring costs at most a slot in a pool that is already capped.
     if (!Block_HasValidStructure(blk)) {
         printf("Rejected BLOCK_DATA at height %" PRIu64 " during validation\n", blockHeight);
-        DynArr_destroy(blk->transactions);
+        vector_destroy(&blk->transactions);
         free(blk);
         return NODE_BLOCK_REJECTED;
     }
@@ -588,7 +600,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
 
             if (memcmp(localHash, incomingHash, 32) == 0) {
                 // Exactly the block we already have.
-                DynArr_destroy(blk->transactions);
+                vector_destroy(&blk->transactions);
                 free(blk);
                 return NODE_BLOCK_DUPLICATE;
             }
@@ -695,7 +707,7 @@ net_node_t* Node_Create() {
     // Initialize outbound lock and seen-block cache
     pthread_mutex_init(&node->seenLock, NULL);
     pthread_mutex_init(&node->outboundLock, NULL);
-    node->seenBlocks = DynSet_Create(32); // 32-byte canonical hashes
+    node->seenBlocks = set_create(32); // 32-byte canonical hashes; raw bytes, so memcmp equality is right
     TxMempool_Init();
 
     TcpServer_Init(node->server, listenPort, "::");
@@ -812,10 +824,7 @@ void Node_Destroy(net_node_t* node) {
     OrphanPool_Destroy();
     TxMempool_Destroy();
 
-    if (node->seenBlocks) {
-        DynSet_Destroy(node->seenBlocks);
-        node->seenBlocks = NULL;
-    }
+    set_destroy(&node->seenBlocks);
     pthread_mutex_destroy(&node->seenLock);
     pthread_mutex_destroy(&node->outboundLock);
 
@@ -1153,11 +1162,11 @@ void Node_Server_OnData(tcp_connection_t* client) {
             if (loadedFromDisk) {
                 printf("Serving block %" PRIu64 " from disk with %zu transaction(s)\n",
                     requestedHeight,
-                    DynArr_size(block->transactions));
+                    vector_size(block->transactions));
             }
 
             // Serialize into a BLOCK_DATA packet [block header][tx count - 8 bytes][transactions...]
-            size_t txCount = block->transactions ? DynArr_size(block->transactions) : 0;
+            size_t txCount = vector_size(block->transactions);
             size_t blockDataSize = sizeof(uint64_t) + sizeof(block_header_t) + sizeof(uint64_t) + (txCount * sizeof(signed_transaction_t));
             unsigned char* blockData = (unsigned char*)malloc(blockDataSize);
             if (!blockData) {
@@ -1181,7 +1190,10 @@ void Node_Server_OnData(tcp_connection_t* client) {
             offset += sizeof(txCount64);
             if (block->transactions && txCount > 0) {
                 for (size_t ti = 0; ti < txCount; ++ti) {
-                    signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, ti);
+                    signed_transaction_t* tx = (signed_transaction_t*)vector_get(block->transactions, ti);
+                    if (!tx) {
+                        break;
+                    }
                     memcpy(blockData + offset, tx, sizeof(signed_transaction_t));
                     offset += sizeof(signed_transaction_t);
                 }
@@ -1645,7 +1657,7 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
         // peer was connected (or while every peer was filtered out below) was never offered again.
         int seen = 0;
         pthread_mutex_lock(&node->seenLock);
-        if (DynSet_Contains(node->seenBlocks, hash)) {
+        if (set_contains(node->seenBlocks, hash)) {
             seen = 1;
         }
         pthread_mutex_unlock(&node->seenLock);
@@ -1656,7 +1668,7 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
         }
 
         // Serialize payload: [uint64_t height][block_header_t][uint64_t txCount][transactions...]
-        size_t txCount = DynArr_size(blk->transactions);
+        size_t txCount = vector_size(blk->transactions);
         size_t payloadLen = sizeof(uint64_t) + sizeof(block_header_t) + sizeof(uint64_t) + (txCount * sizeof(signed_transaction_t));
         unsigned char* payload = (unsigned char*)malloc(payloadLen);
         if (!payload) {
@@ -1670,7 +1682,8 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
         uint64_t txCount64 = (uint64_t)txCount;
         memcpy(payload + off, &txCount64, sizeof(txCount64)); off += sizeof(txCount64);
         for (size_t ti = 0; ti < txCount; ++ti) {
-            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, ti);
+            signed_transaction_t* tx = (signed_transaction_t*)vector_get(blk->transactions, ti);
+            if (!tx) break;
             memcpy(payload + off, tx, sizeof(signed_transaction_t)); off += sizeof(signed_transaction_t);
         }
 
@@ -1751,7 +1764,7 @@ void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp
 
         if (delivered > 0) {
             pthread_mutex_lock(&node->seenLock);
-            DynSet_Insert(node->seenBlocks, hash);
+            (void)set_insert(node->seenBlocks, hash);
             pthread_mutex_unlock(&node->seenLock);
         }
 

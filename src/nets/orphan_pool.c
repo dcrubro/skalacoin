@@ -1,6 +1,6 @@
 #include <nets/orphan_pool.h>
 #include <constants.h>
-#include <dynarr.h>
+#include <dlibc/vector.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +14,7 @@ typedef struct {
     uint8_t hash[32];
 } orphan_entry_t;
 
-static DynArr* g_orphans = NULL;
+static vector_t* g_orphans = NULL;
 static uint64_t g_nextSequence = 0;
 
 // The pool is touched by the maintenance thread, by every per-peer TCP thread and by the REPL
@@ -26,9 +26,18 @@ static uint64_t g_nextSequence = 0;
 // Chain_ReplaceBranch/Chain_AddBlock called.
 static pthread_mutex_t g_orphanLock = PTHREAD_MUTEX_INITIALIZER;
 
+// Element destructor for `g_orphans`: an entry owns its block, so dropping or evicting an entry
+// frees the block along with it. OrphanPool_TakeByHashLocked hands a block out through
+// vector_take_at(), which deliberately skips this. Block_Destroy accepts NULL.
+static void OrphanPool_EntryDestructor(void* element) {
+    orphan_entry_t* e = (orphan_entry_t*)element;
+    Block_Destroy(e->block);
+}
+
 static void OrphanPool_InitLocked(void) {
     if (!g_orphans) {
-        g_orphans = DYNARR_CREATE(orphan_entry_t, 16);
+        g_orphans = vector_create(sizeof(orphan_entry_t));
+        vector_set_destructor(g_orphans, OrphanPool_EntryDestructor);
     }
 }
 
@@ -40,17 +49,7 @@ void OrphanPool_Init(void) {
 
 void OrphanPool_Destroy(void) {
     pthread_mutex_lock(&g_orphanLock);
-    if (g_orphans) {
-        size_t n = DynArr_size(g_orphans);
-        for (size_t i = 0; i < n; ++i) {
-            orphan_entry_t* e = (orphan_entry_t*)DynArr_at(g_orphans, i);
-            if (e && e->block) {
-                Block_Destroy(e->block);
-            }
-        }
-        DynArr_destroy(g_orphans);
-        g_orphans = NULL;
-    }
+    vector_destroy(&g_orphans); // The element destructor frees every pooled block
     pthread_mutex_unlock(&g_orphanLock);
 }
 
@@ -59,9 +58,9 @@ static ssize_t OrphanPool_FindByHashLocked(const uint8_t blockHash[32]) {
         return -1;
     }
 
-    size_t n = DynArr_size(g_orphans);
+    size_t n = vector_size(g_orphans);
     for (size_t i = 0; i < n; ++i) {
-        orphan_entry_t* e = (orphan_entry_t*)DynArr_at(g_orphans, i);
+        orphan_entry_t* e = (orphan_entry_t*)vector_get(g_orphans, i);
         if (e && memcmp(e->hash, blockHash, 32) == 0) {
             return (ssize_t)i;
         }
@@ -77,7 +76,7 @@ static bool OrphanPool_EvictOldestLocked(void) {
         return false;
     }
 
-    size_t n = DynArr_size(g_orphans);
+    size_t n = vector_size(g_orphans);
     if (n == 0) {
         return false;
     }
@@ -85,18 +84,14 @@ static bool OrphanPool_EvictOldestLocked(void) {
     size_t oldestIndex = 0;
     uint64_t oldestSequence = UINT64_MAX;
     for (size_t i = 0; i < n; ++i) {
-        orphan_entry_t* e = (orphan_entry_t*)DynArr_at(g_orphans, i);
+        orphan_entry_t* e = (orphan_entry_t*)vector_get(g_orphans, i);
         if (e && e->sequence < oldestSequence) {
             oldestSequence = e->sequence;
             oldestIndex = i;
         }
     }
 
-    orphan_entry_t* victim = (orphan_entry_t*)DynArr_at(g_orphans, oldestIndex);
-    if (victim && victim->block) {
-        Block_Destroy(victim->block);
-    }
-    DynArr_remove(g_orphans, oldestIndex);
+    vector_pop_at(g_orphans, oldestIndex); // The element destructor frees the victim's block
     return true;
 }
 
@@ -124,7 +119,7 @@ void OrphanPool_Insert(block_t* block, uint64_t height, uint64_t observedAtTipHe
         return;
     }
 
-    while (DynArr_size(g_orphans) >= MAX_ORPHAN_BLOCKS) {
+    while (vector_size(g_orphans) >= MAX_ORPHAN_BLOCKS) {
         if (!OrphanPool_EvictOldestLocked()) {
             break;
         }
@@ -138,9 +133,9 @@ void OrphanPool_Insert(block_t* block, uint64_t height, uint64_t observedAtTipHe
     e.sequence = g_nextSequence++;
     memcpy(e.hash, blockHash, 32);
 
-    if (!DynArr_push_back(g_orphans, &e)) {
+    if (vector_push_back(g_orphans, &e) != 0) {
         pthread_mutex_unlock(&g_orphanLock);
-        Block_Destroy(block);
+        Block_Destroy(block); // never pooled, so the pool does not own it
         return;
     }
 
@@ -156,23 +151,25 @@ bool OrphanPool_Contains(const uint8_t blockHash[32]) {
 
 size_t OrphanPool_Size(void) {
     pthread_mutex_lock(&g_orphanLock);
-    size_t n = g_orphans ? DynArr_size(g_orphans) : 0;
+    size_t n = vector_size(g_orphans);
     pthread_mutex_unlock(&g_orphanLock);
     return n;
 }
 
 // Remove the entry with this hash without freeing the block, and hand the block back. Used once a
-// block has been given to the chain, which then owns its transaction array.
+// block has been given to the chain, which then owns its transaction array. vector_take_at() skips
+// the element destructor, which is what moves ownership of the block to the caller.
 static block_t* OrphanPool_TakeByHashLocked(const uint8_t blockHash[32]) {
     ssize_t index = OrphanPool_FindByHashLocked(blockHash);
     if (index < 0) {
         return NULL;
     }
 
-    orphan_entry_t* e = (orphan_entry_t*)DynArr_at(g_orphans, (size_t)index);
-    block_t* blk = e ? e->block : NULL;
-    DynArr_remove(g_orphans, (size_t)index);
-    return blk;
+    orphan_entry_t entry;
+    if (vector_take_at(g_orphans, (size_t)index, &entry) != 0) {
+        return NULL;
+    }
+    return entry.block;
 }
 
 static void OrphanPool_DropByHashLocked(const uint8_t blockHash[32]) {
@@ -181,11 +178,7 @@ static void OrphanPool_DropByHashLocked(const uint8_t blockHash[32]) {
         return;
     }
 
-    orphan_entry_t* e = (orphan_entry_t*)DynArr_at(g_orphans, (size_t)index);
-    if (e && e->block) {
-        Block_Destroy(e->block);
-    }
-    DynArr_remove(g_orphans, (size_t)index);
+    vector_pop_at(g_orphans, (size_t)index); // The element destructor frees the block
 }
 
 /**
@@ -201,9 +194,9 @@ static bool OrphanPool_FindChildLocked(uint64_t height,
         return false;
     }
 
-    size_t n = DynArr_size(g_orphans);
+    size_t n = vector_size(g_orphans);
     for (size_t i = 0; i < n; ++i) {
-        orphan_entry_t* e = (orphan_entry_t*)DynArr_at(g_orphans, i);
+        orphan_entry_t* e = (orphan_entry_t*)vector_get(g_orphans, i);
         if (!e || !e->block) {
             continue;
         }
@@ -240,11 +233,11 @@ static size_t OrphanPool_CollectBranchLocked(uint64_t forkHeight,
     *outHashes = NULL;
     *outObservedAtTipHeight = 0;
 
-    DynArr* collected = DYNARR_CREATE(block_t*, 8);
-    DynArr* hashes = DYNARR_CREATE(uint8_t, 8 * 32);
+    vector_t* collected = vector_create(sizeof(block_t*));
+    vector_t* hashes = vector_create(32); // one whole 32-byte block hash per element, index-aligned with collected
     if (!collected || !hashes) {
-        if (collected) DynArr_destroy(collected);
-        if (hashes) DynArr_destroy(hashes);
+        vector_destroy(&collected);
+        vector_destroy(&hashes);
         return 0;
     }
 
@@ -263,13 +256,13 @@ static size_t OrphanPool_CollectBranchLocked(uint64_t forkHeight,
             break;
         }
 
-        if (!DynArr_push_back(collected, &child)) {
+        // A block only counts once both pushes have landed, so the two vectors never drift out of
+        // step: the copy-out below reads index i from both.
+        if (vector_push_back(collected, &child) != 0) {
             break;
         }
-        for (size_t b = 0; b < 32; ++b) {
-            if (!DynArr_push_back(hashes, &childHash[b])) {
-                break;
-            }
+        if (vector_push_back(hashes, childHash) != 0) {
+            break;
         }
 
         if (observed < earliestObserved) {
@@ -282,8 +275,8 @@ static size_t OrphanPool_CollectBranchLocked(uint64_t forkHeight,
     }
 
     if (count == 0) {
-        DynArr_destroy(collected);
-        DynArr_destroy(hashes);
+        vector_destroy(&collected);
+        vector_destroy(&hashes);
         return 0;
     }
 
@@ -292,20 +285,24 @@ static size_t OrphanPool_CollectBranchLocked(uint64_t forkHeight,
     if (!blocks || !hashOut) {
         free(blocks);
         free(hashOut);
-        DynArr_destroy(collected);
-        DynArr_destroy(hashes);
+        vector_destroy(&collected);
+        vector_destroy(&hashes);
         return 0;
     }
 
     for (size_t i = 0; i < count; ++i) {
-        blocks[i] = *(block_t**)DynArr_at(collected, i);
-        for (size_t b = 0; b < 32; ++b) {
-            hashOut[i * 32 + b] = *(uint8_t*)DynArr_at(hashes, i * 32 + b);
+        block_t** blockSlot = (block_t**)vector_get(collected, i);
+        const uint8_t* hashSlot = (const uint8_t*)vector_get_const(hashes, i);
+        if (!blockSlot || !hashSlot) {
+            count = i; // never hand back a branch with a hole in it
+            break;
         }
+        blocks[i] = *blockSlot;
+        memcpy(&hashOut[i * 32], hashSlot, 32);
     }
 
-    DynArr_destroy(collected);
-    DynArr_destroy(hashes);
+    vector_destroy(&collected);
+    vector_destroy(&hashes);
 
     *outBlocks = blocks;
     *outHashes = hashOut;
@@ -324,39 +321,43 @@ static void OrphanPool_PruneStale(blockchain_t* chain) {
     const size_t chainSize = Chain_Size(chain);
 
     // Collect the hashes to drop first, so we never call into chain.c while holding the pool lock.
-    DynArr* doomed = DYNARR_CREATE(uint8_t, 32);
+    vector_t* doomed = vector_create(32); // one whole 32-byte block hash per element
     if (!doomed) {
         return;
     }
 
     pthread_mutex_lock(&g_orphanLock);
-    size_t n = g_orphans ? DynArr_size(g_orphans) : 0;
-    DynArr* candidates = DYNARR_CREATE(uint8_t, 32);
-    DynArr* candidateHeights = DYNARR_CREATE(uint64_t, 8);
+    size_t n = vector_size(g_orphans);
+    vector_t* candidates = vector_create(32); // index-aligned with candidateHeights
+    vector_t* candidateHeights = vector_create(sizeof(uint64_t));
     if (candidates && candidateHeights) {
         for (size_t i = 0; i < n; ++i) {
-            orphan_entry_t* e = (orphan_entry_t*)DynArr_at(g_orphans, i);
+            orphan_entry_t* e = (orphan_entry_t*)vector_get(g_orphans, i);
             if (!e || !e->block) {
                 continue;
             }
             if (e->height >= (uint64_t)chainSize) {
                 continue; // still ahead of us; may attach later
             }
-            for (size_t b = 0; b < 32; ++b) {
-                (void)DynArr_push_back(candidates, &e->hash[b]);
+            if (vector_push_back(candidates, e->hash) != 0) {
+                break;
             }
-            (void)DynArr_push_back(candidateHeights, &e->height);
+            if (vector_push_back(candidateHeights, &e->height) != 0) {
+                vector_pop_back(candidates); // keep the two index-aligned
+                break;
+            }
         }
     }
     pthread_mutex_unlock(&g_orphanLock);
 
-    size_t candidateCount = candidateHeights ? DynArr_size(candidateHeights) : 0;
+    size_t candidateCount = vector_size(candidateHeights);
     for (size_t i = 0; i < candidateCount; ++i) {
-        uint64_t height = *(uint64_t*)DynArr_at(candidateHeights, i);
-        uint8_t orphanHash[32];
-        for (size_t b = 0; b < 32; ++b) {
-            orphanHash[b] = *(uint8_t*)DynArr_at(candidates, i * 32 + b);
+        const uint64_t* heightSlot = (const uint64_t*)vector_get_const(candidateHeights, i);
+        const uint8_t* orphanHash = (const uint8_t*)vector_get_const(candidates, i);
+        if (!heightSlot || !orphanHash) {
+            continue;
         }
+        uint64_t height = *heightSlot;
 
         block_t* local = NULL;
         if (!Chain_GetBlockCopy(chain, (size_t)height, &local) || !local) {
@@ -370,28 +371,25 @@ static void OrphanPool_PruneStale(blockchain_t* chain) {
         // Same block we already have: pure duplicate, drop it. A different block at a height we
         // have already passed is kept, because it may yet be the base of a heavier branch.
         if (memcmp(localHash, orphanHash, 32) == 0) {
-            for (size_t b = 0; b < 32; ++b) {
-                (void)DynArr_push_back(doomed, &orphanHash[b]);
-            }
+            (void)vector_push_back(doomed, orphanHash);
         }
     }
 
-    size_t doomedCount = DynArr_size(doomed) / 32;
+    size_t doomedCount = vector_size(doomed);
     if (doomedCount > 0) {
         pthread_mutex_lock(&g_orphanLock);
         for (size_t i = 0; i < doomedCount; ++i) {
-            uint8_t h[32];
-            for (size_t b = 0; b < 32; ++b) {
-                h[b] = *(uint8_t*)DynArr_at(doomed, i * 32 + b);
+            const uint8_t* h = (const uint8_t*)vector_get_const(doomed, i);
+            if (h) {
+                OrphanPool_DropByHashLocked(h);
             }
-            OrphanPool_DropByHashLocked(h);
         }
         pthread_mutex_unlock(&g_orphanLock);
     }
 
-    if (candidates) DynArr_destroy(candidates);
-    if (candidateHeights) DynArr_destroy(candidateHeights);
-    DynArr_destroy(doomed);
+    vector_destroy(&candidates);
+    vector_destroy(&candidateHeights);
+    vector_destroy(&doomed);
 }
 
 /**
@@ -558,7 +556,7 @@ size_t OrphanPool_AttemptAttachForced(blockchain_t* chain, bool bypassPenalty) {
     }
 
     pthread_mutex_lock(&g_orphanLock);
-    bool empty = (g_orphans == NULL) || (DynArr_size(g_orphans) == 0);
+    bool empty = vector_is_empty(g_orphans); // also true while the pool is not initialised
     pthread_mutex_unlock(&g_orphanLock);
     if (empty) {
         return 0;

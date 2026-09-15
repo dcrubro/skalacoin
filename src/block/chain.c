@@ -133,7 +133,7 @@ static bool Chain_BorrowBlockTransactions(blockchain_t* chain, size_t index, blo
     *outBlock = NULL;
     *outLoadedFromDisk = false;
 
-    block_t* blk = (block_t*)DynArr_at(chain->blocks, index);
+    block_t* blk = (block_t*)vector_get(chain->blocks, index);
     if (blk && blk->transactions) {
         *outBlock = blk;
         return true;
@@ -155,9 +155,7 @@ static void Chain_ReturnBlockTransactions(block_t* blk, bool loadedFromDisk) {
         return;
     }
 
-    if (blk->transactions) {
-        DynArr_destroy(blk->transactions);
-    }
+    vector_destroy(&blk->transactions);
     free(blk);
 }
 
@@ -174,8 +172,8 @@ bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
             return false;
         }
 
-        for (size_t j = 0; j < DynArr_size(blk->transactions); ++j) {
-            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, j);
+        for (size_t j = 0; j < vector_size(blk->transactions); ++j) {
+            signed_transaction_t* tx = (signed_transaction_t*)vector_get(blk->transactions, j);
             if (!tx) {
                 Chain_ReturnBlockTransactions(blk, loadedFromDisk);
                 return false;
@@ -219,20 +217,24 @@ static void Chain_InvalidateDagEpochs(blockchain_t* chain) {
     pthread_mutex_unlock(&chain->dagCacheLock);
 }
 
+/**
+ * Element destructor for `chain->blocks`.
+ *
+ * A block stored in the chain owns its transaction vector, so the vector is freed whenever the
+ * block leaves the chain -- rollback, clear or destroy -- without every one of those paths having
+ * to remember to do it. Header-only blocks carry NULL here, which vector_destroy() accepts.
+**/
+static void Chain_BlockElementDestructor(void* element) {
+    block_t* blk = (block_t*)element;
+    vector_destroy(&blk->transactions);
+}
+
 static void Chain_ClearBlocks(blockchain_t* chain) {
     if (!chain || !chain->blocks) {
         return;
     }
 
-    for (size_t i = 0; i < DynArr_size(chain->blocks); i++) {
-        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
-        if (blk && blk->transactions) {
-            DynArr_destroy(blk->transactions);
-            blk->transactions = NULL;
-        }
-    }
-
-    DynArr_erase(chain->blocks);
+    vector_clear(chain->blocks); // The element destructor frees each block's transactions
     chain->size = 0;
     Chain_InvalidateDagEpochs(chain);
 }
@@ -243,14 +245,19 @@ blockchain_t* Chain_Create() {
         return NULL;
     }
 
-    ptr->blocks = DYNARR_CREATE(block_t, 1);
+    ptr->blocks = vector_create(sizeof(block_t));
+    if (!ptr->blocks) {
+        free(ptr);
+        return NULL;
+    }
+    vector_set_destructor(ptr->blocks, Chain_BlockElementDestructor);
     ptr->size = 0;
 
     ptr->dagEpochs = NULL;
     ptr->dagEpochsComputed = 0;
     ptr->dagEpochsCapacity = 0;
     if (pthread_mutex_init(&ptr->dagCacheLock, NULL) != 0) {
-        DynArr_destroy(ptr->blocks);
+        vector_destroy(&ptr->blocks);
         free(ptr);
         return NULL;
     }
@@ -262,7 +269,7 @@ void Chain_Destroy(blockchain_t* chain) {
     if (chain) {
         if (chain->blocks) {
             Chain_ClearBlocks(chain);
-            DynArr_destroy(chain->blocks);
+            vector_destroy(&chain->blocks);
         }
         free(chain->dagEpochs);
         pthread_mutex_destroy(&chain->dagCacheLock);
@@ -287,7 +294,7 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
     }
 
     // Ensure the incoming block's header.blockNumber matches the index it will be appended at.
-    size_t expectedIndex = DynArr_size(chain->blocks);
+    size_t expectedIndex = vector_size(chain->blocks);
     if (block->header.blockNumber != expectedIndex) {
         // Mismatched block number; reject to avoid duplicate indices or inconsistent headers.
         return false;
@@ -296,7 +303,7 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
     // Ensure the block actually builds on our tip. Without this, a rollback-then-reapply path can
     // splice blocks from two different forks into a chain that no longer links up.
     if (expectedIndex > 0) {
-        block_t* parent = (block_t*)DynArr_at(chain->blocks, expectedIndex - 1);
+        block_t* parent = (block_t*)vector_get(chain->blocks, expectedIndex - 1);
         if (!parent) {
             return false;
         }
@@ -351,7 +358,13 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
     }
 
     do {
-        size_t txCount = DynArr_size(block->transactions);
+        size_t txCount = vector_size(block->transactions);
+        if (txCount == 0) {
+            // Every block carries at least its coinbase, so an empty one fails the coinbase check
+            // below regardless. Rejecting it here also keeps calloc() from being asked for zero bytes.
+            ok = false;
+            break;
+        }
         signed_transaction_t* candidateTxs = (signed_transaction_t*)calloc(txCount, sizeof(signed_transaction_t));
         if (!candidateTxs) {
             ok = false;
@@ -360,7 +373,7 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
 
         size_t nonCoinbaseCount = 0;
         for (size_t i = 0; i < txCount; ++i) {
-            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+            signed_transaction_t* tx = (signed_transaction_t*)vector_get(block->transactions, i);
             if (!tx) {
                 ok = false;
                 break;
@@ -405,8 +418,8 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
             // Debug: log expected coinbase and fees to aid diagnosis when nodes disagree
             {
                 uint64_t cbAmount = 0;
-                if (block->transactions && DynArr_size(block->transactions) > 0) {
-                    signed_transaction_t* firstTx = (signed_transaction_t*)DynArr_at(block->transactions, 0);
+                if (block->transactions && vector_size(block->transactions) > 0) {
+                    signed_transaction_t* firstTx = (signed_transaction_t*)vector_get(block->transactions, 0);
                     if (firstTx && Address_IsCoinbase(firstTx->transaction.senderAddress)) {
                         cbAmount = firstTx->transaction.amount1;
                     }
@@ -462,37 +475,37 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
         }
 
         // Push the block only after validation succeeds.
-        block_t* blk = (block_t*)DynArr_push_back(chain->blocks, block);
-        if (!blk) { ok = false; break; }
+        if (vector_push_back(chain->blocks, block) != 0) { ok = false; break; }
+        block_t* blk = (block_t*)vector_back(chain->blocks);
         stored = blk;
         chain->size++;
         currentBlockHeight = (uint64_t)(chain->size - 1);
 
         /**
-         * The chain now owns the transaction array, so clear the CALLER's pointer to it.
+         * The chain now owns the transaction vector, so clear the CALLER's pointer to it.
          *
-         * DynArr_push_back stores the struct by value, which leaves the chain's element and the
+         * vector_push_back stores the struct by value, which leaves the chain's element and the
          * caller's block_t sharing one `transactions` pointer. Three separate places later free
-         * that array through the chain's copy -- Chain_ClearBlocks, Chain_RollbackToHeightLocked
-         * and Chain_SaveToFile -- and each of them NULLs only the chain's side, leaving the
-         * caller holding a dangling pointer. Whether a caller must then use free() or
-         * Block_Destroy() was a convention carried in comments at every call site plus a
-         * consumed-count passed around; getting it wrong aborted in the allocator.
+         * that vector through the chain's copy -- Chain_ClearBlocks and Chain_RollbackToHeightLocked
+         * via the element destructor, and Chain_SaveToFile -- and each of them NULLs only the
+         * chain's side, leaving the caller holding a dangling pointer. Whether a caller must then
+         * use free() or Block_Destroy() was a convention carried in comments at every call site
+         * plus a consumed-count passed around; getting it wrong aborted in the allocator.
          *
          * Clearing it here makes the rule structural: free(wrapper) and Block_Destroy(wrapper)
-         * are now equivalent and both safe, because DynArr_destroy(NULL) is a no-op.
+         * are now equivalent and both safe, because vector_destroy() on a NULL vector is a no-op.
          *
          * This runs right after the push and NOT at the end on success, deliberately. If the
          * ledger pass below fails we return false with the block still in the chain, so a caller
-         * that destroys its wrapper on failure would otherwise free the chain's array.
+         * that destroys its wrapper on failure would otherwise free the chain's vector.
         **/
         block->transactions = NULL;
 
         // Second pass: apply the ledger changes.
-        if (blk->transactions) {
-            txCount = DynArr_size(blk->transactions);
+        if (blk && blk->transactions) {
+            txCount = vector_size(blk->transactions);
             for (size_t i = 0; i < txCount; ++i) {
-                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, i);
+                signed_transaction_t* tx = (signed_transaction_t*)vector_get(blk->transactions, i);
                 if (!tx) {
                     continue;
                 }
@@ -527,9 +540,9 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
         }
 
         // Remove mined non-coinbase transactions from the mempool so they are not re-mined or re-broadcast.
-        if (blk->transactions) {
-            for (size_t i = 0; i < DynArr_size(blk->transactions); ++i) {
-                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(blk->transactions, i);
+        if (blk && blk->transactions) {
+            for (size_t i = 0; i < vector_size(blk->transactions); ++i) {
+                signed_transaction_t* tx = (signed_transaction_t*)vector_get(blk->transactions, i);
                 if (!tx) continue;
                 if (Address_IsCoinbase(tx->transaction.senderAddress)) continue;
                 uint8_t txHash[32];
@@ -589,7 +602,7 @@ block_t* Chain_GetBlock(blockchain_t* chain, size_t index) {
     if (!chain) return NULL;
     block_t* blk = NULL;
     pthread_rwlock_rdlock(&chainLock);
-    blk = (block_t*)DynArr_at(chain->blocks, index);
+    blk = (block_t*)vector_get(chain->blocks, index);
     pthread_rwlock_unlock(&chainLock);
     return blk;
 }
@@ -598,7 +611,7 @@ bool Chain_GetBlockCopy(blockchain_t* chain, size_t index, block_t** outCopy) {
     if (!chain || !outCopy) return false;
     *outCopy = NULL;
     pthread_rwlock_rdlock(&chainLock);
-    block_t* src = (block_t*)DynArr_at(chain->blocks, index);
+    block_t* src = (block_t*)vector_get(chain->blocks, index);
     if (!src) {
         pthread_rwlock_unlock(&chainLock);
         return false;
@@ -614,7 +627,7 @@ size_t Chain_Size(blockchain_t* chain) {
     if (!chain) return 0;
     size_t sz = 0;
     pthread_rwlock_rdlock(&chainLock);
-    sz = DynArr_size(chain->blocks);
+    sz = vector_size(chain->blocks);
     pthread_rwlock_unlock(&chainLock);
     return sz;
 }
@@ -624,14 +637,14 @@ bool Chain_IsValid(blockchain_t* chain) {
         return false;
     }
 
-    const size_t chainSize = DynArr_size(chain->blocks);
+    const size_t chainSize = vector_size(chain->blocks);
     if (chainSize == 0) {
         return true;
     }
 
     for (size_t i = 1; i < chainSize; i++) {
-        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
-        block_t* prevBlk = (block_t*)DynArr_at(chain->blocks, i - 1);
+        block_t* blk = (block_t*)vector_get(chain->blocks, i);
+        block_t* prevBlk = (block_t*)vector_get(chain->blocks, i - 1);
         if (!blk || !prevBlk || blk->header.blockNumber != i) { return false; } // NULL blocks or blockNumber != order in chain
 
         // Verify prevHash is valid
@@ -649,7 +662,7 @@ bool Chain_IsValid(blockchain_t* chain) {
     }
     
     // Genesis needs special handling because the prevHash is always invalid (no previous block)
-    block_t* genesis = (block_t*)DynArr_at(chain->blocks, 0);
+    block_t* genesis = (block_t*)vector_get(chain->blocks, 0);
     if (!genesis || genesis->header.blockNumber != 0) { return false; }
 
     return true;
@@ -664,7 +677,7 @@ bool Chain_IsValid(blockchain_t* chain) {
 static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
     if (!chain || !chain->blocks) return false;
 
-    size_t cur = DynArr_size(chain->blocks);
+    size_t cur = vector_size(chain->blocks);
     if (height >= cur) {
         return true; // nothing to do
     }
@@ -702,9 +715,9 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
         }
 
         if (source && source->transactions) {
-            const size_t txCount = DynArr_size(source->transactions);
+            const size_t txCount = vector_size(source->transactions);
             for (size_t t = 0; t < txCount; ++t) {
-                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(source->transactions, t);
+                signed_transaction_t* tx = (signed_transaction_t*)vector_get(source->transactions, t);
                 if (!tx || Address_IsCoinbase(tx->transaction.senderAddress)) {
                     continue;
                 }
@@ -715,18 +728,12 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
         Chain_ReturnBlockTransactions(source, loadedFromDisk);
     }
 
-    // Remove blocks above height
+    // Remove blocks above height. The element destructor frees each one's transactions.
     for (size_t i = cur; i > height; --i) {
-        size_t idx = i - 1;
-        block_t* blk = (block_t*)DynArr_at(chain->blocks, idx);
-        if (blk && blk->transactions) {
-            DynArr_destroy(blk->transactions);
-            blk->transactions = NULL;
-        }
-        DynArr_remove(chain->blocks, idx);
+        vector_pop_at(chain->blocks, i - 1);
     }
 
-    chain->size = DynArr_size(chain->blocks);
+    chain->size = vector_size(chain->blocks);
     currentBlockHeight = chain->size ? (uint64_t)(chain->size - 1) : 0ULL;
 
     // Blocks below the old tip are gone, so the DAG recurrence folded from their votes is stale.
@@ -752,9 +759,9 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
 
         // Apply transactions
         if (toProcess && toProcess->transactions) {
-            size_t txCount = DynArr_size(toProcess->transactions);
+            size_t txCount = vector_size(toProcess->transactions);
             for (size_t ti = 0; ti < txCount; ++ti) {
-                signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(toProcess->transactions, ti);
+                signed_transaction_t* tx = (signed_transaction_t*)vector_get(toProcess->transactions, ti);
                 if (!tx) continue;
 
                 // Coinbase credit
@@ -863,7 +870,7 @@ static uint64_t Chain_MedianTimePastLocked(blockchain_t* chain) {
         return 0ULL;
     }
 
-    const size_t size = DynArr_size(chain->blocks);
+    const size_t size = vector_size(chain->blocks);
     if (size == 0) {
         return 0ULL;
     }
@@ -872,7 +879,7 @@ static uint64_t Chain_MedianTimePastLocked(blockchain_t* chain) {
     uint64_t samples[MEDIAN_TIME_SPAN];
     size_t taken = 0;
     for (size_t i = 0; i < span; ++i) {
-        block_t* blk = (block_t*)DynArr_at(chain->blocks, size - 1 - i);
+        block_t* blk = (block_t*)vector_get(chain->blocks, size - 1 - i);
         if (!blk) {
             continue;
         }
@@ -892,7 +899,7 @@ bool Chain_IsInitialBlockDownload(blockchain_t* chain) {
         return true;
     }
 
-    if (DynArr_size(chain->blocks) == 0) {
+    if (vector_size(chain->blocks) == 0) {
         return true;
     }
 
@@ -916,7 +923,7 @@ static bool Chain_BranchIsLinkedLocked(blockchain_t* chain, size_t forkHeight, b
         return false;
     }
 
-    block_t* parent = (block_t*)DynArr_at(chain->blocks, forkHeight - 1);
+    block_t* parent = (block_t*)vector_get(chain->blocks, forkHeight - 1);
     if (!parent) {
         return false;
     }
@@ -967,10 +974,10 @@ bool Chain_BlockRespectsSenderOrdering(const block_t* block) {
         return false;
     }
 
-    const size_t txCount = DynArr_size(block->transactions);
+    const size_t txCount = vector_size(block->transactions);
 
     for (size_t i = 0; i < txCount; ++i) {
-        const signed_transaction_t* tx = (const signed_transaction_t*)DynArr_at(block->transactions, i);
+        const signed_transaction_t* tx = (const signed_transaction_t*)vector_get_const(block->transactions, i);
         if (!tx || Address_IsCoinbase(tx->transaction.senderAddress)) {
             continue; // coinbase is exempt -- see balance_sheet.h
         }
@@ -994,7 +1001,7 @@ bool Chain_BlockRespectsSenderOrdering(const block_t* block) {
          * worth a per-sender map if they grow.
         **/
         for (size_t j = 0; j < i; ++j) {
-            const signed_transaction_t* prev = (const signed_transaction_t*)DynArr_at(block->transactions, j);
+            const signed_transaction_t* prev = (const signed_transaction_t*)vector_get_const(block->transactions, j);
             if (!prev || Address_IsCoinbase(prev->transaction.senderAddress)) {
                 continue;
             }
@@ -1038,7 +1045,7 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
     size_t candidateApplied = 0;    // how far the apply got, for the log line below
 
     do {
-        const size_t tipCount = DynArr_size(chain->blocks);
+        const size_t tipCount = vector_size(chain->blocks);
         if (forkHeight > tipCount) {
             printf("Chain_ReplaceBranch: fork point %zu is beyond our tip %zu; nothing to replace\n",
                 forkHeight, tipCount);
@@ -1302,10 +1309,10 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         return false;
     }
 
-    const size_t chainSize = DynArr_size(chain->blocks);
+    const size_t chainSize = vector_size(chain->blocks);
     uint64_t byteCount = 0;
     for (size_t i = 0; i < chainSize; ++i) {
-        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
+        block_t* blk = (block_t*)vector_get(chain->blocks, i);
         if (!blk) {
             fclose(metaFile);
             fclose(chainFile);
@@ -1349,7 +1356,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
             return false;
         }
 
-        const size_t txSize = DynArr_size(diskCopy->transactions);
+        const size_t txSize = vector_size(diskCopy->transactions);
         if (fwrite(&txSize, sizeof(size_t), 1, chainFile) != 1) {
             if (loadedTemp) Block_Destroy(diskCopy);
             fclose(metaFile);
@@ -1364,7 +1371,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         byteCount += sizeof(block_header_t) + sizeof(size_t);
 
         for (size_t j = 0; j < txSize; ++j) {
-            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(diskCopy->transactions, j);
+            signed_transaction_t* tx = (signed_transaction_t*)vector_get(diskCopy->transactions, j);
             if (!tx || fwrite(tx, sizeof(signed_transaction_t), 1, chainFile) != 1) {
                 if (loadedTemp) Block_Destroy(diskCopy);
                 fclose(metaFile);
@@ -1397,9 +1404,8 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
 
         if (loadedTemp) {
             Block_Destroy(diskCopy);
-        } else if (blk->transactions) {
-            DynArr_destroy(blk->transactions);
-            blk->transactions = NULL;
+        } else {
+            vector_destroy(&blk->transactions);
         }
     }
 
@@ -1407,8 +1413,8 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     fseek(metaFile, 0, SEEK_SET);
     fwrite(&newSize, sizeof(size_t), 1, metaFile);
     uint32_t difficultyTarget = INITIAL_DIFFICULTY;
-    if (newSize > 0) {
-        block_t* lastBlock = (block_t*)DynArr_at(chain->blocks, newSize - 1);
+    block_t* lastBlock = (block_t*)vector_back(chain->blocks); // NULL exactly when the chain is empty
+    if (lastBlock) {
         uint8_t lastHash[32];
         Block_CalculateHash(lastBlock, lastHash);
         fwrite(lastHash, sizeof(uint8_t), 32, metaFile);
@@ -1560,10 +1566,11 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
             return false;
         }
         if (loadTransactions) {
-            blk->transactions = DYNARR_CREATE(signed_transaction_t, txSize == 0 ? 1 : txSize);
-            if (!blk->transactions) {
+            blk->transactions = vector_create(sizeof(signed_transaction_t));
+            if (!blk->transactions || vector_reserve(blk->transactions, txSize) != 0) {
                 fclose(chainFile);
                 fclose(tableFile);
+                vector_destroy(&blk->transactions);
                 free(blk);
                 return false;
             }
@@ -1573,15 +1580,15 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
                 if (fread(&tx, sizeof(signed_transaction_t), 1, chainFile) != 1) {
                     fclose(chainFile);
                     fclose(tableFile);
-                    DynArr_destroy(blk->transactions);
+                    vector_destroy(&blk->transactions);
                     free(blk);
                     return false;
                 }
 
-                if (!DynArr_push_back(blk->transactions, &tx)) {
+                if (vector_push_back(blk->transactions, &tx) != 0) {
                     fclose(chainFile);
                     fclose(tableFile);
-                    DynArr_destroy(blk->transactions);
+                    vector_destroy(&blk->transactions);
                     free(blk);
                     return false;
                 }
@@ -1598,15 +1605,15 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
 
         // Loading from disk currently restores headers only. Do not run Chain_AddBlock,
         // because it enforces transaction presence and mutates balances.
-        if (!DynArr_push_back(chain->blocks, blk)) {
+        if (vector_push_back(chain->blocks, blk) != 0) {
             fclose(chainFile);
             fclose(tableFile);
-            free(blk);
+            Block_Destroy(blk); // never stored, so its transactions are still ours to free
             return false;
         }
         chain->size++;
 
-        // DynArr_push_back stores blocks by value, so the copied block now owns
+        // vector_push_back stores blocks by value, so the chain's element now owns
         // blk->transactions. Free wrapper only.
         free(blk);
     }
@@ -1733,8 +1740,9 @@ bool Chain_LoadBlockFromFile(const char* dirpath, uint64_t blockNumber, bool loa
     }
 
     if (loadTransactions) {
-        blk->transactions = DYNARR_CREATE(signed_transaction_t, txSize == 0 ? 1 : txSize);
-        if (!blk->transactions) {
+        blk->transactions = vector_create(sizeof(signed_transaction_t));
+        if (!blk->transactions || vector_reserve(blk->transactions, txSize) != 0) {
+            vector_destroy(&blk->transactions);
             free(blk);
             fclose(chainFile);
             fclose(tableFile);
@@ -1744,15 +1752,15 @@ bool Chain_LoadBlockFromFile(const char* dirpath, uint64_t blockNumber, bool loa
         for (size_t i = 0; i < txSize; ++i) {
             signed_transaction_t tx;
             if (fread(&tx, sizeof(signed_transaction_t), 1, chainFile) != 1) {
-                DynArr_destroy(blk->transactions);
+                vector_destroy(&blk->transactions);
                 free(blk);
                 fclose(chainFile);
                 fclose(tableFile);
                 return false;
             }
 
-            if (!DynArr_push_back(blk->transactions, &tx)) {
-                DynArr_destroy(blk->transactions);
+            if (vector_push_back(blk->transactions, &tx) != 0) {
+                vector_destroy(&blk->transactions);
                 free(blk);
                 fclose(chainFile);
                 fclose(tableFile);
@@ -1801,13 +1809,13 @@ uint32_t Chain_ComputeTargetAtHeight(blockchain_t* chain, uint64_t height, uint3
         return INITIAL_DIFFICULTY;
     }
 
-    if (height > (uint64_t)DynArr_size(chain->blocks)) {
+    if (height > (uint64_t)vector_size(chain->blocks)) {
         return 0x00; // Retarget window is not fully present in this chain
     }
 
     // Assuming block validation validates timestamps, we can assume they're valid and can just read them
-    block_t* lastBlock = (block_t*)DynArr_at(chain->blocks, (size_t)(height - 1));
-    block_t* adjustmentBlock = (block_t*)DynArr_at(chain->blocks, (size_t)(height - DIFFICULTY_ADJUSTMENT_INTERVAL));
+    block_t* lastBlock = (block_t*)vector_get(chain->blocks, (size_t)(height - 1));
+    block_t* adjustmentBlock = (block_t*)vector_get(chain->blocks, (size_t)(height - DIFFICULTY_ADJUSTMENT_INTERVAL));
     if (!lastBlock || !adjustmentBlock) {
         return 0x00; // Impossible difficulty, only valid hash is all zeros (practically impossible)
     }
@@ -1932,13 +1940,13 @@ bool Chain_ComputeWorkRange(blockchain_t* chain, size_t from, size_t to, uint256
         return false;
     }
 
-    if (to > DynArr_size(chain->blocks)) {
+    if (to > vector_size(chain->blocks)) {
         return false;
     }
 
     uint256_t total = uint256_from_u64(0);
     for (size_t i = from; i < to; ++i) {
-        block_t* blk = (block_t*)DynArr_at(chain->blocks, i);
+        block_t* blk = (block_t*)vector_get(chain->blocks, i);
         if (!blk) {
             return false;
         }
@@ -2032,7 +2040,7 @@ static bool Chain_ExtendDagEpochsLocked(blockchain_t* chain, size_t epochIndex) 
         chain->dagEpochsComputed = 1;
     }
 
-    const size_t chainSize = DynArr_size(chain->blocks);
+    const size_t chainSize = vector_size(chain->blocks);
     const size_t epochLength = (size_t)EPOCH_LENGTH;
 
     for (size_t k = chain->dagEpochsComputed; k <= epochIndex; ++k) {
@@ -2048,7 +2056,7 @@ static bool Chain_ExtendDagEpochsLocked(blockchain_t* chain, size_t epochIndex) 
         uint64_t holdVotes = 0;
         uint64_t downVotes = 0;
         for (size_t i = from; i < to; ++i) {
-            const block_t* blk = (const block_t*)DynArr_at(chain->blocks, i);
+            const block_t* blk = (const block_t*)vector_get_const(chain->blocks, i);
             if (!blk) {
                 return false;
             }
@@ -2114,11 +2122,11 @@ static bool Chain_EpochDagSeedForHeightLocked(blockchain_t* chain, uint64_t bloc
     }
 
     const uint64_t seedBlockNumber = (epochIndex * (uint64_t)EPOCH_LENGTH) - 1ULL;
-    if (seedBlockNumber >= (uint64_t)DynArr_size(chain->blocks)) {
+    if (seedBlockNumber >= (uint64_t)vector_size(chain->blocks)) {
         return false;
     }
 
-    const block_t* seedBlock = (const block_t*)DynArr_at(chain->blocks, (size_t)seedBlockNumber);
+    const block_t* seedBlock = (const block_t*)vector_get_const(chain->blocks, (size_t)seedBlockNumber);
     if (!seedBlock) {
         return false;
     }

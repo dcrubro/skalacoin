@@ -390,8 +390,8 @@ static bool Block_GetCoinbaseAndFeeTotals(const block_t* block, uint64_t* outCoi
     uint64_t coinbaseAmount = 0;
     uint64_t totalFees = 0;
 
-    for (size_t i = 0; i < DynArr_size(block->transactions); ++i) {
-        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+    for (size_t i = 0; i < vector_size(block->transactions); ++i) {
+        signed_transaction_t* tx = (signed_transaction_t*)vector_get(block->transactions, i);
         if (!tx) {
             return false;
         }
@@ -549,8 +549,8 @@ static bool MineAndAppendBlock(blockchain_t* chain,
     // Read the coinbase BEFORE handing the block to the chain. Chain_AddBlock takes ownership of
     // the transaction array and clears our pointer to it, so this has to happen first.
     uint64_t coinbaseAmount = 0;
-    if (block->transactions && DynArr_size(block->transactions) > 0) {
-        signed_transaction_t* firstTx = (signed_transaction_t*)DynArr_at(block->transactions, 0);
+    if (block->transactions && vector_size(block->transactions) > 0) {
+        signed_transaction_t* firstTx = (signed_transaction_t*)vector_get(block->transactions, 0);
         if (firstTx && Address_IsCoinbase(firstTx->transaction.senderAddress)) {
             coinbaseAmount = firstTx->transaction.amount1;
         }
@@ -745,17 +745,20 @@ static bool VerifyChainFully(blockchain_t* chain) {
 
         // Transactions are persisted on disk. Once this block is fully verified,
         // release its in-memory transaction list to reduce peak memory usage.
-        if (blk->transactions) {
-            DynArr_destroy(blk->transactions);
-            blk->transactions = NULL;
-        }
+        vector_destroy(&blk->transactions);
 
         // Push a header-only copy of this block into prevChain for future difficulty calculations.
+        // A missing header would shift every later reward calculation, so a failed push fails the
+        // verification rather than being skipped.
         block_t headerOnly;
         memset(&headerOnly, 0, sizeof(headerOnly));
         headerOnly.header = blk->header;
         headerOnly.transactions = NULL;
-        (void)DynArr_push_back(prevChain->blocks, &headerOnly);
+        if (vector_push_back(prevChain->blocks, &headerOnly) != 0) {
+            Block_Destroy(blk);
+            Chain_Destroy(prevChain);
+            return false;
+        }
 
         (void)uint256_add_u64(&replaySupply, coinbaseAmount);
 

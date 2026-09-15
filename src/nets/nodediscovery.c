@@ -11,7 +11,7 @@
 #include <ifaddrs.h>
 
 #include <constants.h>
-#include <dynarr.h>
+#include <dlibc/vector.h>
 #include <numgen.h>
 #include <runtime_state.h>
 #include <utils.h>
@@ -52,9 +52,9 @@ typedef struct {
 struct node_discovery {
     net_node_t* node;
     udp_node_t* udpNode;
-    DynArr* peers;                 // of discovered_peer_t
-    DynArr* selfEndpoints;         // of struct sockaddr_storage - our own listen endpoints
-    DynArr* connectAttempts;       // of discovery_attempt_t
+    vector_t* peers;               // of discovered_peer_t
+    vector_t* selfEndpoints;       // of struct sockaddr_storage - our own listen endpoints
+    vector_t* connectAttempts;     // of discovery_attempt_t
     pthread_mutex_t lock;
 };
 
@@ -123,10 +123,10 @@ static void Discovery_NormaliseAddr(struct sockaddr_storage* addr) {
 
 // Returns non-zero if addr is one of our own listen endpoints. Caller holds disc->lock.
 static int Discovery_IsSelfUnlocked(node_discovery_t* disc, const struct sockaddr_storage* addr) {
-    size_t n = DynArr_size(disc->selfEndpoints);
+    size_t n = vector_size(disc->selfEndpoints);
     for (size_t i = 0; i < n; ++i) {
-        const struct sockaddr_storage* self = (const struct sockaddr_storage*)DynArr_at(disc->selfEndpoints, i);
-        if (Discovery_AddrEqual(self, addr)) return 1;
+        const struct sockaddr_storage* self = (const struct sockaddr_storage*)vector_get_const(disc->selfEndpoints, i);
+        if (self && Discovery_AddrEqual(self, addr)) return 1;
     }
     return 0;
 }
@@ -134,7 +134,7 @@ static int Discovery_IsSelfUnlocked(node_discovery_t* disc, const struct sockadd
 // Adds addr to the self set if not already there. Caller holds disc->lock.
 static void Discovery_AddSelfUnlocked(node_discovery_t* disc, const struct sockaddr_storage* addr) {
     if (Discovery_IsSelfUnlocked(disc, addr)) return;
-    DynArr_push_back(disc->selfEndpoints, (void*)addr);
+    vector_push_back(disc->selfEndpoints, addr);
 }
 
 // Seeds the self set with (local interface address, our listen port) for every address this host
@@ -171,10 +171,10 @@ static void Discovery_SeedSelfEndpoints(node_discovery_t* disc) {
 }
 
 static discovered_peer_t* Discovery_FindPtr(node_discovery_t* disc, const struct sockaddr_storage* addr) {
-    size_t n = DynArr_size(disc->peers);
+    size_t n = vector_size(disc->peers);
     for (size_t i = 0; i < n; ++i) {
-        discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
-        if (Discovery_AddrEqual(&p->addr, addr)) return p;
+        discovered_peer_t* p = (discovered_peer_t*)vector_get(disc->peers, i);
+        if (p && Discovery_AddrEqual(&p->addr, addr)) return p;
     }
     return NULL;
 }
@@ -191,7 +191,7 @@ static discovered_peer_t* Discovery_Upsert(node_discovery_t* disc, const struct 
         if (hop < existing->hop) existing->hop = hop; // keep the shortest known distance
         return existing;
     }
-    if (DynArr_size(disc->peers) >= DISCOVERY_MAX_KNOWN_PEERS) return NULL;
+    if (vector_size(disc->peers) >= DISCOVERY_MAX_KNOWN_PEERS) return NULL;
 
     discovered_peer_t np;
     memset(&np, 0, sizeof(np));
@@ -200,17 +200,18 @@ static discovered_peer_t* Discovery_Upsert(node_discovery_t* disc, const struct 
     np.nodeId = 0;
     np.hop = hop;
     np.state = DISCOVERY_STATE_NEW;
-    DynArr_push_back(disc->peers, &np);
-    return (discovered_peer_t*)DynArr_at(disc->peers, DynArr_size(disc->peers) - 1);
+    // Checked: on a failed push, back() would hand the caller the previous peer instead.
+    if (vector_push_back(disc->peers, &np) != 0) return NULL;
+    return (discovered_peer_t*)vector_back(disc->peers);
 }
 
 // Returns non-zero if addr may be dialed again, i.e. we have not tried it within the retry window.
 // Caller holds disc->lock.
 static int Discovery_ConnectCooledDown(node_discovery_t* disc, const struct sockaddr_storage* addr, uint64_t now) {
-    size_t n = DynArr_size(disc->connectAttempts);
+    size_t n = vector_size(disc->connectAttempts);
     for (size_t i = 0; i < n; ++i) {
-        const discovery_attempt_t* a = (const discovery_attempt_t*)DynArr_at(disc->connectAttempts, i);
-        if (Discovery_AddrEqual(&a->addr, addr)) {
+        const discovery_attempt_t* a = (const discovery_attempt_t*)vector_get_const(disc->connectAttempts, i);
+        if (a && Discovery_AddrEqual(&a->addr, addr)) {
             return (now - a->lastMs) >= DISCOVERY_CONNECT_RETRY_MS;
         }
     }
@@ -220,12 +221,13 @@ static int Discovery_ConnectCooledDown(node_discovery_t* disc, const struct sock
 // Stamps a dial attempt against addr, evicting the stalest record once the table is full.
 // Caller holds disc->lock.
 static void Discovery_NoteConnectAttempt(node_discovery_t* disc, const struct sockaddr_storage* addr, uint64_t now) {
-    size_t n = DynArr_size(disc->connectAttempts);
+    size_t n = vector_size(disc->connectAttempts);
     size_t oldestIdx = 0;
     uint64_t oldestMs = UINT64_MAX;
 
     for (size_t i = 0; i < n; ++i) {
-        discovery_attempt_t* a = (discovery_attempt_t*)DynArr_at(disc->connectAttempts, i);
+        discovery_attempt_t* a = (discovery_attempt_t*)vector_get(disc->connectAttempts, i);
+        if (!a) continue;
         if (Discovery_AddrEqual(&a->addr, addr)) {
             a->lastMs = now;
             return;
@@ -237,9 +239,11 @@ static void Discovery_NoteConnectAttempt(node_discovery_t* disc, const struct so
     }
 
     if (n >= DISCOVERY_MAX_KNOWN_PEERS) {
-        discovery_attempt_t* victim = (discovery_attempt_t*)DynArr_at(disc->connectAttempts, oldestIdx);
-        victim->addr = *addr;
-        victim->lastMs = now;
+        discovery_attempt_t* victim = (discovery_attempt_t*)vector_get(disc->connectAttempts, oldestIdx);
+        if (victim) {
+            victim->addr = *addr;
+            victim->lastMs = now;
+        }
         return;
     }
 
@@ -247,16 +251,16 @@ static void Discovery_NoteConnectAttempt(node_discovery_t* disc, const struct so
     memset(&na, 0, sizeof(na));
     na.addr = *addr;
     na.lastMs = now;
-    DynArr_push_back(disc->connectAttempts, &na);
+    vector_push_back(disc->connectAttempts, &na);
 }
 
 // Drops the entry for addr, if any. Caller holds disc->lock.
 static void Discovery_RemoveUnlocked(node_discovery_t* disc, const struct sockaddr_storage* addr) {
-    size_t n = DynArr_size(disc->peers);
+    size_t n = vector_size(disc->peers);
     for (size_t i = 0; i < n; ++i) {
-        discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
-        if (Discovery_AddrEqual(&p->addr, addr)) {
-            DynArr_remove(disc->peers, i);
+        discovered_peer_t* p = (discovered_peer_t*)vector_get(disc->peers, i);
+        if (p && Discovery_AddrEqual(&p->addr, addr)) {
+            vector_pop_at(disc->peers, i);
             return;
         }
     }
@@ -331,21 +335,21 @@ node_discovery_t* NodeDiscovery_Create(net_node_t* node, udp_node_t* udpNode) {
     memset(disc, 0, sizeof(*disc));
     disc->node = node;
     disc->udpNode = udpNode;
-    disc->peers = DYNARR_CREATE(discovered_peer_t, 16);
+    disc->peers = vector_create(sizeof(discovered_peer_t));
     if (!disc->peers) {
         free(disc);
         return NULL;
     }
-    disc->selfEndpoints = DYNARR_CREATE(struct sockaddr_storage, 8);
+    disc->selfEndpoints = vector_create(sizeof(struct sockaddr_storage));
     if (!disc->selfEndpoints) {
-        DynArr_destroy(disc->peers);
+        vector_destroy(&disc->peers);
         free(disc);
         return NULL;
     }
-    disc->connectAttempts = DYNARR_CREATE(discovery_attempt_t, 16);
+    disc->connectAttempts = vector_create(sizeof(discovery_attempt_t));
     if (!disc->connectAttempts) {
-        DynArr_destroy(disc->selfEndpoints);
-        DynArr_destroy(disc->peers);
+        vector_destroy(&disc->selfEndpoints);
+        vector_destroy(&disc->peers);
         free(disc);
         return NULL;
     }
@@ -358,9 +362,9 @@ node_discovery_t* NodeDiscovery_Create(net_node_t* node, udp_node_t* udpNode) {
 
 void NodeDiscovery_Destroy(node_discovery_t* disc) {
     if (!disc) return;
-    if (disc->peers) DynArr_destroy(disc->peers);
-    if (disc->selfEndpoints) DynArr_destroy(disc->selfEndpoints);
-    if (disc->connectAttempts) DynArr_destroy(disc->connectAttempts);
+    vector_destroy(&disc->peers);
+    vector_destroy(&disc->selfEndpoints);
+    vector_destroy(&disc->connectAttempts);
     pthread_mutex_destroy(&disc->lock);
     free(disc);
 }
@@ -471,15 +475,15 @@ void NodeDiscovery_OnPeersReceived(node_discovery_t* disc, tcp_connection_t* fro
 void NodeDiscovery_RemovePeer(node_discovery_t* disc, const struct sockaddr_storage* endpoint) {
     if (!disc || !endpoint) return;
     pthread_mutex_lock(&disc->lock);
-    size_t n = DynArr_size(disc->peers);
+    size_t n = vector_size(disc->peers);
     for (size_t i = 0; i < n; ++i) {
-        discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
-        if (Discovery_AddrEqual(&p->addr, endpoint)) {
+        discovered_peer_t* p = (discovered_peer_t*)vector_get(disc->peers, i);
+        if (p && Discovery_AddrEqual(&p->addr, endpoint)) {
             char ip[INET6_ADDRSTRLEN] = {0};
             unsigned short port = 0;
             Discovery_AddrToIpPort(&p->addr, ip, sizeof(ip), &port);
             printf("NodeDiscovery: struck disconnected peer %s:%u from peer list\n", ip, port);
-            DynArr_remove(disc->peers, i);
+            vector_pop_at(disc->peers, i);
             break;
         }
     }
@@ -563,10 +567,10 @@ void NodeDiscovery_Iterate(node_discovery_t* disc) {
     }
     // Demote entries still marked CONNECTED that are no longer in the outbound set.
     {
-        size_t n = DynArr_size(disc->peers);
+        size_t n = vector_size(disc->peers);
         for (size_t i = 0; i < n; ++i) {
-            discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
-            if (p->state != DISCOVERY_STATE_CONNECTED) continue;
+            discovered_peer_t* p = (discovered_peer_t*)vector_get(disc->peers, i);
+            if (!p || p->state != DISCOVERY_STATE_CONNECTED) continue;
             int stillConnected = 0;
             for (size_t j = 0; j < outEpCount; ++j) {
                 if (Discovery_AddrEqual(&p->addr, &outEndpoints[j])) { stillConnected = 1; break; }
@@ -580,9 +584,10 @@ void NodeDiscovery_Iterate(node_discovery_t* disc) {
     // 2. Ping NEW peers (and refresh stale REACHABLE ones), capped per tick.
     {
         int pings = 0;
-        size_t n = DynArr_size(disc->peers);
+        size_t n = vector_size(disc->peers);
         for (size_t i = 0; i < n && pings < DISCOVERY_MAX_PINGS_PER_TICK; ++i) {
-            discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
+            discovered_peer_t* p = (discovered_peer_t*)vector_get(disc->peers, i);
+            if (!p) continue;
             int shouldPing = 0;
             if (!p->pingPending) {
                 if (p->state == DISCOVERY_STATE_NEW) {
@@ -604,9 +609,10 @@ void NodeDiscovery_Iterate(node_discovery_t* disc) {
 
     // 3. Timeout backstop (in case the UDP layer's own timeout callback is missed).
     {
-        size_t n = DynArr_size(disc->peers);
+        size_t n = vector_size(disc->peers);
         for (size_t i = 0; i < n; ++i) {
-            discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
+            discovered_peer_t* p = (discovered_peer_t*)vector_get(disc->peers, i);
+            if (!p) continue;
             if (p->state == DISCOVERY_STATE_PINGED && p->pingPending &&
                 (now - p->lastPingMs) > DISCOVERY_PING_TIMEOUT_MS) {
                 p->pingPending = 0;
@@ -653,10 +659,10 @@ void NodeDiscovery_Iterate(node_discovery_t* disc) {
         size_t slots = (size_t)DISCOVERY_TARGET_CONNECTIONS - outCount;
         for (size_t s = 0; s < slots && toConnectCount < MAX_CONS; ++s) {
             discovered_peer_t* best = NULL;
-            size_t n = DynArr_size(disc->peers);
+            size_t n = vector_size(disc->peers);
             for (size_t i = 0; i < n; ++i) {
-                discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
-                if (p->state != DISCOVERY_STATE_REACHABLE) continue;
+                discovered_peer_t* p = (discovered_peer_t*)vector_get(disc->peers, i);
+                if (!p || p->state != DISCOVERY_STATE_REACHABLE) continue;
                 if (!Discovery_ConnectCooledDown(disc, &p->addr, now)) continue;
                 int already = 0;
                 for (size_t j = 0; j < outEpCount; ++j) {
@@ -710,10 +716,11 @@ void NodeDiscovery_PrintPeers(node_discovery_t* disc) {
     static const char* stateNames[] = { "NEW", "PINGED", "REACHABLE", "CONNECTED", "UNREACHABLE" };
 
     pthread_mutex_lock(&disc->lock);
-    size_t n = DynArr_size(disc->peers);
+    size_t n = vector_size(disc->peers);
     printf("Known peers (%zu):\n", n);
     for (size_t i = 0; i < n; ++i) {
-        discovered_peer_t* p = (discovered_peer_t*)DynArr_at(disc->peers, i);
+        discovered_peer_t* p = (discovered_peer_t*)vector_get(disc->peers, i);
+        if (!p) continue;
         char ip[INET6_ADDRSTRLEN] = {0};
         unsigned short port = 0;
         Discovery_AddrToIpPort(&p->addr, ip, sizeof(ip), &port);
@@ -732,10 +739,11 @@ void NodeDiscovery_PrintPeers(node_discovery_t* disc) {
         (void)port; // port is part of ip endpoint identity; shown via connect logs
     }
 
-    size_t selfCount = DynArr_size(disc->selfEndpoints);
+    size_t selfCount = vector_size(disc->selfEndpoints);
     printf("Own endpoints (%zu):\n", selfCount);
     for (size_t i = 0; i < selfCount; ++i) {
-        const struct sockaddr_storage* self = (const struct sockaddr_storage*)DynArr_at(disc->selfEndpoints, i);
+        const struct sockaddr_storage* self = (const struct sockaddr_storage*)vector_get_const(disc->selfEndpoints, i);
+        if (!self) continue;
         char ip[INET6_ADDRSTRLEN] = {0};
         unsigned short port = 0;
         Discovery_AddrToIpPort(self, ip, sizeof(ip), &port);

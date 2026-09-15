@@ -17,8 +17,8 @@ typedef struct node_discovery node_discovery_t;
 
 #include <stddef.h>
 
-#include <dynarr.h>
-#include <dynset.h>
+#include <dlibc/vector.h>
+#include <dlibc/set.h>
 
 #include <pthread.h>
 
@@ -32,7 +32,7 @@ typedef struct {
     tcp_client_t outboundClients[MAX_CONS];
     size_t outboundCount;
     // Dedup cache for recently seen block hashes (canonical 32-byte hash)
-    DynSet* seenBlocks;
+    set_t* seenBlocks;
     // Protects seenBlocks
     pthread_mutex_t seenLock;
     // Protects outboundClients snapshots and peerBlockHeight writes

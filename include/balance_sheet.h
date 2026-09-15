@@ -2,7 +2,6 @@
 #define BALANCE_SHEET_H
 
 #include <stdint.h>
-#include <dynarr.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>

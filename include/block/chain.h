@@ -2,7 +2,7 @@
 #define CHAIN_H
 
 #include <block/block.h>
-#include <dynarr.h>
+#include <dlibc/vector.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -21,7 +21,9 @@ typedef struct {
 // Tagged so block.h can forward-declare it: PoW validity depends on the chain (it needs the epoch
 // seed), but chain.h includes block.h, so the tag is what breaks the cycle.
 typedef struct blockchain {
-    DynArr* blocks;
+    // Vector of block_t, stored by value. Each element owns its `transactions` vector, which the
+    // element destructor frees whenever a block leaves the chain (rollback, clear, destroy).
+    vector_t* blocks;
     size_t size;
 
     /**

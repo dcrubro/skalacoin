@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <openssl/sha.h>
-#include <dynarr.h>
+#include <dlibc/vector.h>
 #include <block/transaction.h>
 #include <stdbool.h>
 #include <string.h>
@@ -27,7 +27,7 @@ typedef struct {
 
 typedef struct {
     block_header_t header;
-    DynArr* transactions; // Array of signed_transaction_t, NOTE: Potentially move to a hashmap at some point for quick lookups.
+    vector_t* transactions; // Vector of signed_transaction_t, NOTE: Potentially move to a hashmap at some point for quick lookups.
 } block_t;
 
 // PoW validity is chain-relative: it needs the epoch DAG size and seed. chain.h includes this

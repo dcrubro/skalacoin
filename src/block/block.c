@@ -133,7 +133,7 @@ block_t* Block_Create() {
         return NULL;
     }
     memset(&block->header, 0, sizeof(block_header_t));
-    block->transactions = DYNARR_CREATE(signed_transaction_t, 1);
+    block->transactions = vector_create(sizeof(signed_transaction_t));
     if (!block->transactions) {
         free(block);
         return NULL;
@@ -160,13 +160,13 @@ void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash) {
         return;
     }
 
-    const size_t txCount = DynArr_size(block->transactions);
+    const size_t txCount = vector_size(block->transactions);
     if (txCount == 0) {
         memset(outHash, 0, 32);
         return;
     }
     if (txCount == 1) {
-        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, 0);
+        signed_transaction_t* tx = (signed_transaction_t*)vector_get(block->transactions, 0);
         Transaction_CalculateHash(tx, outHash);
         return;
     }
@@ -181,7 +181,7 @@ void Block_CalculateMerkleRoot(const block_t* block, uint8_t* outHash) {
     }
 
     for (size_t i = 0; i < txCount; ++i) {
-        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+        signed_transaction_t* tx = (signed_transaction_t*)vector_get(block->transactions, i);
         if (!tx) {
             free(current);
             free(next);
@@ -223,7 +223,7 @@ void Block_AddTransaction(block_t* block, signed_transaction_t* tx) {
         return;
     }
 
-    DynArr_push_back(block->transactions, tx);
+    vector_push_back(block->transactions, tx);
 }
 
 void Block_RemoveTransaction(block_t* block, uint8_t* txHash) {
@@ -231,12 +231,12 @@ void Block_RemoveTransaction(block_t* block, uint8_t* txHash) {
         return;
     }
 
-    for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
-        signed_transaction_t* currentTx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+    for (size_t i = 0; i < vector_size(block->transactions); i++) {
+        signed_transaction_t* currentTx = (signed_transaction_t*)vector_get(block->transactions, i);
         uint8_t currentTxHash[32];
         Transaction_CalculateHash(currentTx, currentTxHash);
         if (memcmp(currentTxHash, txHash, 32) == 0) {
-            DynArr_remove(block->transactions, i);
+            vector_pop_at(block->transactions, i);
             return;
         }
     }
@@ -311,8 +311,8 @@ bool Block_AllTransactionsValid(const block_t* block) {
 
     bool hasCoinbase = false;
 
-    for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
-        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+    for (size_t i = 0; i < vector_size(block->transactions); i++) {
+        signed_transaction_t* tx = (signed_transaction_t*)vector_get(block->transactions, i);
         if (!Transaction_Verify(tx)) {
             return false;
         }
@@ -326,7 +326,7 @@ bool Block_AllTransactionsValid(const block_t* block) {
         }
     }
 
-    return true && hasCoinbase && DynArr_size(block->transactions) > 0; // Every block must have at least one transaction (the coinbase)
+    return true && hasCoinbase && vector_size(block->transactions) > 0; // Every block must have at least one transaction (the coinbase)
 }
 
 bool Block_ValidateCoinbaseAndFees(const block_t* block, uint64_t expectedCoinbaseAmount, uint64_t* outTotalFees) {
@@ -338,8 +338,8 @@ bool Block_ValidateCoinbaseAndFees(const block_t* block, uint64_t expectedCoinba
     uint64_t totalFees = 0;
     uint8_t zeroAddress[32] = {0};
 
-    for (size_t i = 0; i < DynArr_size(block->transactions); ++i) {
-        signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+    for (size_t i = 0; i < vector_size(block->transactions); ++i) {
+        signed_transaction_t* tx = (signed_transaction_t*)vector_get(block->transactions, i);
         if (!tx) {
             return false;
         }
@@ -408,7 +408,7 @@ bool Block_HasValidStructure(const block_t* block) {
 
     return Block_HasValidVote(block) &&
            Block_AllTransactionsValid(block) &&
-           DynArr_size(block->transactions) > 0;
+           vector_size(block->transactions) > 0;
 }
 
 bool Block_IsFullyValid(const block_t* block, blockchain_t* chain) {
@@ -417,7 +417,7 @@ bool Block_IsFullyValid(const block_t* block, blockchain_t* chain) {
 
 void Block_Destroy(block_t* block) {
     if (!block) return;
-    DynArr_destroy(block->transactions);
+    vector_destroy(&block->transactions);
     free(block);
 }
 
@@ -440,9 +440,9 @@ void Block_Print(const block_t* block) {
     }
     printf("\n");
     if (block->transactions) {
-        printf("Transactions (%zu):\n", DynArr_size(block->transactions));
-        for (size_t i = 0; i < DynArr_size(block->transactions); i++) {
-            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(block->transactions, i);
+        printf("Transactions (%zu):\n", vector_size(block->transactions));
+        for (size_t i = 0; i < vector_size(block->transactions); i++) {
+            signed_transaction_t* tx = (signed_transaction_t*)vector_get(block->transactions, i);
             if (tx) {
                 printf("  Tx #%zu: 1: %llu -> %02x%02x...%02x%02x, fee %llu\n           2: %llu -> %02x%02x...%02x%02x, fee %llu\n", 
                     i,
@@ -470,7 +470,7 @@ void Block_ShortPrint(const block_t* block) {
         block->header.version,
         block->header.prevHash[0], block->header.prevHash[1], block->header.prevHash[30], block->header.prevHash[31],
         block->header.merkleRoot[0], block->header.merkleRoot[1], block->header.merkleRoot[30], block->header.merkleRoot[31],
-        block->transactions ? DynArr_size(block->transactions) : 0);
+        vector_size(block->transactions));
 }
 
 block_t* Block_Copy(const block_t* src) {
@@ -479,24 +479,12 @@ block_t* Block_Copy(const block_t* src) {
     if (!dst) return NULL;
     dst->header = src->header;
     if (src->transactions) {
-        size_t txCount = DynArr_size(src->transactions);
-        dst->transactions = DYNARR_CREATE(signed_transaction_t, txCount == 0 ? 1 : txCount);
+        // Transactions own no memory of their own, so the vector has no destructor and a byte-wise
+        // deep copy is exactly an independent copy of the list.
+        dst->transactions = vector_deep_copy(src->transactions);
         if (!dst->transactions) {
             free(dst);
             return NULL;
-        }
-        for (size_t i = 0; i < txCount; ++i) {
-            signed_transaction_t* tx = (signed_transaction_t*)DynArr_at(src->transactions, i);
-            if (!tx) {
-                DynArr_destroy(dst->transactions);
-                free(dst);
-                return NULL;
-            }
-            if (!DynArr_push_back(dst->transactions, tx)) {
-                DynArr_destroy(dst->transactions);
-                free(dst);
-                return NULL;
-            }
         }
     } else {
         dst->transactions = NULL;
