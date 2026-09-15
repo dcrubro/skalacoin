@@ -41,8 +41,16 @@ static bool BuildPath(char* out, size_t outSize, const char* dirpath, const char
         return false;
     }
 
-    const int written = snprintf(out, outSize, "%s/%s", dirpath, filename);
-    return written > 0 && (size_t)written < outSize;
+    const size_t dirLen = strlen(dirpath);
+    const size_t fileLen = strlen(filename);
+    if (dirLen + 1 + fileLen >= outSize) {
+        return false;
+    }
+
+    memcpy(out, dirpath, dirLen);
+    out[dirLen] = '/';
+    memcpy(out + dirLen + 1, filename, fileLen + 1);
+    return true;
 }
 
 static bool BuildSpendAmount(const signed_transaction_t* tx, uint256_t* outSpend) {
@@ -70,7 +78,7 @@ static bool CreditAddress(const uint8_t address[32], uint64_t amount) {
     }
 
     balance_sheet_entry_t entry;
-    if (BalanceSheet_Lookup((uint8_t*)address, &entry)) {
+    if (BalanceSheet_Lookup(address, &entry)) {
         if (uint256_add_u64(&entry.balance, amount)) {
             return false;
         }
@@ -97,7 +105,7 @@ static bool DebitAddress(const uint8_t address[32], const uint256_t* amount, uin
     }
 
     balance_sheet_entry_t entry;
-    if (!BalanceSheet_Lookup((uint8_t*)address, &entry)) {
+    if (!BalanceSheet_Lookup(address, &entry)) {
         return false;
     }
 
@@ -985,7 +993,7 @@ bool Chain_BlockRespectsSenderOrdering(const block_t* block) {
         // Baseline is THIS sender's own last included transaction.
         uint64_t lastSeen = 0;
         balance_sheet_entry_t senderEntry;
-        if (BalanceSheet_Lookup((uint8_t*)tx->transaction.senderAddress, &senderEntry)) {
+        if (BalanceSheet_Lookup(tx->transaction.senderAddress, &senderEntry)) {
             lastSeen = senderEntry.lastTxTimestamp;
         }
 
@@ -1537,7 +1545,7 @@ bool Chain_LoadFromFile(blockchain_t* chain, const char* dirpath, uint256_t* out
         }
 
         // Seek to that position
-        if (fseek(chainFile, loc.byteNumber, SEEK_SET) != 0) {
+        if (loc.byteNumber > (uint64_t)LONG_MAX || fseek(chainFile, (long)loc.byteNumber, SEEK_SET) != 0) {
             fclose(chainFile);
             fclose(tableFile);
             return false;

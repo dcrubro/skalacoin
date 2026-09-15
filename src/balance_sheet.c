@@ -22,7 +22,7 @@ static bool BalanceSheet_GetSimEntry(
         return true;
     }
 
-    if (BalanceSheet_Lookup((uint8_t*)address, out)) {
+    if (BalanceSheet_Lookup(address, out)) {
         int ret = 0;
         k = kh_put(balance_sheet_map_m, simMap, key, &ret);
         if (k == kh_end(simMap)) {
@@ -170,7 +170,7 @@ int BalanceSheet_Insert(balance_sheet_entry_t entry) {
     return ret;
 }
 
-bool BalanceSheet_Lookup(uint8_t* address, balance_sheet_entry_t* out) {
+bool BalanceSheet_Lookup(const uint8_t* address, balance_sheet_entry_t* out) {
     if (!address || !out) { return false; }
 
     pthread_mutex_lock(&g_sheetLock);

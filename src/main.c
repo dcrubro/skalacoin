@@ -42,7 +42,7 @@ uint64_t g_localNodeId = 0; // Randomised in main() before the node comes up
 pthread_rwlock_t g_chainLock;
 pthread_mutex_t g_balanceSheetLock;
 
-void handle_sigint(int sig) {
+static void handle_sigint(int sig) {
     printf("Caught signal %d, exiting...\n", sig);
     Block_ShutdownPowContext();
     BalanceSheet_Destroy();
@@ -335,7 +335,7 @@ static void PrintBlockDetail(const block_t* block, size_t txCount, const uint8_t
     printf("\n");
 }
 
-static bool ComputeHistoricalAutolykosHashFromChain(const blockchain_t* chain, const block_t* block, uint64_t blockHeight, uint8_t outHash[32]) {
+static bool ComputeHistoricalAutolykosHashFromChain(blockchain_t* chain, const block_t* block, uint64_t blockHeight, uint8_t outHash[32]) {
     if (!chain || !block || !outHash) {
         return false;
     }
@@ -345,7 +345,7 @@ static bool ComputeHistoricalAutolykosHashFromChain(const blockchain_t* chain, c
     // that disagreed with the one in constants.h -- notably at exactly height EPOCH_LENGTH.
     uint8_t seed[32];
     size_t dagBytes = 0;
-    if (!Chain_DagParamsForHeight((blockchain_t*)chain, blockHeight, &dagBytes, seed)) {
+    if (!Chain_DagParamsForHeight(chain, blockHeight, &dagBytes, seed)) {
         return false;
     }
 
@@ -770,7 +770,7 @@ static bool VerifyChainFully(blockchain_t* chain) {
 }
 
 // Use when error
-[[noreturn]] void KillEverythingAndExit(net_node_t* node, blockchain_t* chain) {
+[[noreturn]] static void KillEverythingAndExit(net_node_t* node, blockchain_t* chain) {
     Node_Destroy(node);
     g_currentChain = NULL;
     Chain_Destroy(chain);
@@ -914,7 +914,7 @@ int main(int argc, char* argv[]) {
     bool loadedWallet = false;
 
     // Attempt load
-    char* path = "chain_data/wallet.data"; // TODO: Don't hardcode path
+    const char* path = "chain_data/wallet.data"; // TODO: Don't hardcode path
     FILE* walletFile = fopen(path, "rb");
     if (walletFile) {
         size_t read = fread(minerPrivateKey, 1, 32, walletFile);

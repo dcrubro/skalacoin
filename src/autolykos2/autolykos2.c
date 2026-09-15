@@ -459,8 +459,8 @@ bool Autolykos2_CheckTarget(
     }
 
 #ifdef SKALACOIN_AUTOLYKOS2_REF_AVAILABLE
-    if (ctx->backend) {
-        const bool ok = skalacoin_autolykos2_ref_check_target(ctx->backend, message32, nonce, height, target32);
+    if (ctx->backend && height <= UINT32_MAX) {
+        const bool ok = skalacoin_autolykos2_ref_check_target(ctx->backend, message32, nonce, (uint32_t)height, target32);
         if (Autolykos2_Hash(ctx, message32, 32, nonce, height, outHash)) {
             return ok;
         }

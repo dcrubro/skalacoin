@@ -47,7 +47,7 @@ extern khash_t(balance_sheet_map_m)* g_sheetMap;
 
 void BalanceSheet_Init();
 int BalanceSheet_Insert(balance_sheet_entry_t entry);
-bool BalanceSheet_Lookup(uint8_t* address, balance_sheet_entry_t* out);
+bool BalanceSheet_Lookup(const uint8_t* address, balance_sheet_entry_t* out);
 bool BalanceSheet_SaveToFile(const char* outPath);
 bool BalanceSheet_LoadFromFile(const char* inPath); 
 void BalanceSheet_Print();

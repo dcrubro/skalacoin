@@ -38,7 +38,7 @@ static inline uint64_t get_current_time_ms(void) {
         return 0; // Handle error
     }
     // Convert seconds to milliseconds and add nanoseconds converted to milliseconds
-    return (spec.tv_sec * 1000) + (spec.tv_nsec / 1000000);
+    return ((uint64_t)spec.tv_sec * 1000ULL) + ((uint64_t)spec.tv_nsec / 1000000ULL);
 }
 
 static inline void sleep_for_microseconds(uint64_t microseconds) {

@@ -133,7 +133,7 @@ static const size_t MAX_ORPHAN_BLOCKS = 512U;
 static const uint64_t IBD_TIP_AGE_BLOCKS = 20ULL;
 // Number of trailing blocks whose median timestamp is used for the age test above. Using a median
 // rather than the tip alone means a single miner cannot backdate one block to fake being in IBD.
-static const size_t MEDIAN_TIME_SPAN = 11U;
+#define MEDIAN_TIME_SPAN 11U
 
 // Reward schedule acceleration: 1 means normal-speed progression.
 #define EMISSION_ACCELERATION_FACTOR 1ULL

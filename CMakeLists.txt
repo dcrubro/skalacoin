@@ -193,7 +193,6 @@ else()
     skalacoin_append_supported_c_flags(SKALACOIN_C_WARNINGS
         -Wall
         -Wextra
-        -Wpedantic
         -Wshadow
         -Wconversion
         -Wsign-conversion
