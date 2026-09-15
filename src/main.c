@@ -1095,6 +1095,7 @@ int main(int argc, char* argv[]) {
                 }
                 free(acceptedTxs);
 
+                printf("(%llu/%llu) ", (unsigned long long)(i + 1), requested);
                 if (!MineAndAppendBlock(chain, block, &g_currentSupply, &g_currentReward)) {
                     Block_Destroy(block);
                     minedAll = false;
