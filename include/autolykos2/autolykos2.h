@@ -12,7 +12,7 @@ extern "C" {
 
 typedef struct Autolykos2Context Autolykos2Context;
 
-extern uint64_t autolykos2_sleepBetweenHashOperationsMicroseconds;
+extern uint64_t g_autolykos2_sleepBetweenHashOperationsMicroseconds;
 
 Autolykos2Context* Autolykos2_Create(void);
 void Autolykos2_Destroy(Autolykos2Context* ctx);

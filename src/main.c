@@ -29,18 +29,18 @@
 #define CHAIN_DATA_DIR "chain_data"
 #endif
 
-blockchain_t* currentChain = NULL;
-const char* chainDataDir = CHAIN_DATA_DIR;
-unsigned short listenPort = LISTEN_PORT;
-bool echoPeersEnabled = ECHO_PEERS != 0;
-bool forceOrphanReorgEnabled = false;
-uint256_t currentSupply = {{0, 0, 0, 0}};
-uint64_t currentReward = 750000000000ULL;
-uint64_t localNodeId = 0; // Randomised in main() before the node comes up
+blockchain_t* g_currentChain = NULL;
+const char* g_chainDataDir = CHAIN_DATA_DIR;
+unsigned short g_listenPort = LISTEN_PORT;
+bool g_echoPeersEnabled = ECHO_PEERS != 0;
+bool g_forceOrphanReorgEnabled = false;
+uint256_t g_currentSupply = {{0, 0, 0, 0}};
+uint64_t g_currentReward = 750000000000ULL;
+uint64_t g_localNodeId = 0; // Randomised in main() before the node comes up
 
 // Define the synchronization primitives declared in runtime_state.h
-pthread_rwlock_t chainLock;
-pthread_mutex_t balanceSheetLock;
+pthread_rwlock_t g_chainLock;
+pthread_mutex_t g_balanceSheetLock;
 
 void handle_sigint(int sig) {
     printf("Caught signal %d, exiting...\n", sig);
@@ -52,7 +52,7 @@ void handle_sigint(int sig) {
 static void ApplyRuntimeConfigFromEnv(void) {
     const char* dataDir = getenv("SKALACOIN_CHAIN_DATA_DIR");
     if (dataDir && dataDir[0] != '\0') {
-        chainDataDir = dataDir;
+        g_chainDataDir = dataDir;
     }
 
     const char* portStr = getenv("SKALACOIN_LISTEN_PORT");
@@ -60,29 +60,29 @@ static void ApplyRuntimeConfigFromEnv(void) {
         char* end = NULL;
         long parsed = strtol(portStr, &end, 10);
         if (end != portStr && *end == '\0' && parsed > 0 && parsed <= 65535) {
-            listenPort = (unsigned short)parsed;
+            g_listenPort = (unsigned short)parsed;
         }
     }
 
     const char* echoStr = getenv("SKALACOIN_ECHO_PEERS");
     if (echoStr && echoStr[0] != '\0') {
-        echoPeersEnabled = (strcmp(echoStr, "0") != 0);
+        g_echoPeersEnabled = (strcmp(echoStr, "0") != 0);
     }
 
     const char* forceOrphanStr = getenv("SKALACOIN_FORCE_ORPHAN_REORG");
     if (forceOrphanStr && forceOrphanStr[0] != '\0') {
-        forceOrphanReorgEnabled = (strcmp(forceOrphanStr, "0") != 0);
+        g_forceOrphanReorgEnabled = (strcmp(forceOrphanStr, "0") != 0);
     }
 }
 
-uint32_t difficultyTarget = INITIAL_DIFFICULTY;
+uint32_t g_difficultyTarget = INITIAL_DIFFICULTY;
 
 static bool MineBlock(blockchain_t* chain, block_t* block) {
     if (!chain || !block) {
         return false;
     }
 
-    // Resolve the epoch parameters ONCE. Doing it per nonce would take chainLock millions of times
+    // Resolve the epoch parameters ONCE. Doing it per nonce would take g_chainLock millions of times
     // per block and contend with every network thread.
     size_t dagBytes = 0;
     uint8_t seed[32];
@@ -568,8 +568,8 @@ static bool MineAndAppendBlock(blockchain_t* chain,
     if (attached > 0) {
         printf("Attached %zu orphan(s) after mining/appending block\n", attached);
         // Persist chain/sheet after attaching orphans
-        Chain_SaveToFile(chain, chainDataDir, *currentSupply, *currentReward);
-        BalanceSheet_SaveToFile(chainDataDir);
+        Chain_SaveToFile(chain, g_chainDataDir, *currentSupply, *currentReward);
+        BalanceSheet_SaveToFile(g_chainDataDir);
     }
 
     uint8_t canonicalHash[32];
@@ -711,9 +711,9 @@ static bool VerifyChainFully(blockchain_t* chain) {
         }
 
         uint64_t expectedReward = 0;
-        uint64_t savedReward = currentReward;
+        uint64_t savedReward = g_currentReward;
         expectedReward = CalculateBlockReward(replaySupply, prevChain);
-        currentReward = savedReward;
+        g_currentReward = savedReward;
 
         if (!Block_AllTransactionsValid(blk)) {
             Block_Destroy(blk);
@@ -772,7 +772,7 @@ static bool VerifyChainFully(blockchain_t* chain) {
 // Use when error
 [[noreturn]] void KillEverythingAndExit(net_node_t* node, blockchain_t* chain) {
     Node_Destroy(node);
-    currentChain = NULL;
+    g_currentChain = NULL;
     Chain_Destroy(chain);
     Block_ShutdownPowContext();
     BalanceSheet_Destroy();
@@ -818,12 +818,12 @@ int main(int argc, char* argv[]) {
     // Pick this run's node identity before the node (and with it the listener) comes up, so every
     // handshake can carry it. Peers are identified by this nonce rather than by an (ip, port)
     // endpoint, which a multi-homed host has several of.
-    localNodeId = random_secure_eight_byte();
-    printf("Node identity: %016" PRIx64 "\n", localNodeId);
+    g_localNodeId = random_secure_eight_byte();
+    printf("Node identity: %016" PRIx64 "\n", g_localNodeId);
 
     // Initialize runtime locks before any thread or helper can touch chain state.
-    pthread_rwlock_init(&chainLock, NULL);
-    pthread_mutex_init(&balanceSheetLock, NULL);
+    pthread_rwlock_init(&g_chainLock, NULL);
+    pthread_mutex_init(&g_balanceSheetLock, NULL);
 
     BalanceSheet_Init();
     blockchain_t* chain = Chain_Create();
@@ -833,19 +833,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    currentChain = chain;
+    g_currentChain = chain;
 
     net_node_t* node = Node_Create();
     if (!node) {
-        currentChain = NULL;
+        g_currentChain = NULL;
         Chain_Destroy(chain);
         BalanceSheet_Destroy();
         return 1;
     }
 
     uint8_t lastSavedHash[32] = {0};
-    if (!Chain_LoadFromFile(chain, chainDataDir, &currentSupply, &difficultyTarget, &currentReward, lastSavedHash, false)) {
-        printf("No existing chain loaded from %s\n", chainDataDir);
+    if (!Chain_LoadFromFile(chain, g_chainDataDir, &g_currentSupply, &g_difficultyTarget, &g_currentReward, lastSavedHash, false)) {
+        printf("No existing chain loaded from %s\n", g_chainDataDir);
     } else {
         // Recompute runtime supply/reward from loaded blocks to avoid trusting stale meta values.
         if (!Chain_RecomputeRuntimeState(chain)) {
@@ -857,7 +857,7 @@ int main(int argc, char* argv[]) {
         Chain_OnTipAdvanced(chain);
     }
 
-    if (!BalanceSheet_LoadFromFile(chainDataDir)) {
+    if (!BalanceSheet_LoadFromFile(g_chainDataDir)) {
         printf("Failed to load the balance sheet or none existing\n");
     }
 
@@ -866,8 +866,8 @@ int main(int argc, char* argv[]) {
             ? (PHASE1_TARGET_BLOCKS / EMISSION_ACCELERATION_FACTOR)
             : 1;
 
-    if ((uint64_t)Chain_Size(chain) < effectivePhase1Blocks || currentReward == 0) {
-        currentReward = CalculateBlockReward(currentSupply, chain);
+    if ((uint64_t)Chain_Size(chain) < effectivePhase1Blocks || g_currentReward == 0) {
+        g_currentReward = CalculateBlockReward(g_currentSupply, chain);
     }
 
     {
@@ -895,13 +895,13 @@ int main(int argc, char* argv[]) {
             printf("Loaded chain with %zu blocks from disk\n", Chain_Size(chain));
         } else {
             fprintf(stderr, "loaded chain is invalid, wiping persisted state.\n");
-            WipeChainFiles(chainDataDir);
+            WipeChainFiles(g_chainDataDir);
             Chain_Wipe(chain);
             BalanceSheet_Destroy();
             BalanceSheet_Init();
-            currentSupply = uint256_from_u64(0);
-            difficultyTarget = INITIAL_DIFFICULTY;
-            currentReward = CalculateBlockReward(currentSupply, chain);
+            g_currentSupply = uint256_from_u64(0);
+            g_difficultyTarget = INITIAL_DIFFICULTY;
+            g_currentReward = CalculateBlockReward(g_currentSupply, chain);
         }
     }
 
@@ -984,7 +984,7 @@ int main(int argc, char* argv[]) {
     if (!GenerateTestMinerIdentity(minerPrivateKey, minerCompressedPubkey, minerAddress)) {
         fprintf(stderr, "failed to generate test miner keypair\n");
         Node_Destroy(node);
-        currentChain = NULL;
+        g_currentChain = NULL;
         Chain_Destroy(chain);
         Block_ShutdownPowContext();
         BalanceSheet_Destroy();
@@ -996,7 +996,7 @@ int main(int argc, char* argv[]) {
     printf("Test miner address: %s\n", minerAddressHex);
 
     char supplyStr[80];
-    Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
+    Uint256ToDecimal(&g_currentSupply, supplyStr, sizeof(supplyStr));
     printf("Current chain has %zu blocks, total supply %s\n", Chain_Size(chain), supplyStr);
     printf("Commands: mine <x>, send <address> <amount> [fee], sendrawtx <hex_tx>, txpooldetail <txhash>, balance [address], connect <ipv4> [port], peers, sync [force] (requires nodes), dagvote <grow|hold|down>, flushchain, fullverify, blockdetail <block number>, wipechain, genaddr, exit\n");
 
@@ -1079,7 +1079,7 @@ int main(int argc, char* argv[]) {
                     break;
                 }
 
-                uint64_t coinbaseAmount = currentReward;
+                uint64_t coinbaseAmount = g_currentReward;
                 if (UINT64_MAX - coinbaseAmount < totalFees) {
                     free(acceptedTxs);
                     Block_Destroy(block);
@@ -1095,7 +1095,7 @@ int main(int argc, char* argv[]) {
                 }
                 free(acceptedTxs);
 
-                if (!MineAndAppendBlock(chain, block, &currentSupply, &currentReward)) {
+                if (!MineAndAppendBlock(chain, block, &g_currentSupply, &g_currentReward)) {
                     Block_Destroy(block);
                     minedAll = false;
                     break;
@@ -1110,14 +1110,14 @@ int main(int argc, char* argv[]) {
 
                 if (i % 50 == 0) {
                     // Mid-mine flush
-                    (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
+                    (void)FlushChainAndSheet(chain, g_chainDataDir, g_currentSupply, g_currentReward);
                 }
             }
 
             
 
             if (minedAll) {
-                (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
+                (void)FlushChainAndSheet(chain, g_chainDataDir, g_currentSupply, g_currentReward);
                 printf("mine finished and chain flushed\n");
             }
             continue;
@@ -1189,7 +1189,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            uint64_t coinbaseAmount = currentReward;
+            uint64_t coinbaseAmount = g_currentReward;
             AddCoinbaseTransaction(block, minerAddress, coinbaseAmount);
 
             signed_transaction_t spendTx;
@@ -1212,12 +1212,12 @@ int main(int argc, char* argv[]) {
             AddressToHexString(recipientAddress, recipientHex);
             printf("%s\n\nMining block...\n", recipientHex);
             
-            if (!MineAndAppendBlock(chain, block, &currentSupply, &currentReward)) {
+            if (!MineAndAppendBlock(chain, block, &g_currentSupply, &g_currentReward)) {
                 Block_Destroy(block);
                 continue;
             }
 
-            FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
+            FlushChainAndSheet(chain, g_chainDataDir, g_currentSupply, g_currentReward);
 
             Block_Destroy(block); // the chain took the transaction array; this frees the wrapper
             if (node) {
@@ -1749,7 +1749,7 @@ int main(int argc, char* argv[]) {
 
             block_t* detailBlock = NULL;
             size_t txCount = 0;
-            if (!Chain_LoadBlockFromFile(chainDataDir, (uint64_t)requestedBlock, false, &detailBlock, &txCount)) {
+            if (!Chain_LoadBlockFromFile(g_chainDataDir, (uint64_t)requestedBlock, false, &detailBlock, &txCount)) {
                 printf("block %llu not found\n", requestedBlock);
                 continue;
             }
@@ -1757,7 +1757,7 @@ int main(int argc, char* argv[]) {
             uint8_t canonicalHash[32];
             uint8_t powHash[32];
             Block_CalculateHash(detailBlock, canonicalHash);
-            if (!ComputeHistoricalAutolykosHashFromDisk(chainDataDir, (uint64_t)requestedBlock, detailBlock, powHash)) {
+            if (!ComputeHistoricalAutolykosHashFromDisk(g_chainDataDir, (uint64_t)requestedBlock, detailBlock, powHash)) {
                 Block_Destroy(detailBlock);
                 printf("failed to calculate block %llu proof hash\n", requestedBlock);
                 continue;
@@ -1822,7 +1822,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            unsigned short peerPort = listenPort;
+            unsigned short peerPort = g_listenPort;
             if (portStr) {
                 char* end = NULL;
                 long parsedPort = strtol(portStr, &end, 10);
@@ -1860,7 +1860,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (strcmp(cmd, "flushchain") == 0) {
-            if (FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward)) {
+            if (FlushChainAndSheet(chain, g_chainDataDir, g_currentSupply, g_currentReward)) {
                 printf("chain flushed\n");
             }
             continue;
@@ -1880,7 +1880,7 @@ int main(int argc, char* argv[]) {
 
             bool loaded = Chain_LoadFromFile(
                 verifyChain,
-                chainDataDir,
+                g_chainDataDir,
                 &verifySupply,
                 &verifyDifficulty,
                 &verifyReward,
@@ -1899,13 +1899,13 @@ int main(int argc, char* argv[]) {
         }
 
         if (strcmp(cmd, "wipechain") == 0) {
-            WipeChainFiles(chainDataDir);
+            WipeChainFiles(g_chainDataDir);
             Chain_Wipe(chain);
             BalanceSheet_Destroy();
             BalanceSheet_Init();
-            currentSupply = uint256_from_u64(0);
-            difficultyTarget = INITIAL_DIFFICULTY;
-            currentReward = CalculateBlockReward(currentSupply, chain);
+            g_currentSupply = uint256_from_u64(0);
+            g_difficultyTarget = INITIAL_DIFFICULTY;
+            g_currentReward = CalculateBlockReward(g_currentSupply, chain);
 
             // No DAG rebuild needed: Chain_Wipe drops the memoised epoch table, and MineBlock
             // rebuilds the DAG on demand for whatever epoch it next mines in.
@@ -1934,16 +1934,16 @@ int main(int argc, char* argv[]) {
         printf("Unknown command. Available: mine, send, sendrawtx, sync, txpooldetail, blockdetail, balance, connect, peers, flushchain, fullverify, wipechain, genaddr, exit\n");
     }
 
-    (void)FlushChainAndSheet(chain, chainDataDir, currentSupply, currentReward);
+    (void)FlushChainAndSheet(chain, g_chainDataDir, g_currentSupply, g_currentReward);
 
     Block_ShutdownPowContext();
     Node_Destroy(node);
-    currentChain = NULL;
+    g_currentChain = NULL;
     Chain_Destroy(chain);
     BalanceSheet_Destroy();
 
-    pthread_mutex_destroy(&balanceSheetLock);
-    pthread_rwlock_destroy(&chainLock);
+    pthread_mutex_destroy(&g_balanceSheetLock);
+    pthread_rwlock_destroy(&g_chainLock);
 
     return 0;
 }

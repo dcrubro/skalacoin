@@ -21,7 +21,7 @@ static uint64_t g_nextSequence = 0;
 // thread. It used to have no synchronisation at all, so a concurrent Insert could realloc the
 // array out from under a scan that was holding a raw element pointer.
 //
-// Lock ordering: this mutex is never held while calling into chain.c (which takes chainLock).
+// Lock ordering: this mutex is never held while calling into chain.c (which takes g_chainLock).
 // Candidate branches are collected under the lock, the lock is dropped, and only then is
 // Chain_ReplaceBranch/Chain_AddBlock called.
 static pthread_mutex_t g_orphanLock = PTHREAD_MUTEX_INITIALIZER;

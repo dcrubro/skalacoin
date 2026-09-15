@@ -16,7 +16,7 @@ KHASH_INIT(tx_mempool_map_m, key32_t, signed_transaction_t, 1, hash_key32, eq_ke
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
-extern khash_t(tx_mempool_map_m)* txMempool;
+extern khash_t(tx_mempool_map_m)* g_txMempool;
 
 void TxMempool_Init();
 // Assumed that the transation was confirmed to be valid

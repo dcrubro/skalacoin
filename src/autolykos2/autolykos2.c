@@ -10,7 +10,7 @@
 #include <unistd.h>
 #endif
 
-uint64_t autolykos2_sleepBetweenHashOperationsMicroseconds = 0;
+uint64_t g_autolykos2_sleepBetweenHashOperationsMicroseconds = 0;
 
 typedef struct {
     uint8_t* buf;
@@ -249,12 +249,12 @@ static bool Autolykos2_HashCore(
     bool ok = Blake2b_Hash(finalInput, sizeof(finalInput), outHash, 32);
 
     // Throttle between hash operations if configured (applies to all hash paths).
-    if (autolykos2_sleepBetweenHashOperationsMicroseconds > 0) {
+    if (g_autolykos2_sleepBetweenHashOperationsMicroseconds > 0) {
 #if defined(_WIN32) || defined(_WIN64)
-        DWORD ms = (DWORD)((autolykos2_sleepBetweenHashOperationsMicroseconds + 999) / 1000);
+        DWORD ms = (DWORD)((g_autolykos2_sleepBetweenHashOperationsMicroseconds + 999) / 1000);
         Sleep(ms);
 #else
-        sleep_for_microseconds(autolykos2_sleepBetweenHashOperationsMicroseconds);
+        sleep_for_microseconds(g_autolykos2_sleepBetweenHashOperationsMicroseconds);
 #endif
     }
 
@@ -500,5 +500,5 @@ bool Autolykos2_FindNonceSingleCore(
 }
 
 void Autolykos2_SetSleepBetweenHashOperations(uint64_t sleepMicroseconds) {
-    autolykos2_sleepBetweenHashOperationsMicroseconds = sleepMicroseconds;
+    g_autolykos2_sleepBetweenHashOperationsMicroseconds = sleepMicroseconds;
 }

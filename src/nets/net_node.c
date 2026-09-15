@@ -25,11 +25,11 @@ static net_node_t* Node_FromConnection(tcp_connection_t* conn) {
 }
 
 static uint64_t Node_GetCurrentBlockHeight(void) {
-    if (currentChain) {
-        return (uint64_t)Chain_Size(currentChain);
+    if (g_currentChain) {
+        return (uint64_t)Chain_Size(g_currentChain);
     }
 
-    return currentBlockHeight;
+    return g_currentBlockHeight;
 }
 
 // Compares two listen endpoints (family + IP + port).
@@ -300,7 +300,7 @@ static node_identity_result_t Node_CheckPeerIdentity(net_node_t* node, tcp_conne
     struct sockaddr_storage ep;
     int haveEp = Node_ConnListenEndpoint(conn, &ep);
 
-    if (conn->peerNodeId == localNodeId) {
+    if (conn->peerNodeId == g_localNodeId) {
         // We dialled ourselves (or accepted our own dial). Remember the endpoint as our own so
         // discovery stops offering it back to us, and drop the connection.
         if (haveEp && node->discovery) {
@@ -449,12 +449,12 @@ static void* Node_MaintenanceThread(void* arg) {
     net_node_t* n = (net_node_t*)arg;
     if (!n) return NULL;
     while (n->maintenanceRunning) {
-        if (currentChain) {
-            size_t attached = OrphanPool_AttemptAttach(currentChain);
+        if (g_currentChain) {
+            size_t attached = OrphanPool_AttemptAttach(g_currentChain);
             if (attached > 0) {
                 printf("Maintenance: attached %zu orphan(s)\n", attached);
-                Chain_SaveToFile(currentChain, chainDataDir, currentSupply, currentReward);
-                BalanceSheet_SaveToFile(chainDataDir);
+                Chain_SaveToFile(g_currentChain, g_chainDataDir, g_currentSupply, g_currentReward);
+                BalanceSheet_SaveToFile(g_chainDataDir);
             }
         }
         // Drop transactions too old to be worth holding, so the pool is not inflated by junk that
@@ -546,7 +546,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
 
     // The chain check has to come first now: PoW validity is chain-relative (the epoch DAG size and
     // seed are derived from it), so there is nothing to validate against without a chain.
-    if (!currentChain) {
+    if (!g_currentChain) {
         printf("Rejected BLOCK_DATA at height %" PRIu64 ": no active chain\n", blockHeight);
         vector_destroy(&blk->transactions);
         free(blk);
@@ -570,11 +570,11 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
 
     // The orphan pool stamps the local tip height at first sight; that stamp drives the reorg
     // penalty and must be taken now, not re-derived later from a moved tip.
-    uint64_t chainSize = Chain_Size(currentChain);
+    uint64_t chainSize = Chain_Size(g_currentChain);
     const uint64_t observedAtTipHeight = chainSize > 0 ? (chainSize - 1) : 0ULL;
 
     // Temporary debug mode: force network-received blocks through the orphan pool to exercise reorg handling.
-    if (forceOrphanReorgEnabled && blk->header.blockNumber > 0) {
+    if (g_forceOrphanReorgEnabled && blk->header.blockNumber > 0) {
         OrphanPool_Insert(blk, blockHeight, observedAtTipHeight);
         printf("Forced orphan BLOCK_DATA at height %" PRIu64 "\n", blockHeight);
         return NODE_BLOCK_ORPHAN_QUEUED;
@@ -591,7 +591,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         // branch. Dropping both (as this used to) made any fork that diverges below the tip
         // impossible to discover: the fork point itself was always thrown away.
         block_t* local = NULL;
-        if (Chain_GetBlockCopy(currentChain, (size_t)blk->header.blockNumber, &local) && local) {
+        if (Chain_GetBlockCopy(g_currentChain, (size_t)blk->header.blockNumber, &local) && local) {
             uint8_t localHash[32];
             uint8_t incomingHash[32];
             Block_CalculateHash(local, localHash);
@@ -613,7 +613,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         // blk->header.blockNumber == chainSize -> candidate to append. Ensure prevHash matches current tip.
         if (chainSize > 0) {
             block_t* last = NULL;
-            if (!Chain_GetBlockCopy(currentChain, (size_t)(chainSize - 1), &last) || !last) {
+            if (!Chain_GetBlockCopy(g_currentChain, (size_t)(chainSize - 1), &last) || !last) {
                 // Can't verify parent; queue as orphan conservatively
                 OrphanPool_Insert(blk, blockHeight, observedAtTipHeight);
                 printf("Queued orphan BLOCK_DATA at height %" PRIu64 " (unable to verify parent)\n", blockHeight);
@@ -633,7 +633,7 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         }
     }
 
-    if (!Chain_AddBlock(currentChain, blk)) {
+    if (!Chain_AddBlock(g_currentChain, blk)) {
         // Chain_AddBlock failed; cleanup. Safe either way: if it failed before taking the block we
         // still own the transactions, and if it failed after (the ledger pass can fail with the
         // block already pushed) our pointer to them was cleared, so this frees only the wrapper.
@@ -642,25 +642,25 @@ static node_block_accept_result_t Node_ParseAndAcceptBlock(const unsigned char* 
         return NODE_BLOCK_REJECTED;
     }
 
-    // currentSupply/currentReward are advanced inside Chain_AddBlock, so that every path that
+    // g_currentSupply/g_currentReward are advanced inside Chain_AddBlock, so that every path that
     // appends (mining, this one, orphan attach, reorg) keeps them consistent.
 
     // Persist on accept if requested
     if (persist) {
-        Chain_SaveToFile(currentChain, chainDataDir, currentSupply, currentReward);
-        BalanceSheet_SaveToFile(chainDataDir);
+        Chain_SaveToFile(g_currentChain, g_chainDataDir, g_currentSupply, g_currentReward);
+        BalanceSheet_SaveToFile(g_chainDataDir);
     }
 
     // Chain_AddBlock took ownership of the transaction array and cleared our pointer to it, so
     // destroying the wrapper here frees only the wrapper.
     Block_Destroy(blk);
     // Attempt to attach any orphans that may now have their parents present.
-    size_t attached = OrphanPool_AttemptAttach(currentChain);
+    size_t attached = OrphanPool_AttemptAttach(g_currentChain);
     if (attached > 0) {
         printf("Attached %zu orphan(s) after accepting block\n", attached);
         // Persist after attaching orphans
-        Chain_SaveToFile(currentChain, chainDataDir, currentSupply, currentReward);
-        BalanceSheet_SaveToFile(chainDataDir);
+        Chain_SaveToFile(g_currentChain, g_chainDataDir, g_currentSupply, g_currentReward);
+        BalanceSheet_SaveToFile(g_chainDataDir);
     }
     return NODE_BLOCK_ACCEPTED;
 }
@@ -710,7 +710,7 @@ net_node_t* Node_Create() {
     node->seenBlocks = set_create(32); // 32-byte canonical hashes; raw bytes, so memcmp equality is right
     TxMempool_Init();
 
-    TcpServer_Init(node->server, listenPort, "::");
+    TcpServer_Init(node->server, g_listenPort, "::");
 
     node->server->owner = node;
     node->server->on_connect = Node_Server_OnConnect;
@@ -725,7 +725,7 @@ net_node_t* Node_Create() {
     // the node still works without discovery, it just won't crawl for new peers.
     node->udpNode = (udp_node_t*)malloc(sizeof(udp_node_t));
     if (node->udpNode) {
-        if (UdpNode_Init(node->udpNode, (uint16_t)listenPort) == 0) {
+        if (UdpNode_Init(node->udpNode, (uint16_t)g_listenPort) == 0) {
             UdpNode_SetCallbacks(node->udpNode, Node_OnPongThunk, Node_OnPingTimeoutThunk, node);
             if (UdpNode_Start(node->udpNode) == 0) {
                 node->discovery = NodeDiscovery_Create(node, node->udpNode);
@@ -968,13 +968,13 @@ void Node_Server_OnConnect(tcp_connection_t* client) {
     Node_ForwardConnect(node, client);
     printf("Inbound node connected: %u\n", client ? client->connectionId : 0U);
 
-    if (echoPeersEnabled && node && client) {
+    if (g_echoPeersEnabled && node && client) {
         // Attempt to create an outbound connection back to the peer's IP on our configured port.
         // We avoid connecting if we already have an outbound to the same IP.
         char ipbuf[INET6_ADDRSTRLEN];
         if (TcpConnection_GetPeerAddrStr(client, ipbuf, sizeof(ipbuf))) {
             // Use the configured port as the target port for the peer's listening service.
-            unsigned short targetPort = listenPort;
+            unsigned short targetPort = g_listenPort;
 
             int shouldConnect = 1;
             pthread_mutex_lock(&node->outboundLock);
@@ -1051,10 +1051,10 @@ void Node_Server_OnData(tcp_connection_t* client) {
             uint64_t currentHeight = Node_GetCurrentBlockHeight();
             memcpy(ackData + ackOffset, &currentHeight, sizeof(currentHeight));
             ackOffset += sizeof(currentHeight);
-            uint16_t myListenPort = (uint16_t)listenPort;
+            uint16_t myListenPort = (uint16_t)g_listenPort;
             memcpy(ackData + ackOffset, &myListenPort, sizeof(myListenPort));
             ackOffset += sizeof(myListenPort);
-            uint64_t myNodeId = localNodeId;
+            uint64_t myNodeId = g_localNodeId;
             memcpy(ackData + ackOffset, &myNodeId, sizeof(myNodeId));
             ackOffset += sizeof(myNodeId);
 
@@ -1130,9 +1130,9 @@ void Node_Server_OnData(tcp_connection_t* client) {
             // Find the block (deep-copy it for safe access)
             block_t* block = NULL;
             bool loadedFromDisk = false;
-            if (!Chain_GetBlockCopy(currentChain, (size_t)requestedHeight, &block) || !block) {
+            if (!Chain_GetBlockCopy(g_currentChain, (size_t)requestedHeight, &block) || !block) {
                 // Try loading from disk directly
-                if (!Chain_LoadBlockFromFile(chainDataDir, requestedHeight, true, &block, NULL) || !block) {
+                if (!Chain_LoadBlockFromFile(g_chainDataDir, requestedHeight, true, &block, NULL) || !block) {
                     printf("Requested block height %" PRIu64 " not found, ignoring\n", requestedHeight);
                     const char* msg = "Requested block not found!";
                     Node_SendPacket(Node_FromConnection(client), client, PACKET_TYPE_ERROR, msg, strlen(msg));
@@ -1142,7 +1142,7 @@ void Node_Server_OnData(tcp_connection_t* client) {
             } else if (!block->transactions) {
                 // In-memory chain may be compacted to headers only after persistence.
                 block_t* fullBlock = NULL;
-                if (Chain_LoadBlockFromFile(chainDataDir, requestedHeight, true, &fullBlock, NULL) && fullBlock) {
+                if (Chain_LoadBlockFromFile(g_chainDataDir, requestedHeight, true, &fullBlock, NULL) && fullBlock) {
                     Block_Destroy(block);
                     block = fullBlock;
                     loadedFromDisk = true;
@@ -1349,11 +1349,11 @@ void Node_Client_OnConnect(tcp_connection_t* client) {
         memcpy((unsigned char*)data + offset, &blockHeight, sizeof(blockHeight));
         offset += sizeof(blockHeight);
         // Advertise the port we listen on so the peer can share us with others (and reach us back)
-        uint16_t myListenPort = (uint16_t)listenPort;
+        uint16_t myListenPort = (uint16_t)g_listenPort;
         memcpy((unsigned char*)data + offset, &myListenPort, sizeof(myListenPort));
         offset += sizeof(myListenPort);
         // ...and who we are, so the peer can tell this connection apart from our other addresses
-        uint64_t myNodeId = localNodeId;
+        uint64_t myNodeId = g_localNodeId;
         memcpy((unsigned char*)data + offset, &myNodeId, sizeof(myNodeId));
         offset += sizeof(myNodeId);
 
@@ -1625,20 +1625,20 @@ int Node_GetBestOutboundPeer(net_node_t* node, tcp_connection_t** outConn, uint6
 }
 
 void Node_BroadcastChainRange(net_node_t* node, size_t startHeightInclusive, tcp_connection_t* sourceConn) {
-    if (!node || !currentChain) return;
+    if (!node || !g_currentChain) return;
 
-    size_t chainSize = Chain_Size(currentChain);
+    size_t chainSize = Chain_Size(g_currentChain);
     if (startHeightInclusive >= chainSize) return;
 
     for (size_t h = startHeightInclusive; h < chainSize; ++h) {
         block_t* blk = NULL;
-        if (!Chain_GetBlockCopy(currentChain, h, &blk) || !blk) {
-            if (!Chain_LoadBlockFromFile(chainDataDir, h, true, &blk, NULL) || !blk) {
+        if (!Chain_GetBlockCopy(g_currentChain, h, &blk) || !blk) {
+            if (!Chain_LoadBlockFromFile(g_chainDataDir, h, true, &blk, NULL) || !blk) {
                 continue;
             }
         } else if (!blk->transactions) {
             block_t* full = NULL;
-            if (Chain_LoadBlockFromFile(chainDataDir, h, true, &full, NULL) && full) {
+            if (Chain_LoadBlockFromFile(g_chainDataDir, h, true, &full, NULL) && full) {
                 Block_Destroy(blk);
                 blk = full;
             }

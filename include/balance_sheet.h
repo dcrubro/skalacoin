@@ -43,7 +43,7 @@ KHASH_INIT(balance_sheet_map_m, key32_t, balance_sheet_entry_t, 1, hash_key32, e
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
-extern khash_t(balance_sheet_map_m)* sheetMap;
+extern khash_t(balance_sheet_map_m)* g_sheetMap;
 
 void BalanceSheet_Init();
 int BalanceSheet_Insert(balance_sheet_entry_t entry);

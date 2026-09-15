@@ -37,7 +37,7 @@ typedef struct blockchain {
      * an epoch once the *following* entry has been computed, so it is valid on
      * [0, dagEpochsComputed - 1).
      *
-     * Guarded by `dagCacheLock`, which is always taken AFTER `chainLock` and is never held across a
+     * Guarded by `dagCacheLock`, which is always taken AFTER `g_chainLock` and is never held across a
      * call back into chain.c.
     **/
     dag_epoch_state_t* dagEpochs;
@@ -106,7 +106,7 @@ uint64_t Chain_ReorgPenaltyForDepth(uint64_t reorgDepth);
 **/
 bool Chain_BlockRespectsSenderOrdering(const block_t* block);
 
-// Recompute `currentSupply` and `currentReward` from the in-memory chain blocks.
+// Recompute `g_currentSupply` and `g_currentReward` from the in-memory chain blocks.
 // Returns true on success and updates runtime state globals.
 bool Chain_RecomputeRuntimeState(blockchain_t* chain);
 
@@ -120,15 +120,15 @@ bool Chain_LoadBlockFromFile(const char* dirpath, uint64_t blockNumber, bool loa
 
 // Difficulty
 // Retarget for the block at `height`, measured over the window [height - INTERVAL, height - 1].
-// `chain` must hold blocks 0..height-1. Takes no locks; safe to call while holding `chainLock`.
+// `chain` must hold blocks 0..height-1. Takes no locks; safe to call while holding `g_chainLock`.
 uint32_t Chain_ComputeTargetAtHeight(blockchain_t* chain, uint64_t height, uint32_t currentTarget);
 
 // The consensus-required difficultyTarget for the block at `height`, derived from the chain alone.
-// Takes no locks; safe to call while holding `chainLock`.
+// Takes no locks; safe to call while holding `g_chainLock`.
 uint32_t Chain_GetTargetForHeight(blockchain_t* chain, uint64_t height);
 
 // Refresh runtime state derived from the chain tip (difficulty target, epoch DAG).
-// Call after any change to the tip. Must NOT be called while holding `chainLock`.
+// Call after any change to the tip. Must NOT be called while holding `g_chainLock`.
 void Chain_OnTipAdvanced(blockchain_t* chain);
 
 // DAG
@@ -145,7 +145,7 @@ void Chain_OnTipAdvanced(blockchain_t* chain);
  * true when validating or mining a block at that height. Returns false if it cannot produce both
  * values; callers MUST treat that as an invalid proof rather than falling back to a default.
  *
- * Takes `chainLock` for reading internally. Must NOT be called while holding it.
+ * Takes `g_chainLock` for reading internally. Must NOT be called while holding it.
 **/
 bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
                               size_t* outDagBytes, uint8_t outSeed[32]);
@@ -155,7 +155,7 @@ bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
 bool Chain_ComputeBlockWork(uint32_t difficultyTargetBits, uint256_t* outWork);
 
 // Summed work of the chain's blocks over the half-open range [from, to).
-// Takes no locks; safe to call while holding `chainLock`.
+// Takes no locks; safe to call while holding `g_chainLock`.
 bool Chain_ComputeWorkRange(blockchain_t* chain, size_t from, size_t to, uint256_t* outWork);
 
 // Summed work of a candidate branch that is not (yet) part of the chain.

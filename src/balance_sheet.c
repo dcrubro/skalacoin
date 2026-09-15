@@ -1,7 +1,7 @@
 #include <balance_sheet.h>
 #include <pthread.h>
 
-khash_t(balance_sheet_map_m)* sheetMap = NULL;
+khash_t(balance_sheet_map_m)* g_sheetMap = NULL;
 static pthread_mutex_t g_sheetLock;
 
 static bool BalanceSheet_GetSimEntry(
@@ -139,7 +139,7 @@ static bool BalanceSheet_ApplyCandidateTransaction(
 }
 
 static int BalanceSheet_InsertLocked(balance_sheet_entry_t entry) {
-    if (!sheetMap) {
+    if (!g_sheetMap) {
         return -1;
     }
 
@@ -147,22 +147,22 @@ static int BalanceSheet_InsertLocked(balance_sheet_entry_t entry) {
     memcpy(key.bytes, entry.address, 32);
 
     int ret = 0;
-    khiter_t k = kh_put(balance_sheet_map_m, sheetMap, key, &ret);
-    if (k == kh_end(sheetMap)) {
+    khiter_t k = kh_put(balance_sheet_map_m, g_sheetMap, key, &ret);
+    if (k == kh_end(g_sheetMap)) {
         return -1;
     }
 
-    kh_value(sheetMap, k) = entry;
+    kh_value(g_sheetMap, k) = entry;
     return ret;
 }
 
 void BalanceSheet_Init() {
-    sheetMap = kh_init(balance_sheet_map_m);
+    g_sheetMap = kh_init(balance_sheet_map_m);
     pthread_mutex_init(&g_sheetLock, NULL);
 }
 
 int BalanceSheet_Insert(balance_sheet_entry_t entry) {
-    if (!sheetMap) { return -1; }
+    if (!g_sheetMap) { return -1; }
 
     pthread_mutex_lock(&g_sheetLock);
     int ret = BalanceSheet_InsertLocked(entry);
@@ -177,9 +177,9 @@ bool BalanceSheet_Lookup(uint8_t* address, balance_sheet_entry_t* out) {
     key32_t key;
     memcpy(key.bytes, address, 32);
 
-    khiter_t k = kh_get(balance_sheet_map_m, sheetMap, key);
-    if (k != kh_end(sheetMap)) {
-        balance_sheet_entry_t entry = kh_value(sheetMap, k);
+    khiter_t k = kh_get(balance_sheet_map_m, g_sheetMap, key);
+    if (k != kh_end(g_sheetMap)) {
+        balance_sheet_entry_t entry = kh_value(g_sheetMap, k);
         memcpy(out, &entry, sizeof(balance_sheet_entry_t));
         pthread_mutex_unlock(&g_sheetLock);
         return true;
@@ -190,7 +190,7 @@ bool BalanceSheet_Lookup(uint8_t* address, balance_sheet_entry_t* out) {
 }
 
 bool BalanceSheet_SaveToFile(const char* outPath) {
-    if (!sheetMap) { return false; }
+    if (!g_sheetMap) { return false; }
 
     pthread_mutex_lock(&g_sheetLock);
     char outFile[512];
@@ -203,9 +203,9 @@ bool BalanceSheet_SaveToFile(const char* outPath) {
     }
 
     khiter_t k;
-    for (k = kh_begin(sheetMap); k != kh_end(sheetMap); ++k) {
-        if (kh_exist(sheetMap, k)) {
-            balance_sheet_entry_t entry = kh_val(sheetMap, k);
+    for (k = kh_begin(g_sheetMap); k != kh_end(g_sheetMap); ++k) {
+        if (kh_exist(g_sheetMap, k)) {
+            balance_sheet_entry_t entry = kh_val(g_sheetMap, k);
             if (fwrite(&entry, sizeof(balance_sheet_entry_t), 1, file) != 1) {
                 fclose(file);
                 pthread_mutex_unlock(&g_sheetLock);
@@ -220,7 +220,7 @@ bool BalanceSheet_SaveToFile(const char* outPath) {
 }
 
 bool BalanceSheet_LoadFromFile(const char* inPath) {
-    if (!sheetMap) { return false; }
+    if (!g_sheetMap) { return false; }
 
     pthread_mutex_lock(&g_sheetLock);
     char inFile[512];
@@ -247,15 +247,15 @@ bool BalanceSheet_LoadFromFile(const char* inPath) {
 }
 
 void BalanceSheet_Print() {
-    if (!sheetMap) { return; }
+    if (!g_sheetMap) { return; }
 
     pthread_mutex_lock(&g_sheetLock);
     // Iterate through every entry
     khiter_t k;
-    for (k = kh_begin(sheetMap); k != kh_end(sheetMap); ++k) {
-        if (kh_exist(sheetMap, k)) {
-            key32_t key = kh_key(sheetMap, k);
-            balance_sheet_entry_t val = kh_val(sheetMap, k);
+    for (k = kh_begin(g_sheetMap); k != kh_end(g_sheetMap); ++k) {
+        if (kh_exist(g_sheetMap, k)) {
+            key32_t key = kh_key(g_sheetMap, k);
+            balance_sheet_entry_t val = kh_val(g_sheetMap, k);
 
             char balanceStr[80];
             uint256_serialize(&val.balance, balanceStr);
@@ -273,8 +273,8 @@ void BalanceSheet_Print() {
 }
 
 void BalanceSheet_Destroy() {
-    kh_destroy(balance_sheet_map_m, sheetMap);
-    sheetMap = NULL;
+    kh_destroy(balance_sheet_map_m, g_sheetMap);
+    g_sheetMap = NULL;
     pthread_mutex_destroy(&g_sheetLock);
 }
 

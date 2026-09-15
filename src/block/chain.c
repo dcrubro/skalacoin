@@ -8,10 +8,10 @@
 #include <sys/stat.h>
 #include <pthread.h>
 
-uint64_t currentBlockHeight = 0;
+uint64_t g_currentBlockHeight = 0;
 
 // Defined near the DAG helpers at the bottom; needed early by Chain_AddBlockLocked, which verifies
-// proof of work while already holding chainLock for writing.
+// proof of work while already holding g_chainLock for writing.
 static bool Chain_DagParamsForHeightLocked(blockchain_t* chain, uint64_t blockHeight,
                                            size_t* outDagBytes, uint8_t outSeed[32]);
 
@@ -123,7 +123,7 @@ static bool DebitAddress(const uint8_t address[32], const uint256_t* amount, uin
  * or loaded without transactions (Chain_LoadFromFile), so any full replay of the chain has to be
  * able to fall back to the on-disk copy. On success `*outLoadedFromDisk` tells the caller whether
  * the returned block is a temporary that must be released with Chain_ReturnBlockTransactions.
- * Takes no locks; callers are expected to already hold `chainLock`.
+ * Takes no locks; callers are expected to already hold `g_chainLock`.
 **/
 static bool Chain_BorrowBlockTransactions(blockchain_t* chain, size_t index, block_t** outBlock, bool* outLoadedFromDisk) {
     if (!chain || !chain->blocks || !outBlock || !outLoadedFromDisk) {
@@ -141,7 +141,7 @@ static bool Chain_BorrowBlockTransactions(blockchain_t* chain, size_t index, blo
 
     block_t* loadedBlk = NULL;
     size_t txCount = 0;
-    if (!Chain_LoadBlockFromFile(chainDataDir, (uint64_t)index, true, &loadedBlk, &txCount) || !loadedBlk) {
+    if (!Chain_LoadBlockFromFile(g_chainDataDir, (uint64_t)index, true, &loadedBlk, &txCount) || !loadedBlk) {
         return false;
     }
 
@@ -190,9 +190,9 @@ bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
         Chain_ReturnBlockTransactions(blk, loadedFromDisk);
     }
 
-    currentSupply = rebuiltSupply;
-    // *AtHeight: never take chainLock from here, callers may already hold it.
-    currentReward = CalculateBlockRewardAtHeight(currentSupply, (uint64_t)chain->size);
+    g_currentSupply = rebuiltSupply;
+    // *AtHeight: never take g_chainLock from here, callers may already hold it.
+    g_currentReward = CalculateBlockRewardAtHeight(g_currentSupply, (uint64_t)chain->size);
     return true;
 }
 
@@ -204,7 +204,7 @@ bool Chain_RecomputeRuntimeState(blockchain_t* chain) {
  * headers reading a single byte each -- so blowing it away wholesale is both correct and cheap,
  * and far safer than trying to work out which suffix a reorg actually disturbed.
  *
- * Takes `dagCacheLock`. Safe to call while holding `chainLock` (that is the required lock order);
+ * Takes `dagCacheLock`. Safe to call while holding `g_chainLock` (that is the required lock order);
  * must NOT be called while already holding `dagCacheLock`.
 **/
 static void Chain_InvalidateDagEpochs(blockchain_t* chain) {
@@ -280,7 +280,7 @@ void Chain_Destroy(blockchain_t* chain) {
 /**
  * Append `block` to the tip.
  *
- * Caller MUST already hold `chainLock` (write) and `balanceSheetLock`, and MUST call
+ * Caller MUST already hold `g_chainLock` (write) and `g_balanceSheetLock`, and MUST call
  * Chain_OnTipAdvanced afterwards (outside the locks) if this returns true. Chain_AddBlock is the
  * locked wrapper for single appends; Chain_ReplaceBranch drives this directly so that a whole
  * branch swap happens under one lock acquisition.
@@ -407,7 +407,7 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
             break;
         }
 
-        uint64_t expectedCoinbaseAmount = currentReward;
+        uint64_t expectedCoinbaseAmount = g_currentReward;
         if (UINT64_MAX - expectedCoinbaseAmount < totalFees) {
             free(spendableTxs);
             ok = false;
@@ -425,13 +425,13 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
                     }
                 }
                 char supplyStr[80];
-                Uint256ToDecimal(&currentSupply, supplyStr, sizeof(supplyStr));
+                Uint256ToDecimal(&g_currentSupply, supplyStr, sizeof(supplyStr));
                 printf("Chain_AddBlock: blockIndex=%zu expectedCoinbase=%llu totalFees=%llu observedBlockCoinbase=%llu currentReward=%llu currentSupply=%s\n",
                     expectedIndex,
                     (unsigned long long)expectedCoinbaseAmount,
                     (unsigned long long)totalFees,
                     (unsigned long long)cbAmount,
-                    (unsigned long long)currentReward,
+                    (unsigned long long)g_currentReward,
                     supplyStr);
             }
 
@@ -479,7 +479,7 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
         block_t* blk = (block_t*)vector_back(chain->blocks);
         stored = blk;
         chain->size++;
-        currentBlockHeight = (uint64_t)(chain->size - 1);
+        g_currentBlockHeight = (uint64_t)(chain->size - 1);
 
         /**
          * The chain now owns the transaction vector, so clear the CALLER's pointer to it.
@@ -556,14 +556,14 @@ static bool Chain_AddBlockLocked(blockchain_t* chain, block_t* block) {
 
         // Advance supply and reward here rather than in each caller. Callers used to do this
         // themselves, which meant the orphan-attach and maintenance-thread paths never did it: the
-        // next block's coinbase was then validated against a stale currentReward and rejected
+        // next block's coinbase was then validated against a stale g_currentReward and rejected
         // forever. It also has to happen per block so that applying a whole branch works.
         if (ok) {
-            (void)uint256_add_u64(&currentSupply, expectedCoinbaseAmount);
-            // Must be the *AtHeight variant: we hold chainLock for writing here, and
-            // CalculateBlockReward would take it for reading via Chain_Size. chainLock is not
+            (void)uint256_add_u64(&g_currentSupply, expectedCoinbaseAmount);
+            // Must be the *AtHeight variant: we hold g_chainLock for writing here, and
+            // CalculateBlockReward would take it for reading via Chain_Size. g_chainLock is not
             // recursive, so that self-deadlocks as soon as another thread queues for the write lock.
-            currentReward = CalculateBlockRewardAtHeight(currentSupply, (uint64_t)chain->size);
+            g_currentReward = CalculateBlockRewardAtHeight(g_currentSupply, (uint64_t)chain->size);
         }
         // ok remains true if no failures
     } while (0);
@@ -582,13 +582,13 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
     }
 
     // Acquire global write locks to protect chain and balance sheet mutations.
-    pthread_rwlock_wrlock(&chainLock);
-    pthread_mutex_lock(&balanceSheetLock);
+    pthread_rwlock_wrlock(&g_chainLock);
+    pthread_mutex_lock(&g_balanceSheetLock);
 
     bool ok = Chain_AddBlockLocked(chain, block);
 
-    pthread_mutex_unlock(&balanceSheetLock);
-    pthread_rwlock_unlock(&chainLock);
+    pthread_mutex_unlock(&g_balanceSheetLock);
+    pthread_rwlock_unlock(&g_chainLock);
 
     if (ok) {
         // Every path that appends comes through here, so this is where difficulty/DAG catch up.
@@ -601,23 +601,23 @@ bool Chain_AddBlock(blockchain_t* chain, block_t* block) {
 block_t* Chain_GetBlock(blockchain_t* chain, size_t index) {
     if (!chain) return NULL;
     block_t* blk = NULL;
-    pthread_rwlock_rdlock(&chainLock);
+    pthread_rwlock_rdlock(&g_chainLock);
     blk = (block_t*)vector_get(chain->blocks, index);
-    pthread_rwlock_unlock(&chainLock);
+    pthread_rwlock_unlock(&g_chainLock);
     return blk;
 }
 
 bool Chain_GetBlockCopy(blockchain_t* chain, size_t index, block_t** outCopy) {
     if (!chain || !outCopy) return false;
     *outCopy = NULL;
-    pthread_rwlock_rdlock(&chainLock);
+    pthread_rwlock_rdlock(&g_chainLock);
     block_t* src = (block_t*)vector_get(chain->blocks, index);
     if (!src) {
-        pthread_rwlock_unlock(&chainLock);
+        pthread_rwlock_unlock(&g_chainLock);
         return false;
     }
     block_t* copy = Block_Copy(src);
-    pthread_rwlock_unlock(&chainLock);
+    pthread_rwlock_unlock(&g_chainLock);
     if (!copy) return false;
     *outCopy = copy;
     return true;
@@ -626,9 +626,9 @@ bool Chain_GetBlockCopy(blockchain_t* chain, size_t index, block_t** outCopy) {
 size_t Chain_Size(blockchain_t* chain) {
     if (!chain) return 0;
     size_t sz = 0;
-    pthread_rwlock_rdlock(&chainLock);
+    pthread_rwlock_rdlock(&g_chainLock);
     sz = vector_size(chain->blocks);
-    pthread_rwlock_unlock(&chainLock);
+    pthread_rwlock_unlock(&g_chainLock);
     return sz;
 }
 
@@ -671,7 +671,7 @@ bool Chain_IsValid(blockchain_t* chain) {
 /**
  * Truncate the chain to `height` blocks and rebuild the balance sheet and supply from what remains.
  *
- * Caller MUST already hold `chainLock` (write) and `balanceSheetLock`, and MUST call
+ * Caller MUST already hold `g_chainLock` (write) and `g_balanceSheetLock`, and MUST call
  * Chain_OnTipAdvanced afterwards (outside the locks). Chain_RollbackToHeight is the locked wrapper.
 **/
 static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
@@ -734,7 +734,7 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
     }
 
     chain->size = vector_size(chain->blocks);
-    currentBlockHeight = chain->size ? (uint64_t)(chain->size - 1) : 0ULL;
+    g_currentBlockHeight = chain->size ? (uint64_t)(chain->size - 1) : 0ULL;
 
     // Blocks below the old tip are gone, so the DAG recurrence folded from their votes is stale.
     Chain_InvalidateDagEpochs(chain);
@@ -830,9 +830,9 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
         Chain_ReturnBlockTransactions(toProcess, loaded);
     }
 
-    currentSupply = rebuiltSupply;
-    // *AtHeight: chainLock is held for writing here (see Chain_RollbackToHeight).
-    currentReward = CalculateBlockRewardAtHeight(currentSupply, (uint64_t)chain->size);
+    g_currentSupply = rebuiltSupply;
+    // *AtHeight: g_chainLock is held for writing here (see Chain_RollbackToHeight).
+    g_currentReward = CalculateBlockRewardAtHeight(g_currentSupply, (uint64_t)chain->size);
 
     return true;
 }
@@ -840,13 +840,13 @@ static bool Chain_RollbackToHeightLocked(blockchain_t* chain, size_t height) {
 bool Chain_RollbackToHeight(blockchain_t* chain, size_t height) {
     if (!chain || !chain->blocks) return false;
 
-    pthread_rwlock_wrlock(&chainLock);
-    pthread_mutex_lock(&balanceSheetLock);
+    pthread_rwlock_wrlock(&g_chainLock);
+    pthread_mutex_lock(&g_balanceSheetLock);
 
     bool ok = Chain_RollbackToHeightLocked(chain, height);
 
-    pthread_mutex_unlock(&balanceSheetLock);
-    pthread_rwlock_unlock(&chainLock);
+    pthread_mutex_unlock(&g_balanceSheetLock);
+    pthread_rwlock_unlock(&g_chainLock);
 
     // A reorg can move the tip back across an adjustment boundary, so the target must come down too.
     Chain_OnTipAdvanced(chain);
@@ -863,7 +863,7 @@ static int Chain_CompareTimestamps(const void* lhs, const void* rhs) {
 }
 
 /**
- * Median timestamp of the last MEDIAN_TIME_SPAN blocks. Caller must hold `chainLock`.
+ * Median timestamp of the last MEDIAN_TIME_SPAN blocks. Caller must hold `g_chainLock`.
 **/
 static uint64_t Chain_MedianTimePastLocked(blockchain_t* chain) {
     if (!chain || !chain->blocks) {
@@ -916,7 +916,7 @@ bool Chain_IsInitialBlockDownload(blockchain_t* chain) {
 
 /**
  * Verify that a candidate branch is internally linked and attaches to the block below `forkHeight`.
- * Caller must hold `chainLock`.
+ * Caller must hold `g_chainLock`.
 **/
 static bool Chain_BranchIsLinkedLocked(blockchain_t* chain, size_t forkHeight, block_t** blocks, size_t count) {
     if (!chain || !chain->blocks || !blocks || count == 0 || forkHeight == 0) {
@@ -1035,8 +1035,8 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
         return false;
     }
 
-    pthread_rwlock_wrlock(&chainLock);
-    pthread_mutex_lock(&balanceSheetLock);
+    pthread_rwlock_wrlock(&g_chainLock);
+    pthread_mutex_lock(&g_balanceSheetLock);
 
     bool ok = false;
     block_t** snapshot = NULL;      // deep copies of the blocks we are replacing
@@ -1109,7 +1109,7 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
                 // only change when our own tip moves -- so without this the same line is printed
                 // every second for as long as the branch stays deferred, which on a node that is
                 // not mining is forever. Report each distinct deferral once, and again whenever the
-                // situation actually changes. Guarded by chainLock (held for writing here).
+                // situation actually changes. Guarded by g_chainLock (held for writing here).
                 static size_t lastDeferredFork = SIZE_MAX;
                 static uint64_t lastDeferredTip = UINT64_MAX;
                 static uint64_t lastDeferredPenalty = UINT64_MAX;
@@ -1247,8 +1247,8 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
     Chain_FreeBlockArray(snapshot, snapshotCount);
     Chain_FreeBlockArray(candidate, candidate ? count : 0);
 
-    pthread_mutex_unlock(&balanceSheetLock);
-    pthread_rwlock_unlock(&chainLock);
+    pthread_mutex_unlock(&g_balanceSheetLock);
+    pthread_rwlock_unlock(&g_chainLock);
 
     Chain_OnTipAdvanced(chain);
 
@@ -1257,8 +1257,8 @@ bool Chain_ReplaceBranch(blockchain_t* chain,
 
 void Chain_Wipe(blockchain_t* chain) {
     Chain_ClearBlocks(chain);
-    currentBlockHeight = 0;
-    difficultyTarget = INITIAL_DIFFICULTY;
+    g_currentBlockHeight = 0;
+    g_difficultyTarget = INITIAL_DIFFICULTY;
 }
 
 bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t currentSupply, uint64_t currentReward) {
@@ -1293,7 +1293,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         return false;
     }
 
-    pthread_rwlock_wrlock(&chainLock);
+    pthread_rwlock_wrlock(&g_chainLock);
 
     FILE* metaFile = fopen(metaTmpPath, "wb+");
     FILE* chainFile = fopen(chainTmpPath, "wb+");
@@ -1302,7 +1302,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
         if (metaFile) fclose(metaFile);
         if (chainFile) fclose(chainFile);
         if (tableFile) fclose(tableFile);
-        pthread_rwlock_unlock(&chainLock);
+        pthread_rwlock_unlock(&g_chainLock);
         remove(metaTmpPath);
         remove(chainTmpPath);
         remove(tableTmpPath);
@@ -1317,7 +1317,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
             fclose(metaFile);
             fclose(chainFile);
             fclose(tableFile);
-            pthread_rwlock_unlock(&chainLock);
+            pthread_rwlock_unlock(&g_chainLock);
             remove(metaTmpPath);
             remove(chainTmpPath);
             remove(tableTmpPath);
@@ -1334,7 +1334,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
                 fclose(metaFile);
                 fclose(chainFile);
                 fclose(tableFile);
-                pthread_rwlock_unlock(&chainLock);
+                pthread_rwlock_unlock(&g_chainLock);
                 remove(metaTmpPath);
                 remove(chainTmpPath);
                 remove(tableTmpPath);
@@ -1349,7 +1349,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
             fclose(metaFile);
             fclose(chainFile);
             fclose(tableFile);
-            pthread_rwlock_unlock(&chainLock);
+            pthread_rwlock_unlock(&g_chainLock);
             remove(metaTmpPath);
             remove(chainTmpPath);
             remove(tableTmpPath);
@@ -1362,7 +1362,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
             fclose(metaFile);
             fclose(chainFile);
             fclose(tableFile);
-            pthread_rwlock_unlock(&chainLock);
+            pthread_rwlock_unlock(&g_chainLock);
             remove(metaTmpPath);
             remove(chainTmpPath);
             remove(tableTmpPath);
@@ -1377,7 +1377,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
                 fclose(metaFile);
                 fclose(chainFile);
                 fclose(tableFile);
-                pthread_rwlock_unlock(&chainLock);
+                pthread_rwlock_unlock(&g_chainLock);
                 remove(metaTmpPath);
                 remove(chainTmpPath);
                 remove(tableTmpPath);
@@ -1395,7 +1395,7 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
             fclose(metaFile);
             fclose(chainFile);
             fclose(tableFile);
-            pthread_rwlock_unlock(&chainLock);
+            pthread_rwlock_unlock(&g_chainLock);
             remove(metaTmpPath);
             remove(chainTmpPath);
             remove(tableTmpPath);
@@ -1436,14 +1436,14 @@ bool Chain_SaveToFile(blockchain_t* chain, const char* dirpath, uint256_t curren
     fclose(tableFile);
 
     if (rename(metaTmpPath, metaPath) != 0 || rename(chainTmpPath, chainPath) != 0 || rename(tableTmpPath, tablePath) != 0) {
-        pthread_rwlock_unlock(&chainLock);
+        pthread_rwlock_unlock(&g_chainLock);
         remove(metaTmpPath);
         remove(chainTmpPath);
         remove(tableTmpPath);
         return false;
     }
 
-    pthread_rwlock_unlock(&chainLock);
+    pthread_rwlock_unlock(&g_chainLock);
     return true;
 }
 
@@ -2023,7 +2023,7 @@ static bool Chain_ReserveDagEpochsLocked(blockchain_t* chain, size_t needed) {
  * [0, k * EPOCH_LENGTH) to all be present. Growth is the default: the size only stays put or falls
  * when miners actively say so, and there is no vote that makes it climb faster.
  *
- * Caller must hold `chainLock` (read) and `chain->dagCacheLock`.
+ * Caller must hold `g_chainLock` (read) and `chain->dagCacheLock`.
 **/
 static bool Chain_ExtendDagEpochsLocked(blockchain_t* chain, size_t epochIndex) {
     if (!chain || !chain->blocks) {
@@ -2112,7 +2112,7 @@ static bool Chain_ExtendDagEpochsLocked(blockchain_t* chain, size_t epochIndex) 
  * last block of the previous epoch. Constant for a whole epoch, which is what lets the DAG be
  * generated once per epoch instead of once per block.
  *
- * Caller must hold `chainLock`.
+ * Caller must hold `g_chainLock`.
 **/
 static bool Chain_EpochDagSeedForHeightLocked(blockchain_t* chain, uint64_t blockHeight, uint8_t outSeed[32]) {
     const uint64_t epochIndex = blockHeight / (uint64_t)EPOCH_LENGTH;
@@ -2136,10 +2136,10 @@ static bool Chain_EpochDagSeedForHeightLocked(blockchain_t* chain, uint64_t bloc
 }
 
 /**
- * As Chain_DagParamsForHeight, but assumes `chainLock` is already held (read OR write).
+ * As Chain_DagParamsForHeight, but assumes `g_chainLock` is already held (read OR write).
  *
  * Needed because Chain_AddBlockLocked verifies proof of work while holding the write lock, and
- * chainLock is not recursive -- taking it for reading there deadlocks the moment another thread
+ * g_chainLock is not recursive -- taking it for reading there deadlocks the moment another thread
  * queues for the write lock.
 **/
 static bool Chain_DagParamsForHeightLocked(blockchain_t* chain, uint64_t blockHeight,
@@ -2153,7 +2153,7 @@ static bool Chain_DagParamsForHeightLocked(blockchain_t* chain, uint64_t blockHe
     uint64_t bytes = 0;
     bool ok = false;
 
-    // Lock order is chainLock -> dagCacheLock, everywhere. Nothing under dagCacheLock calls back
+    // Lock order is g_chainLock -> dagCacheLock, everywhere. Nothing under dagCacheLock calls back
     // into chain.c, so this pair cannot deadlock.
     pthread_mutex_lock(&chain->dagCacheLock);
     if (Chain_ExtendDagEpochsLocked(chain, epochIndex)) {
@@ -2186,9 +2186,9 @@ bool Chain_DagParamsForHeight(blockchain_t* chain, uint64_t blockHeight,
         return false;
     }
 
-    pthread_rwlock_rdlock(&chainLock);
+    pthread_rwlock_rdlock(&g_chainLock);
     const bool ok = Chain_DagParamsForHeightLocked(chain, blockHeight, outDagBytes, outSeed);
-    pthread_rwlock_unlock(&chainLock);
+    pthread_rwlock_unlock(&g_chainLock);
 
     return ok;
 }
@@ -2202,7 +2202,7 @@ void Chain_OnTipAdvanced(blockchain_t* chain) {
 
     // Refresh the cached target for the block that comes next, so every path that moves the tip
     // (mining, P2P accept, sync, orphan attach, reorg) stays on the same difficulty as its peers.
-    difficultyTarget = Chain_GetTargetForHeight(chain, (uint64_t)chainSize);
+    g_difficultyTarget = Chain_GetTargetForHeight(chain, (uint64_t)chainSize);
 
     // The epoch DAG is deliberately NOT rebuilt here. It is a mining accelerator only -- validation
     // derives its lanes from the epoch seed, so a node that does not mine never allocates one --

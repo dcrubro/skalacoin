@@ -208,7 +208,7 @@ static const uint64_t TAIL_EMISSION = 750000000000ULL; // 0.75 coins per block f
 // Phase 3: update once per effective epoch and keep a fixed per-block reward for that epoch.
 //
 // The *AtHeight variants take the height directly and never call Chain_Size/Chain_GetBlockCopy, so
-// they are safe to call from inside a chainLock critical section. chainLock is a non-recursive
+// they are safe to call from inside a g_chainLock critical section. g_chainLock is a non-recursive
 // pthread_rwlock_t: taking it for reading while this thread already holds it for writing deadlocks
 // as soon as another thread is queued for the write lock.
 static inline uint64_t GetInflationRateRewardAtHeight(uint256_t currentSupply, uint64_t height) {
@@ -218,8 +218,8 @@ static inline uint64_t GetInflationRateRewardAtHeight(uint256_t currentSupply, u
             : 1;
 
     if (height == 0) {
-        currentReward = TAIL_EMISSION;
-        return currentReward;
+        g_currentReward = TAIL_EMISSION;
+        return g_currentReward;
     }
     
     if (height % effectiveEpochLength == 0) {
@@ -242,11 +242,11 @@ static inline uint64_t GetInflationRateRewardAtHeight(uint256_t currentSupply, u
         }
 
         uint64_t inflationPerBlock = quotient.limbs[0];
-        currentReward = (inflationPerBlock > TAIL_EMISSION) ? inflationPerBlock : TAIL_EMISSION;
-        return currentReward;
+        g_currentReward = (inflationPerBlock > TAIL_EMISSION) ? inflationPerBlock : TAIL_EMISSION;
+        return g_currentReward;
     }
 
-    return (currentReward > TAIL_EMISSION) ? currentReward : TAIL_EMISSION;
+    return (g_currentReward > TAIL_EMISSION) ? g_currentReward : TAIL_EMISSION;
 }
 
 static inline uint64_t GetInflationRateReward(uint256_t currentSupply, blockchain_t* chain) {
@@ -313,7 +313,7 @@ static inline uint64_t CalculateBlockReward(uint256_t currentSupply, blockchain_
 
 // Hashing DAG: see Chain_DagParamsForHeight in block/chain.h. Both the size and the epoch seed are
 // derived from the chain by that one function, so the mining and verification paths cannot drift
-// apart. The previous CalculateTargetDAGSize/GetNextDAGSeed pair lived here, took chainLock
+// apart. The previous CalculateTargetDAGSize/GetNextDAGSeed pair lived here, took g_chainLock
 // internally, was not epoch-aligned, and disagreed with the verifier's own copy in main.c.
 
 #endif

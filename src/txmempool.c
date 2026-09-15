@@ -5,10 +5,10 @@
 static pthread_mutex_t g_txMempoolLock;
 static bool g_txMempoolLockInitialized = false;
 
-khash_t(tx_mempool_map_m)* txMempool = NULL;
+khash_t(tx_mempool_map_m)* g_txMempool = NULL;
 
 void TxMempool_Init() {
-    txMempool = kh_init(tx_mempool_map_m);
+    g_txMempool = kh_init(tx_mempool_map_m);
     pthread_mutex_init(&g_txMempoolLock, NULL);
     g_txMempoolLockInitialized = true;
 }
@@ -37,20 +37,20 @@ bool TxMempool_PolicyAccepts(const signed_transaction_t* tx, uint64_t nowMs) {
 }
 
 size_t TxMempool_PruneExpired(uint64_t nowMs) {
-    if (!txMempool) {
+    if (!g_txMempool) {
         return 0;
     }
 
     size_t removed = 0;
 
     pthread_mutex_lock(&g_txMempoolLock);
-    for (khiter_t k = kh_begin(txMempool); k != kh_end(txMempool); ++k) {
-        if (!kh_exist(txMempool, k)) {
+    for (khiter_t k = kh_begin(g_txMempool); k != kh_end(g_txMempool); ++k) {
+        if (!kh_exist(g_txMempool, k)) {
             continue;
         }
-        const uint64_t ts = kh_value(txMempool, k).transaction.timestamp;
+        const uint64_t ts = kh_value(g_txMempool, k).transaction.timestamp;
         if (nowMs > ts && (nowMs - ts) > TX_EXPIRY_MS) {
-            kh_del(tx_mempool_map_m, txMempool, k);
+            kh_del(tx_mempool_map_m, g_txMempool, k);
             removed++;
         }
     }
@@ -60,7 +60,7 @@ size_t TxMempool_PruneExpired(uint64_t nowMs) {
 }
 
 int TxMempool_Insert(signed_transaction_t tx) {
-    if (!txMempool) { return -1; }
+    if (!g_txMempool) { return -1; }
 
     pthread_mutex_lock(&g_txMempoolLock);
     uint8_t txHash[32];
@@ -70,13 +70,13 @@ int TxMempool_Insert(signed_transaction_t tx) {
     memcpy(key.bytes, txHash, 32);
 
     int ret;
-    khiter_t k = kh_put(tx_mempool_map_m, txMempool, key, &ret);
-    if (k == kh_end(txMempool)) {
+    khiter_t k = kh_put(tx_mempool_map_m, g_txMempool, key, &ret);
+    if (k == kh_end(g_txMempool)) {
         pthread_mutex_unlock(&g_txMempoolLock);
         return -1;
     }
 
-    kh_value(txMempool, k) = tx;
+    kh_value(g_txMempool, k) = tx;
 
     pthread_mutex_unlock(&g_txMempoolLock);
 
@@ -84,15 +84,15 @@ int TxMempool_Insert(signed_transaction_t tx) {
 }
 
 bool TxMempool_Lookup(uint8_t* txHash, signed_transaction_t* out) {
-    if (!txMempool || !txHash || !out) { return false; }
+    if (!g_txMempool || !txHash || !out) { return false; }
     
     pthread_mutex_lock(&g_txMempoolLock);
     key32_t key;
     memcpy(key.bytes, txHash, 32);
 
-    khiter_t k = kh_get(tx_mempool_map_m, txMempool, key);
-    if (k != kh_end(txMempool)) {
-        signed_transaction_t tx = kh_value(txMempool, k);
+    khiter_t k = kh_get(tx_mempool_map_m, g_txMempool, key);
+    if (k != kh_end(g_txMempool)) {
+        signed_transaction_t tx = kh_value(g_txMempool, k);
         memcpy(out, &tx, sizeof(signed_transaction_t));
         pthread_mutex_unlock(&g_txMempoolLock);
         return true;
@@ -110,7 +110,7 @@ bool TxMempool_Snapshot(signed_transaction_t** outTxs, size_t* outCount) {
     *outTxs = NULL;
     *outCount = 0;
 
-    if (!txMempool) {
+    if (!g_txMempool) {
         return true;
     }
 
@@ -118,8 +118,8 @@ bool TxMempool_Snapshot(signed_transaction_t** outTxs, size_t* outCount) {
 
     size_t count = 0;
     khiter_t k;
-    for (k = kh_begin(txMempool); k != kh_end(txMempool); ++k) {
-        if (kh_exist(txMempool, k)) {
+    for (k = kh_begin(g_txMempool); k != kh_end(g_txMempool); ++k) {
+        if (kh_exist(g_txMempool, k)) {
             ++count;
         }
     }
@@ -136,9 +136,9 @@ bool TxMempool_Snapshot(signed_transaction_t** outTxs, size_t* outCount) {
     }
 
     size_t index = 0;
-    for (k = kh_begin(txMempool); k != kh_end(txMempool); ++k) {
-        if (kh_exist(txMempool, k)) {
-            snapshot[index++] = kh_value(txMempool, k);
+    for (k = kh_begin(g_txMempool); k != kh_end(g_txMempool); ++k) {
+        if (kh_exist(g_txMempool, k)) {
+            snapshot[index++] = kh_value(g_txMempool, k);
         }
     }
 
@@ -150,13 +150,13 @@ bool TxMempool_Snapshot(signed_transaction_t** outTxs, size_t* outCount) {
 }
 
 void TxMempool_Print() {
-    if (!txMempool) { return; }
+    if (!g_txMempool) { return; }
 
     pthread_mutex_lock(&g_txMempoolLock);
     khiter_t k;
-    for (k = kh_begin(txMempool); k != kh_end(txMempool); ++k) {
-        if (kh_exist(txMempool, k)) {
-            signed_transaction_t tx = kh_val(txMempool, k);
+    for (k = kh_begin(g_txMempool); k != kh_end(g_txMempool); ++k) {
+        if (kh_exist(g_txMempool, k)) {
+            signed_transaction_t tx = kh_val(g_txMempool, k);
             char senderHex[65];
             char recipient1Hex[65];
             char recipient2Hex[65];
@@ -174,10 +174,10 @@ void TxMempool_Print() {
 }
 
 void TxMempool_Destroy() {
-    if (txMempool) {
+    if (g_txMempool) {
         pthread_mutex_lock(&g_txMempoolLock);
-        kh_destroy(tx_mempool_map_m, txMempool);
-        txMempool = NULL;
+        kh_destroy(tx_mempool_map_m, g_txMempool);
+        g_txMempool = NULL;
         pthread_mutex_unlock(&g_txMempoolLock);
     }
 
@@ -188,19 +188,19 @@ void TxMempool_Destroy() {
 }
 
 bool TxMempool_Remove(const uint8_t* txHash) {
-    if (!txMempool || !txHash) { return false; }
+    if (!g_txMempool || !txHash) { return false; }
 
     pthread_mutex_lock(&g_txMempoolLock);
     key32_t key;
     memcpy(key.bytes, txHash, 32);
 
-    khiter_t k = kh_get(tx_mempool_map_m, txMempool, key);
-    if (k == kh_end(txMempool)) {
+    khiter_t k = kh_get(tx_mempool_map_m, g_txMempool, key);
+    if (k == kh_end(g_txMempool)) {
         pthread_mutex_unlock(&g_txMempoolLock);
         return false;
     }
 
-    kh_del(tx_mempool_map_m, txMempool, k);
+    kh_del(tx_mempool_map_m, g_txMempool, k);
     pthread_mutex_unlock(&g_txMempoolLock);
     return true;
 }

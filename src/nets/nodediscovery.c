@@ -153,11 +153,11 @@ static void Discovery_SeedSelfEndpoints(node_discovery_t* disc) {
         if (it->ifa_addr->sa_family == AF_INET) {
             struct sockaddr_in* o = (struct sockaddr_in*)&ep;
             memcpy(o, it->ifa_addr, sizeof(struct sockaddr_in));
-            o->sin_port = htons(listenPort);
+            o->sin_port = htons(g_listenPort);
         } else if (it->ifa_addr->sa_family == AF_INET6) {
             struct sockaddr_in6* o = (struct sockaddr_in6*)&ep;
             memcpy(o, it->ifa_addr, sizeof(struct sockaddr_in6));
-            o->sin6_port = htons(listenPort);
+            o->sin6_port = htons(g_listenPort);
             o->sin6_scope_id = 0; // endpoints on the wire are scopeless; compare them the same way
         } else {
             continue;
@@ -494,7 +494,7 @@ void NodeDiscovery_NoteIdentity(node_discovery_t* disc, const struct sockaddr_st
     if (!disc || !endpoint || nodeId == 0) return;
 
     pthread_mutex_lock(&disc->lock);
-    if (nodeId == localNodeId) {
+    if (nodeId == g_localNodeId) {
         // The peer on the other end is us under one of our own addresses. Record it and drop it so
         // discovery stops treating it as a peer.
         Discovery_AddSelfUnlocked(disc, endpoint);
